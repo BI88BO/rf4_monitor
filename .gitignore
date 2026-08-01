@@ -6,3 +6,8 @@ __MACOSX/
 __pycache__/
 .pytest_cache/
 *.log
+
+# RF4 runtime artifacts
+logs/
+rf4_overlay_config.json
+

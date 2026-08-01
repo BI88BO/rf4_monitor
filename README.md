@@ -2,7 +2,7 @@
 
 RF4 Monitor 是一个 `俄罗斯钓鱼4`游戏的网络流量监控工具，用于本地代理 RF4 的登录 HTTPS 和 realtime TCP 流量，解析游戏业务数据，并在控制台输出更易读的中文信息。
 
-为了不破坏游戏实际体验，本工具仅实现了提前“窥探”当前服务端下发的鱼的信息功能。
+为了不破坏游戏实际体验，本工具仅实现了提前"窥探"当前服务端下发的鱼的信息功能。
 
 ## 主要功能
 
@@ -11,24 +11,33 @@ RF4 Monitor 是一个 `俄罗斯钓鱼4`游戏的网络流量监控工具，用�
 - 自动把登录返回的 realtime 地址改写到本地监听端口
 - 继续代理真实 realtime TCP 业务流量
 - 解析 RF4 应用层协议数据
-- 输出频道鱼获信息
-- 输出自己来鱼、入护提示
+- 输出频道鱼获信息（其他玩家钓到/记录鱼）
+- 输出自己钓鱼全流程提示：来鱼、脱钩、入护、放生
+- 桌面浮窗提醒：自己来鱼/脱钩/入护/放生时弹出置顶提示（可拖动、记忆位置）
 - 输出人物坐标、钓组坐标、搏鱼状态、公共聊天等监控信息
 
 ## 目录文件
 
 ```text
-rf4_monitor/
-  rf4_monitor.py        主程序
-  rf4_monitor.bat       Windows 启动脚本
-  安装依赖.bat          Python 依赖安装脚本，使用清华源
-  requirements.txt      Python 依赖列表
-  fish_labels_zh.json   鱼名中文映射
-  reference_defaults.txt 默认网络参考配置
-  rf4_hosts.txt         hosts 示例
-  screenshot/           截图目录
-  certs/                证书目录
-  归档.zip              当前目录打包文件
+rf4_monitor-main/
+  rf4_monitor.py          兼容入口（CLI launcher + mitmdump addon）
+  rf4_tray.py             系统托盘控制（一键启动/停止监控 + 浮窗）
+  rf4.bat                 双击启动托盘（自提权，后台运行无控制台）
+  rf4_overlay.pyw         来鱼浮窗提醒（UDP 事件桥监听端）
+  rf4_core/               核心实现包
+    launcher.py           CLI、hosts、证书、mitmdump 命令、登录改写
+    protocol.py           协议编解码、数据类、协议 profile
+    fish_labels.py        鱼名中文映射加载
+    console.py            终端着色辅助
+    bridge.py             RF4ChatBridge（mitmdump addon）、FlowSession、事件桥
+  rf4_hosts.txt           hosts 示例
+  reference_defaults.txt  默认网络参考配置
+  fish_labels_zh.json     鱼名中文映射
+  安装依赖.bat            Python 依赖安装脚本，使用清华源
+  requirements.txt        Python 依赖列表
+  certs/                  证书目录
+  logs/                   运行日志目录
+  screenshot/             截图目录
 ```
 
 证书文件：
@@ -82,6 +91,8 @@ pip3 install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --t
 
 ```text
 mitmproxy>=9,<10
+pystray>=0.19
+Pillow>=10.0
 ```
 
 ### 3. 导入自签证书
@@ -95,7 +106,7 @@ certs\rf4_monitor.crt
 如果 `certs\rf4_monitor.crt` 不存在，先运行一次：
 
 ```bat
-rf4_monitor.bat --prepare-only
+py -3 rf4_monitor.py --prepare-only
 ```
 
 导入方式一：图形界面导入
@@ -113,20 +124,48 @@ rf4_monitor.bat --prepare-only
 certutil -addstore Root certs\rf4_monitor.crt
 ```
 
-证书导入后，再以管理员身份运行 `rf4_monitor.bat`。
+证书导入后，再以管理员身份运行 `rf4.bat`。
 
 ## 启动
 
+### 方式一：托盘一键启停（推荐，含浮窗，无控制台窗口）
+
 1. 关闭 RF4
-2. 右键以管理员身份运行 `rf4_monitor.bat`
-3. 等待控制台出现监听信息
-4. 启动 RF4 并登录游戏
-5. 在控制台查看解析结果
+2. 右键以管理员身份运行 `rf4.bat`（或在资源管理器中双击，会自动请求提权）
+3. 系统托盘出现 RF4 图标后，右键菜单选择 **启动监控**
+4. 等待 `logs\rf4_monitor.log` 出现监听信息（会同时启动桌面浮窗）
+5. 启动 RF4 并登录游戏
+6. 来鱼/脱钩/入护/放生时浮窗会弹提示，日志写入 `logs\rf4_monitor.log`
+
+停止：托盘右键菜单选择 **停止监控**（会自动恢复 hosts 并结束主程序与浮窗）。
+
+彻底退出：托盘右键菜单选择 **退出**。
+
+### 方式二：命令行仅主程序
+
+```bat
+py -3 rf4_monitor.py
+```
+
+等待控制台出现监听信息后启动 RF4 并登录游戏。
 
 管理员权限通常是必须的，因为程序需要：
 
 - 修改 Windows hosts
 - 监听 `443` 和 realtime 业务端口
+
+## 浮窗提醒
+
+`rf4_overlay.pyw` 是一个独立的桌面浮窗，通过 UDP 事件桥（默认 `127.0.0.1:25000`）接收主程序广播的自己钓鱼事件：
+
+- **来鱼**：`【我自己】： 有太阳鱼 138克 过来了`
+- **脱钩**：`【我自己】： 太阳鱼 挣脱跑了（脱钩）`
+- **入护**：`【我自己】： 有太阳鱼 138克 入护了`
+- **放生**：`【我自己】： 放生了 太阳鱼`
+
+浮窗只显示自己的鱼获事件，其他玩家的钓到/记录消息不会弹出。浮窗为透明置顶小窗，可按住左键拖动到任意位置，位置会自动记忆在 `rf4_overlay_config.json`。
+
+浮窗可单独运行（不依赖主程序启动脚本）：双击 `rf4_overlay.pyw`。若端口被占用会提示已有实例在运行。
 
 ## 默认行为
 
@@ -148,8 +187,20 @@ certutil -addstore Root certs\rf4_monitor.crt
 feide3383 钓到了 63 克 欧鲌
 RF4-3D 记录[底钓] 钓到了 1.384 公斤 金眼狼鲈
 【我自己】： 有鲈鱼 262 克 过来了
+【我自己】： 鲈鱼 挣脱跑了（脱钩）
+【我自己】： 有鲈鱼 262 克 入护了
+【我自己】： 放生了 欧鲌
 人物坐标 =(368.702,16.208,444.658)
 钓鱼过程位置上报 | 钓组=497bae49... 钓组坐标=(-132.041,0.597,-55.398)
+```
+
+浮窗对应显示：
+
+```text
+【我自己】： 有鲈鱼 262 克 过来了
+【我自己】： 鲈鱼 挣脱跑了（脱钩）
+【我自己】： 有鲈鱼 262 克 入护了
+【我自己】： 放生了 欧鲌
 ```
 
 默认不会输出下面这类协议调试前缀：
@@ -167,13 +218,13 @@ RF4-3D 记录[底钓] 钓到了 1.384 公斤 金眼狼鲈
 关闭业务遥测，只看鱼获和自己来鱼：
 
 ```bat
-rf4_monitor.bat --set rf4_log_telemetry=false
+py -3 rf4_monitor.py --set rf4_log_telemetry=false
 ```
 
 只看钓鱼相关信息：
 
 ```bat
-rf4_monitor.bat --set rf4_telemetry_categories=fish
+py -3 rf4_monitor.py --set rf4_telemetry_categories=fish
 ```
 
 只更新 hosts：
@@ -181,7 +232,6 @@ rf4_monitor.bat --set rf4_telemetry_categories=fish
 ```bat
 py -3 rf4_monitor.py --update-hosts-only
 ```
-
 
 ## hosts
 
@@ -203,7 +253,7 @@ C:\Windows\System32\drivers\etc\hosts
 
 `Permission denied`
 
-- 请使用管理员身份运行 `rf4_monitor.bat`
+- 请使用管理员身份运行 `rf4.bat` 或命令行 `py -3 rf4_monitor.py`
 
 `Cannot spawn multiple servers on the same address: *:443`
 
@@ -223,7 +273,7 @@ C:\Windows\System32\drivers\etc\hosts
 - 可临时开启详细日志：
 
 ```bat
-rf4_monitor.bat --set rf4_verbose_logging=true
+py -3 rf4_monitor.py --set rf4_verbose_logging=true
 ```
 
 如果游戏版本升级，需要重新确认协议字段、登录返回结构和 realtime 端口。
