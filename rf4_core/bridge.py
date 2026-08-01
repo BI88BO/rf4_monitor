@@ -4,13 +4,44 @@ import os
 import struct
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+
+class BoundedDict(dict):
+    """容量有界的 dict：超过上限后淘汰最早插入的条目，防止长时间运行内存无限增长。"""
+
+    def __init__(self, max_size: int, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_size = max_size
+        while len(self) > self._max_size:
+            self.pop(next(iter(self)))
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        while len(self) > self._max_size:
+            self.pop(next(iter(self)))
+
+
+class BoundedSet(set):
+    """容量有界的 set：超过上限后淘汰部分条目，防止长时间运行内存无限增长。"""
+
+    def __init__(self, max_size: int, iterable: Iterable = ()) -> None:
+        super().__init__(iterable)
+        self._max_size = max_size
+        while len(self) > self._max_size:
+            self.discard(next(iter(self)))
+
+    def add(self, value) -> None:
+        super().add(value)
+        while len(self) > self._max_size:
+            self.discard(next(iter(self)))
 
 from . import console
 from .fish_labels import load_fish_labels
 from .launcher import parse_https_upstream_map, rewrite_login_logon_info
 from .protocol import (
     BusinessPayloadSummary,
+    CatchSummary,
     FishSetupMeta,
     KeepFishRequest,
     RC4Stream,
@@ -79,17 +110,18 @@ class FlowSession:
     hermes_seen: bool = False
     client_buffer: bytearray = field(default_factory=bytearray)
     server_buffer: bytearray = field(default_factory=bytearray)
+    passthrough: bool = False
     client_read_rc4: Optional[RC4Stream] = None
     client_write_rc4: Optional[RC4Stream] = None
     server_read_rc4: Optional[RC4Stream] = None
     server_write_rc4: Optional[RC4Stream] = None
-    fish_setup_cache: Dict[str, FishSetupMeta] = field(default_factory=dict)
-    keep_requests: Dict[int, KeepFishRequest] = field(default_factory=dict)
-    room_events: Dict[int, RoomBroadcast] = field(default_factory=dict)
-    room_ack_calls: Dict[int, int] = field(default_factory=dict)
-    synthetic_events: Dict[int, SyntheticChatEvent] = field(default_factory=dict)
-    synthetic_wire_ids: set[int] = field(default_factory=set)
-    announced_fish_setup_ids: set[str] = field(default_factory=set)
+    fish_setup_cache: Dict[str, FishSetupMeta] = field(default_factory=lambda: BoundedDict(1024))
+    keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
+    room_events: Dict[int, RoomBroadcast] = field(default_factory=lambda: BoundedDict(512))
+    room_ack_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
+    synthetic_events: Dict[int, SyntheticChatEvent] = field(default_factory=lambda: BoundedDict(64))
+    synthetic_wire_ids: set[int] = field(default_factory=lambda: BoundedSet(64))
+    announced_fish_setup_ids: set[str] = field(default_factory=lambda: BoundedSet(256))
     latest_location_id: Optional[str] = None
     latest_users_count: Optional[int] = None
     next_synthetic_event_id: int = 0x71000000
@@ -371,15 +403,33 @@ class RF4ChatBridge:
     def tcp_error(self, flow: tcp.TCPFlow) -> None:
         self._sessions.pop(flow.id, None)
 
+    MAX_FLOW_MESSAGES = 2000
+    TRIM_FLOW_MESSAGES_KEEP = 1000
+    MAX_SESSIONS = 512
+
     def tcp_message(self, flow: tcp.TCPFlow) -> None:
         if not ctx.options.rf4_enable_chat_bridge:
             return
-        session = self._sessions.setdefault(flow.id, FlowSession(profile=self._profile))
-        message = flow.messages[-1]
-        if message.from_client:
-            message.content = self._process_client_bytes(flow, session, message.content)
-        else:
-            message.content = self._process_server_bytes(flow, session, message.content)
+        try:
+            session = self._sessions.setdefault(flow.id, FlowSession(profile=self._profile))
+            if len(self._sessions) > self.MAX_SESSIONS:
+                # 清理长期未回收的死会话，防止大量短连接累积泄漏。
+                for dead_id in [key for key in self._sessions if key != flow.id][: len(self._sessions) - self.MAX_SESSIONS]:
+                    self._sessions.pop(dead_id, None)
+            message = flow.messages[-1]
+            if message.from_client:
+                message.content = self._process_client_bytes(flow, session, message.content)
+            else:
+                message.content = self._process_server_bytes(flow, session, message.content)
+            # 长时间运行时 mitmproxy 会保留整条 TCP 连接的每条消息，导致内存随游戏时长无限增长。
+            # 只保留最近的消息用于处理，旧消息由我们的会话缓冲自行消费，无需留在 flow 里。
+            if len(flow.messages) > self.MAX_FLOW_MESSAGES:
+                del flow.messages[: len(flow.messages) - self.TRIM_FLOW_MESSAGES_KEEP]
+        except Exception as exc:
+            # 任何异常都不能逃逸出 addon，否则会中断整个代理连接并导致游戏断线。
+            if ctx.options.rf4_verbose_logging:
+                self._log(f"tcp_message error flow={flow.id}: {exc}")
+            return
 
     def request(self, flow: http.HTTPFlow) -> None:
         if not ctx.options.rf4_verbose_logging:
@@ -516,8 +566,12 @@ class RF4ChatBridge:
     def _select_realtime_upstream(self, original_port: int) -> Optional[tuple[str, int]]:
         if not self._latest_realtime_hosts or self._latest_realtime_port is None:
             return None
+        # 登录返回的真实 realtime 端口可能与本机监听端口(reverse:tcp 上游)不一致，
+        # 不能要求端口严格相等，否则动态 host 改写永远不会生效。
         if original_port != self._latest_realtime_port:
-            return None
+            redirect_port = int(getattr(ctx.options, "rf4_realtime_redirect_port", 0) or 0)
+            if redirect_port > 0 and original_port != redirect_port:
+                return None
         return self._latest_realtime_hosts[0], self._latest_realtime_port
 
     @staticmethod
@@ -531,17 +585,55 @@ class RF4ChatBridge:
             return False
         return path.startswith("/login.php") or path.startswith("/steam.php")
 
+    MAX_HANDSHAKE_BUFFER = 1 << 20
+
     def _process_client_bytes(self, flow: tcp.TCPFlow, session: FlowSession, chunk: bytes) -> bytes:
+        if session.passthrough:
+            return chunk
         session.client_buffer.extend(chunk)
         out = bytearray()
 
         if not session.auth_seen:
+            if len(session.client_buffer) >= 2:
+                # \x01\x00 和 \x01\x01 都是 RF4 realtime 认证包开头（后者是打开钓鱼站后
+                # 游戏重连 realtime 使用的格式），其余开头才可能是商店等非 RF4 连接。
+                if bytes(session.client_buffer[:2]) not in (b"\x01\x00", b"\x01\x01"):
+                    self._log(
+                        f"client non-RF4 data flow={flow.id} "
+                        f"first_bytes={session.client_buffer[:2].hex()} "
+                        f"len={len(session.client_buffer)} "
+                        f"hex={self._hex_preview(bytes(session.client_buffer), limit=256)}; "
+                        f"entering passthrough"
+                    )
+                    session.passthrough = True
+                    accumulated = bytes(session.client_buffer)
+                    session.client_buffer.clear()
+                    return accumulated
+            else:
+                # 数据不足 2 字节，先缓冲等待更多数据。
+                return b""
             parsed = try_parse_auth_packet(bytes(session.client_buffer))
             if parsed is None:
+                if len(session.client_buffer) > self.MAX_HANDSHAKE_BUFFER:
+                    # 数据不符合 RF4 认证包格式，进入透传模式（原样转发），
+                    # 避免把非认证连接（如商店的额外 realtime 连接）的数据吞掉。
+                    self._log(
+                        f"client handshake timeout flow={flow.id} "
+                        f"len={len(session.client_buffer)}; entering passthrough"
+                    )
+                    session.passthrough = True
+                    session.client_buffer.clear()
+                    return chunk
                 return b""
             token, consumed = parsed
             session.token = token
             session.auth_seen = True
+            # 立即用 token 初始化 RC4：正常连接在 Hermes 后初始化，但 Hermes 是明文
+            # 不消耗 keystream，所以提前初始化不影响 keystream 位置。
+            try:
+                session.ensure_rc4()
+            except Exception:
+                pass
             out.extend(session.client_buffer[:consumed])
             del session.client_buffer[:consumed]
             if ctx.options.rf4_verbose_logging:
@@ -551,9 +643,43 @@ class RF4ChatBridge:
         if session.auth_seen and not session.hermes_seen:
             frame = try_parse_first_frame(bytes(session.client_buffer))
             if frame is None:
+                if len(session.client_buffer) > self.MAX_HANDSHAKE_BUFFER:
+                    self._log(
+                        f"client hermes buffer overflow flow={flow.id} "
+                        f"len={len(session.client_buffer)}; entering passthrough"
+                    )
+                    session.passthrough = True
+                    session.client_buffer.clear()
+                    return chunk
                 return bytes(out)
             if b"<hermes>" not in frame.payload:
-                raise ValueError("expected Hermes plaintext frame during handshake")
+                # 打开钓鱼站等场景下，游戏可能跳过 Hermes 明文帧直接进入 RC4 加密业务。
+                # 用全新的 RC4(位置0)克隆做校验，不推进会话流；校验通过则继续正常解析。
+                if session.token:
+                    try:
+                        probe = RC4Stream(session.token.encode("utf-8"))
+                        probed = probe.crypt(frame.payload)
+                        if parse_envelope(probed) is not None:
+                            self._log(
+                                f"client skipped-hermes business frame flow={flow.id} "
+                                f"wire={frame.wire_id}; continuing parsing"
+                            )
+                            session.hermes_seen = True
+                            if session.client_buffer:
+                                out.extend(self._process_app_frames(flow, session, from_client=True))
+                            return bytes(out)
+                    except Exception:
+                        pass
+                # 解密失败或非业务帧，进入透传。
+                self._log(
+                    f"client non-hermes frame after auth flow={flow.id} "
+                    f"frame_type={frame.frame_type} wire={frame.wire_id} "
+                    f"payload_hex={self._hex_preview(frame.payload, limit=64)}; entering passthrough"
+                )
+                session.passthrough = True
+                buffered = bytes(session.client_buffer)
+                session.client_buffer.clear()
+                return bytes(out) + buffered
             out.extend(frame.raw)
             del session.client_buffer[:len(frame.raw)]
             session.hermes_seen = True
@@ -567,12 +693,29 @@ class RF4ChatBridge:
         return bytes(out)
 
     def _process_server_bytes(self, flow: tcp.TCPFlow, session: FlowSession, chunk: bytes) -> bytes:
+        if session.passthrough:
+            # 记录透传连接服务器首包特征，判断是否误判了 realtime 连接。
+            if not session.server_buffer:
+                self._log(
+                    f"passthrough server first data flow={flow.id} "
+                    f"first={chunk[:16].hex()} ascii={self._format_ascii_strings(chunk, limit=2)}"
+                )
+                session.server_buffer.extend(b"seen")
+            return chunk
         session.server_buffer.extend(chunk)
         out = bytearray()
 
         if not session.uuid_seen:
             parsed = try_parse_uuid_packet(bytes(session.server_buffer))
             if parsed is None:
+                if len(session.server_buffer) > self.MAX_HANDSHAKE_BUFFER:
+                    self._log(
+                        f"server handshake buffer overflow flow={flow.id} "
+                        f"len={len(session.server_buffer)}; entering passthrough"
+                    )
+                    session.passthrough = True
+                    session.server_buffer.clear()
+                    return chunk
                 return b""
             _, consumed = parsed
             session.uuid_seen = True
@@ -611,7 +754,10 @@ class RF4ChatBridge:
                 continue
 
             plain_body = read_cipher.crypt(frame.payload)
-            self._maybe_log_telemetry_frame(flow, session, from_client, plain_body)
+            try:
+                self._maybe_log_telemetry_frame(flow, session, from_client, plain_body)
+            except Exception:
+                pass
             if getattr(ctx.options, "rf4_log_plain_frames", False):
                 self._log(
                     f"app {'C->S' if from_client else 'S->C'} "
@@ -619,14 +765,28 @@ class RF4ChatBridge:
                     f"body_len={len(plain_body)} {self._describe_plain_body(plain_body)}"
                 )
             if from_client:
-                plain_forward, injections = self._handle_client_frame(session, plain_body)
+                try:
+                    plain_forward, injections = self._handle_client_frame(session, plain_body)
+                except Exception as exc:
+                    # 业务解析异常绝不能中断帧转发，否则 RC4 流失步导致游戏断线/未响应。
+                    if ctx.options.rf4_verbose_logging:
+                        self._log(f"client frame handler error flow={flow.id}: {exc}")
+                    plain_forward, injections = plain_body, []
                 if plain_forward is not None:
                     out.extend(session.build_client_forward_frame(frame.frame_type, frame.wire_id, plain_forward))
                 for injected in injections:
-                    ctx.master.commands.call("inject.tcp", flow, True, injected)
+                    try:
+                        ctx.master.commands.call("inject.tcp", flow, True, injected)
+                    except Exception as exc:
+                        if ctx.options.rf4_verbose_logging:
+                            self._log(f"inject.tcp failed flow={flow.id}: {exc}")
             else:
                 out.extend(session.build_server_forward_frame(frame.frame_type, frame.wire_id, plain_body))
-                out.extend(self._handle_server_frame(session, plain_body))
+                try:
+                    out.extend(self._handle_server_frame(session, plain_body))
+                except Exception as exc:
+                    if ctx.options.rf4_verbose_logging:
+                        self._log(f"server frame handler error flow={flow.id}: {exc}")
 
         return bytes(out)
 
@@ -1224,6 +1384,21 @@ class RF4ChatBridge:
                 self._emit_self_event(session, synthetic)
             return plain_body, []
 
+        # 脱钩/脱离由客户端完成判定后上报，不能只依赖服务器方向（14/12）。
+        contact_left = parse_contact_left(envelope, session.profile)
+        if contact_left and contact_left.fish_setup_id:
+            if contact_left.fish_setup_id in session.announced_fish_setup_ids:
+                session.announced_fish_setup_ids.discard(contact_left.fish_setup_id)
+                meta = session.fish_setup_cache.get(contact_left.fish_setup_id)
+                synthetic = self._build_self_synthetic_event(
+                    session=session,
+                    fish_key=meta.fish_key if meta else "",
+                    weight_raw=meta.weight_hint_raw if meta else 0,
+                    phase=self.SELF_EVENT_PHASE_ESCAPED,
+                )
+                self._emit_self_event(session, synthetic)
+            return plain_body, []
+
         public_chat = parse_public_chat_request(envelope, session.profile)
         if public_chat and public_chat.message:
             self._log_event(f"\u4f60: {self._clean_text(public_chat.message)}")
@@ -1316,13 +1491,15 @@ class RF4ChatBridge:
             catch = extract_catch_summary_from_response(plain_body)
             if keep_request.fish_setup_id:
                 session.announced_fish_setup_ids.discard(keep_request.fish_setup_id)
-            if synthetic is None and catch.fish_key and catch.weight_raw:
-                synthetic = SyntheticChatEvent(
-                    event_id=0,
-                    fish_key=catch.fish_key,
-                    weight_raw=catch.weight_raw,
-                    location_id="",
-                    users_count=0,
+            if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                self._log_keep_response_detail(session, keep_request, plain_body, catch, synthetic)
+            if synthetic is None:
+                # 缓存与响应都提取不到完整鱼名/重量时，仍发出入护事件，
+                # 保证浮窗一定显示"入护"，信息不全也优于完全丢失。
+                synthetic = self._build_self_synthetic_event(
+                    session=session,
+                    fish_key=catch.fish_key or "",
+                    weight_raw=catch.weight_raw or 0,
                     phase=self.SELF_EVENT_PHASE_KEPT,
                 )
                 self._log_self_event(self._format_self_event_log_line(synthetic))
@@ -1331,6 +1508,32 @@ class RF4ChatBridge:
                 out.extend(self._emit_self_event(session, synthetic))
 
         return bytes(out)
+
+    def _log_keep_response_detail(
+        self,
+        session: FlowSession,
+        keep_request: KeepFishRequest,
+        plain_body: bytes,
+        catch: CatchSummary,
+        synthetic: Optional[SyntheticChatEvent],
+    ) -> None:
+        """打印入护响应的完整内容，用于排查鱼名/重量提取不全的问题。"""
+        details = [
+            f"入护响应 call={keep_request.call_id}",
+            f"fish_setup_id={self._short_id(keep_request.fish_setup_id)}",
+            f"提取鱼名key={catch.fish_key or 'None'} 重量raw={catch.weight_raw or 'None'}",
+        ]
+        meta = None
+        if keep_request.fish_setup_id:
+            meta = session.fish_setup_cache.get(keep_request.fish_setup_id)
+        if meta:
+            details.append(
+                f"缓存元数据 鱼名key={meta.fish_key} 重量raw={meta.weight_hint_raw or 'None'}"
+            )
+        details.append(f"合成结果={'有' if synthetic else '无'}")
+        details.append(f"ascii={self._format_ascii_strings(plain_body, limit=12)}")
+        details.append(f"hex={self._hex_preview(plain_body)}")
+        self._log(" ".join(details))
 
     def _remember_room_context(self, session: FlowSession, broadcast: RoomBroadcast) -> None:
         if broadcast.location_id is not None:
@@ -1344,18 +1547,22 @@ class RF4ChatBridge:
         keep_request: KeepFishRequest,
         plain_body: bytes,
     ) -> Optional[SyntheticChatEvent]:
-        catch = extract_catch_summary_from_response(plain_body)
-        fish_key = catch.fish_key
-        if not fish_key and keep_request.fish_setup_id:
+        meta = None
+        if keep_request.fish_setup_id:
             meta = session.fish_setup_cache.get(keep_request.fish_setup_id)
-            if meta:
-                fish_key = meta.fish_key
 
-        weight_raw = catch.weight_raw
-        if weight_raw is None and keep_request.fish_setup_id:
-            meta = session.fish_setup_cache.get(keep_request.fish_setup_id)
-            if meta:
-                weight_raw = meta.weight_hint_raw
+        # 优先用来鱼时缓存的鱼信息（服务器 14/14 下发的 fish_key + 重量提示），
+        # 入护响应的提取依赖位置猜测，可能失败或取错字段。
+        fish_key = meta.fish_key if (meta and meta.fish_key) else None
+        weight_raw = meta.weight_hint_raw if (meta and meta.weight_hint_raw) else None
+
+        if not fish_key or not weight_raw:
+            catch = extract_catch_summary_from_response(plain_body)
+            if not fish_key:
+                fish_key = catch.fish_key
+            if not weight_raw:
+                weight_raw = catch.weight_raw
+
         if not fish_key or not weight_raw:
             return None
 

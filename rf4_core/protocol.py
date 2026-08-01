@@ -365,7 +365,11 @@ class RC4Stream:
 
 
 def try_parse_auth_packet(data: bytes) -> Optional[Tuple[str, int]]:
-    if len(data) < 6 or data[:2] != b"\x01\x00":
+    # 打开钓鱼站等场景下游戏重连 realtime 时，auth 包开头可能是 \x01\x00 或 \x01\x01，
+    # 后续 token 结构完全相同，都需要识别。
+    if len(data) < 6:
+        return None
+    if data[:2] not in (b"\x01\x00", b"\x01\x01"):
         return None
     token_len = u32(data, 2)
     total = 6 + token_len
@@ -574,17 +578,26 @@ def extract_catch_summary_from_response(plain_body: bytes) -> CatchSummary:
     if idx < 0:
         return CatchSummary(fish_key=fish_key, weight_raw=None, size_enum=None)
 
-    pos = idx + len(needle)
     weight_raw = None
     size_enum = None
-    if pos + 4 <= len(plain_body):
+
+    # 在鱼名之后的一段区域内，找一个合理的 u32 作为重量(克)。
+    # 服务器响应里鱼名与重量之间可能有其他字段，按 4 字节对齐逐个试探。
+    start = idx + len(needle)
+    end = min(len(plain_body), start + 64)
+    for offset in range(0, 32, 4):
+        pos = start + offset
+        if pos + 4 > end:
+            break
         candidate = u32(plain_body, pos)
-        if 0 < candidate < 10000000:
+        if 10 < candidate < 10000000:
             weight_raw = candidate
-    if pos + 10 <= len(plain_body):
-        candidate = u16(plain_body, pos + 8)
-        if 0 < candidate < 256:
-            size_enum = candidate
+            if pos + 10 <= len(plain_body):
+                size_candidate = u16(plain_body, pos + 8)
+                if 0 < size_candidate < 256:
+                    size_enum = size_candidate
+            break
+
     return CatchSummary(fish_key=fish_key, weight_raw=weight_raw, size_enum=size_enum)
 
 

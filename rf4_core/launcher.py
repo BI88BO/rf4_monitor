@@ -947,18 +947,24 @@ def main(argv: list[str] | None = None) -> int:
     log_file = None
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if creationflags:
-        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir = THIS_DIR / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = (log_dir / "rf4_monitor.log").open("a", encoding="utf-8")
+        log_path = log_dir / "rf4_monitor.log"
+        log_file = log_path.open("w", encoding="utf-8")
         print(f"[rf4-monitor-runner] mitmdump output is written to {log_file.name}")
 
     try:
         try:
+            process_env = dict(os.environ)
+            # mitmproxy 10 在非 TTY(无窗口)环境下 stdout 会块缓冲，日志积压在缓冲区
+            # 不落盘；设置 PYTHONUNBUFFERED 让 mitmdump 的每行日志即时写入文件。
+            process_env["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(
                 command,
                 creationflags=creationflags,
                 stdout=log_file,
                 stderr=log_file if log_file is not None else None,
+                env=process_env,
             )
         except OSError:
             if log_file is not None:
