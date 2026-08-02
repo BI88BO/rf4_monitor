@@ -2670,6 +2670,10 @@ class RF4ChatBridge:
             and envelope.sub_cmd is not None
         ):
             session.slot_request_calls[envelope.call_id] = envelope.sub_cmd
+            if ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"slot_request sub={envelope.sub_cmd} payload={self._hex_preview(envelope.payload, limit=96)}"
+                )
 
         # 结束钓鱼(14/4)请求：登记 call_id→请求，供服务器响应时反查鱼名/重量。
         fishing_end_request = parse_fishing_end_request(envelope, session.profile)
