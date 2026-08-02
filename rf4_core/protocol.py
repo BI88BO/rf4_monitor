@@ -381,6 +381,26 @@ def try_parse_auth_packet(data: bytes) -> Optional[Tuple[str, int]]:
     return token, total
 
 
+def is_complete_but_invalid_auth_packet(data: bytes) -> bool:
+    """判断缓冲是否已凑齐"完整认证包长度"但解析失败（确定不是 RF4 认证连接）。
+
+    认证包格式：2 字节头(\x01\x00/\x01\x01) + u32 长度 + token。
+    只要长度字段给出总长且已收满，却仍解析失败，说明这不是 RF4 realtime 认证，
+    无需等待 1MB 超时即可进入透传。
+    """
+    if len(data) < 6:
+        return False
+    if data[:2] not in (b"\x01\x00", b"\x01\x01"):
+        return False
+    token_len = u32(data, 2)
+    if token_len <= 0 or token_len > (1 << 16):
+        # 长度非法（过大/过小）同样不可能成为认证包，立即判死。
+        return True
+    if len(data) < 6 + token_len:
+        return False
+    return try_parse_auth_packet(data) is None
+
+
 def try_parse_uuid_packet(data: bytes) -> Optional[Tuple[str, int]]:
     if len(data) < 36:
         return None

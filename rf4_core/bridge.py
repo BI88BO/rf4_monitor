@@ -57,6 +57,7 @@ from .protocol import (
     extract_catch_summary_from_response,
     get_profile,
     guid_le,
+    is_complete_but_invalid_auth_packet,
     parse_contact_left,
     parse_envelope,
     parse_fish_setup_push,
@@ -657,8 +658,69 @@ class RF4ChatBridge:
 
     MAX_HANDSHAKE_BUFFER = 1 << 20
 
+    @staticmethod
+    def _uuid_prefix_is_possible(data: bytes) -> bool:
+        """按字节前缀判断是否仍可能是 36 字节 UUID（连字符固定位 8/13/18/23 + hex）。
+
+        服务端握手缓冲里积累的如果是普通业务数据，前缀很快就与 UUID 形状不符，
+        此时无需再等待 1MB 超时，直接透传即可。
+        """
+        hex_bytes = b"0123456789abcdefABCDEF"
+        hyphen_positions = {8, 13, 18, 23}
+        for index, value in enumerate(data[:36]):
+            if index in hyphen_positions:
+                if value != 0x2D:
+                    return False
+            elif value not in hex_bytes:
+                return False
+        return True
+
+    def _enter_passthrough(
+        self,
+        flow: tcp.TCPFlow,
+        session: FlowSession,
+        reason: str,
+        *,
+        from_client: bool,
+        pending: bytes | None = None,
+    ) -> bytes:
+        """进入字节级透传，并把已缓冲的同向数据整体回放、对向探测半包立即释放。
+
+        首包判定期间，对向可能已收到探测半包；若透传后才交给后续转发，这些字节会
+        滞留在旧握手缓冲中丢失（商店/建筑等辅助通道常见）。这里在切换透传的瞬间
+        用 inject.tcp 把对向半包回放给对方，同向缓冲则整体返回给调用方转发。
+        """
+        if session.passthrough:
+            return pending if pending is not None else b""
+        session.passthrough = True
+        # 释放对向探测半包（client 触发则把 server_buffer 回放给 client，反之亦然）。
+        opposite_buffer = session.server_buffer if from_client else session.client_buffer
+        if opposite_buffer:
+            pending_opposite = bytes(opposite_buffer)
+            try:
+                ctx.master.commands.call("inject.tcp", flow, from_client, pending_opposite)
+            except Exception as exc:
+                if ctx.options.rf4_verbose_logging:
+                    self._log(
+                        f"passthrough opposite replay failed flow={flow.id}: {exc} "
+                        f"(will be prefix-replayed by same-side fallback)"
+                    )
+            else:
+                opposite_buffer.clear()
+        if ctx.options.rf4_verbose_logging:
+            self._log(f"entering passthrough flow={flow.id} reason={reason}")
+        buffered = bytes(session.client_buffer if from_client else session.server_buffer)
+        session.client_buffer.clear() if from_client else session.server_buffer.clear()
+        if pending is not None:
+            buffered = buffered + bytes(pending)
+        return buffered
+
     def _process_client_bytes(self, flow: tcp.TCPFlow, session: FlowSession, chunk: bytes) -> bytes:
         if session.passthrough:
+            # 透传后同向可能仍有未回放的残留字节（对向释放失败时），前缀回放兜底。
+            if session.client_buffer:
+                chunk = bytes(session.client_buffer) + bytes(chunk)
+                session.client_buffer.clear()
             return chunk
         session.client_buffer.extend(chunk)
         out = bytearray()
@@ -675,15 +737,24 @@ class RF4ChatBridge:
                         f"hex={self._hex_preview(bytes(session.client_buffer), limit=256)}; "
                         f"entering passthrough"
                     )
-                    session.passthrough = True
-                    accumulated = bytes(session.client_buffer)
-                    session.client_buffer.clear()
-                    return accumulated
+                    return self._enter_passthrough(
+                        flow, session, "client non-RF4 first bytes", from_client=True
+                    )
             else:
                 # 数据不足 2 字节，先缓冲等待更多数据。
                 return b""
             parsed = try_parse_auth_packet(bytes(session.client_buffer))
             if parsed is None:
+                if is_complete_but_invalid_auth_packet(bytes(session.client_buffer)):
+                    # 已凑齐完整认证包长度却解析失败，确定不是 RF4 realtime 认证连接，
+                    # 立即透传并回放缓冲，无需等待 1MB 超时。
+                    self._log(
+                        f"client invalid auth packet flow={flow.id} "
+                        f"len={len(session.client_buffer)}; entering passthrough"
+                    )
+                    return self._enter_passthrough(
+                        flow, session, "client invalid auth packet", from_client=True
+                    )
                 if len(session.client_buffer) > self.MAX_HANDSHAKE_BUFFER:
                     # 数据不符合 RF4 认证包格式，进入透传模式（原样转发），
                     # 避免把非认证连接（如商店的额外 realtime 连接）的数据吞掉。
@@ -691,9 +762,9 @@ class RF4ChatBridge:
                         f"client handshake timeout flow={flow.id} "
                         f"len={len(session.client_buffer)}; entering passthrough"
                     )
-                    session.passthrough = True
-                    session.client_buffer.clear()
-                    return chunk
+                    return self._enter_passthrough(
+                        flow, session, "client handshake overflow", from_client=True
+                    )
                 return b""
             token, consumed = parsed
             session.token = token
@@ -718,9 +789,10 @@ class RF4ChatBridge:
                         f"client hermes buffer overflow flow={flow.id} "
                         f"len={len(session.client_buffer)}; entering passthrough"
                     )
-                    session.passthrough = True
-                    session.client_buffer.clear()
-                    return chunk
+                    return self._enter_passthrough(
+                        flow, session, "client hermes buffer overflow", from_client=True,
+                        pending=bytes(out),
+                    )
                 return bytes(out)
             if b"<hermes>" not in frame.payload:
                 # 打开钓鱼站等场景下，游戏可能跳过 Hermes 明文帧直接进入 RC4 加密业务。
@@ -746,10 +818,10 @@ class RF4ChatBridge:
                     f"frame_type={frame.frame_type} wire={frame.wire_id} "
                     f"payload_hex={self._hex_preview(frame.payload, limit=64)}; entering passthrough"
                 )
-                session.passthrough = True
-                buffered = bytes(session.client_buffer)
-                session.client_buffer.clear()
-                return bytes(out) + buffered
+                return self._enter_passthrough(
+                    flow, session, "client non-hermes frame after auth", from_client=True,
+                    pending=bytes(out),
+                )
             out.extend(frame.raw)
             del session.client_buffer[:len(frame.raw)]
             session.hermes_seen = True
@@ -764,18 +836,26 @@ class RF4ChatBridge:
 
     def _process_server_bytes(self, flow: tcp.TCPFlow, session: FlowSession, chunk: bytes) -> bytes:
         if session.passthrough:
-            # 记录透传连接服务器首包特征，判断是否误判了 realtime 连接。
-            if not session.server_buffer:
-                self._log(
-                    f"passthrough server first data flow={flow.id} "
-                    f"first={chunk[:16].hex()} ascii={self._format_ascii_strings(chunk, limit=2)}"
-                )
-                session.server_buffer.extend(b"seen")
+            # 透传后同向残留字节前缀回放兜底（对向释放失败时）。
+            if session.server_buffer:
+                chunk = bytes(session.server_buffer) + bytes(chunk)
+                session.server_buffer.clear()
             return chunk
         session.server_buffer.extend(chunk)
         out = bytearray()
 
         if not session.uuid_seen:
+            if not self._uuid_prefix_is_possible(bytes(session.server_buffer)):
+                # 服务端数据前缀已不可能成为 36 字节 UUID，说明这不是 realtime 握手，
+                # 无需等待 1MB 超时，立即透传并回放已缓冲字节。
+                self._log(
+                    f"server non-UUID data flow={flow.id} "
+                    f"first_bytes={session.server_buffer[:16].hex()} "
+                    f"len={len(session.server_buffer)}; entering passthrough"
+                )
+                return self._enter_passthrough(
+                    flow, session, "server non-UUID first bytes", from_client=False
+                )
             parsed = try_parse_uuid_packet(bytes(session.server_buffer))
             if parsed is None:
                 if len(session.server_buffer) > self.MAX_HANDSHAKE_BUFFER:
@@ -783,9 +863,9 @@ class RF4ChatBridge:
                         f"server handshake buffer overflow flow={flow.id} "
                         f"len={len(session.server_buffer)}; entering passthrough"
                     )
-                    session.passthrough = True
-                    session.server_buffer.clear()
-                    return chunk
+                    return self._enter_passthrough(
+                        flow, session, "server handshake overflow", from_client=False
+                    )
                 return b""
             _, consumed = parsed
             session.uuid_seen = True
