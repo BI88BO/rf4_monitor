@@ -269,31 +269,41 @@ def parse_tcp_segment(payload: bytes) -> Optional[TcpSegment]:
     )
 
 
+def _find_ipv4_offset(raw: bytes, start: int = 20) -> Optional[int]:
+    """在帧中扫描 IPv4 头起始偏移。
+
+    Npcap 伪头长度随网卡类型变化（loopback 24 字节；WLAN 等 32 字节），
+    直接扫描找到首个可信的 IPv4 头（version=4 且 IHL 在 5..15），最稳健。
+    """
+    for pos in range(start, len(raw) - 4):
+        first = raw[pos]
+        if (first >> 4) != 4:
+            continue
+        ihl = (first & 0x0F) * 4
+        if ihl < 20 or ihl > 60:
+            continue
+        total_len = int.from_bytes(raw[pos + 2:pos + 4], "big")
+        if total_len < ihl or total_len > 4096:
+            continue
+        # 协议字段 6=TCP 或 17=UDP，且源/目的 IP 非全 0
+        protocol = raw[pos + 9]
+        if protocol not in (6, 17):
+            continue
+        return pos
+    return None
+
+
 def parse_packet(pkt: LinkPacket) -> Optional[TcpSegment]:
-    """把链路层帧解析成 TCP 段。支持标准以太网帧与 Npcap loopback 伪头。"""
+    """把链路层帧解析成 TCP 段。
+
+    支持标准以太网帧与多种 Npcap 伪头（loopback 24 字节、WLAN 等更长），
+    通过扫描定位 IPv4 头，不依赖固定偏移。
+    """
     raw = pkt.raw
-    # Npcap Loopback 适配器：24 字节伪头后直接是 IP 包（偏移 20-23 是 0x02000000 等）
-    if len(raw) >= 28 and (raw[24] >> 4) == 4:
-        ip_payload = raw[24:]
-        parsed_ip = parse_ip_packet(ip_payload)
-        if parsed_ip is None:
-            return None
-        protocol, src_ip, dst_ip, tcp_payload, _ip_rest = parsed_ip
-        if protocol != 6:
-            return None
-        seg = parse_tcp_segment(tcp_payload)
-        if seg is None:
-            return None
-        seg.src_ip = src_ip
-        seg.dst_ip = dst_ip
-        return seg
-    # 标准以太网帧
-    parsed_eth = parse_eth_frame(pkt)
-    if parsed_eth is None:
+    ip_offset = _find_ipv4_offset(raw)
+    if ip_offset is None:
         return None
-    eth_type, _src_mac, _dst_mac, ip_payload = parsed_eth
-    if eth_type != 0x0800:
-        return None
+    ip_payload = raw[ip_offset:]
     parsed_ip = parse_ip_packet(ip_payload)
     if parsed_ip is None:
         return None
