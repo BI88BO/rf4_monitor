@@ -954,6 +954,14 @@ def main(argv: list[str] | None = None) -> int:
         log_dir = THIS_DIR / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "rf4_monitor.log"
+        # 保留历史：把上次的 rf4_monitor.log 归档为带时间戳的文件，再写本次日志。
+        if log_path.exists() and log_path.stat().st_size > 0:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = log_dir / f"rf4_monitor_{stamp}.log"
+            try:
+                shutil.move(str(log_path), str(archive_path))
+            except OSError:
+                pass
         log_file = log_path.open("w", encoding="utf-8")
         print(f"[rf4-monitor-runner] mitmdump output is written to {log_file.name}")
 
