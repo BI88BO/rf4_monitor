@@ -41,6 +41,12 @@ class PassiveEngine:
         self._running = False
         self._assembler = TcpStreamAssembler()
         self._sessions: Dict[str, FlowSession] = {}
+        self._stats = {
+            "tcp_segments": 0,
+            "realtime_flows": 0,
+            "auth_flows": 0,
+            "last_report": 0.0,
+        }
 
     # ------------------------------------------------------------------
     # 配置与启动
@@ -167,13 +173,31 @@ class PassiveEngine:
                     pass
 
     def _handle_segment(self, seg: TcpSegment) -> None:
+        self._stats["tcp_segments"] += 1
+        is_realtime_port = seg.src_port in (9442, 9569, 9448) or seg.dst_port in (9442, 9569, 9448)
+        if is_realtime_port:
+            self._stats["realtime_flows"] += 1
         flow = self._assembler.feed(
             seg.src_ip, seg.src_port, seg.dst_ip, seg.dst_port, seg.payload
         )
         if flow is None:
             return
         if flow.authenticated:
+            if self._stats["auth_flows"] == 0:
+                self._log(f"[rf4-sniffer] 已认证 RF4 realtime 流: {flow.key} token={flow.token[:16]}...")
+            self._stats["auth_flows"] += 1
             self._process_flow(flow)
+        self._maybe_report()
+
+    def _maybe_report(self) -> None:
+        now = time.monotonic()
+        if now - self._stats["last_report"] < 10.0:
+            return
+        self._stats["last_report"] = now
+        self._log(
+            f"[rf4-sniffer] 状态: tcp段={self._stats['tcp_segments']} "
+            f"realtime包={self._stats['realtime_flows']} 已认证流={self._stats['auth_flows']}"
+        )
 
     # ------------------------------------------------------------------
     # 业务处理（复用 bridge）

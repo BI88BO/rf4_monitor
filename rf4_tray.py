@@ -363,10 +363,13 @@ def stop_monitor() -> str:
 
 
 def _open_log() -> None:
-    if not MONITOR_LOG.exists():
+    log_file = MONITOR_LOG
+    if _load_mode() == MODE_PASSIVE:
+        log_file = LOG_DIR / "rf4_sniffer.log"
+    if not log_file.exists():
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        MONITOR_LOG.write_text("", encoding="utf-8")
-    os.startfile(str(MONITOR_LOG))
+        log_file.write_text("", encoding="utf-8")
+    os.startfile(str(log_file))
 
 
 def _status_text() -> str:
