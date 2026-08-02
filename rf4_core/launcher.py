@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import ipaddress
 import math
 import os
@@ -9,6 +10,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import types
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -977,9 +980,17 @@ def main(argv: list[str] | None = None) -> int:
                 log_file = None
             raise
 
+        # 若由 RF4Tray 启动，托盘退出时自动终止本进程链，避免残留 RF4Monitor/Overlay。
+        parent_pid = _watchdog_parent_pid()
+        watchdog = None
+        if parent_pid is not None:
+            watchdog = _spawn_parent_watchdog(parent_pid, process)
+
         try:
             return process.wait()
         except KeyboardInterrupt:
+            if watchdog is not None:
+                _stop_watchdog(watchdog)
             process.terminate()
             try:
                 return process.wait(timeout=5)
@@ -991,6 +1002,104 @@ def main(argv: list[str] | None = None) -> int:
             log_file.close()
             log_file = None
         restore_hosts_on_exit(hosts_result)
+
+
+RF4_WATCHDOG_PARENT_ENV = "RF4_TRAY_PARENT_PID"
+
+
+def _watchdog_parent_pid() -> int | None:
+    """读取由托盘传入的父进程(托盘) PID；未设置则返回 None(不启用守护)。"""
+    raw = os.environ.get(RF4_WATCHDOG_PARENT_ENV, "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """探测指定 PID 进程是否存活(只读，无需提权)。"""
+    kernel32 = ctypes.windll.kernel32
+    process = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return False
+    try:
+        status = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(process, ctypes.byref(status))
+        return status.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _spawn_parent_watchdog(parent_pid: int, engine: subprocess.Popen) -> threading.Thread:
+    """启动守护线程：轮询父托盘进程，若其已退出则终止引擎进程链。"""
+    stop_event = threading.Event()
+
+    def watch() -> None:
+        interval = 1.0
+        while not stop_event.wait(interval):
+            if not _pid_alive(parent_pid):
+                _terminate_engine_tree(engine)
+                break
+
+    thread = threading.Thread(target=watch, name="rf4-parent-watchdog", daemon=True)
+    thread.start()
+    thread.stop_event = stop_event  # type: ignore[attr-defined]
+    return thread
+
+
+def _terminate_engine_tree(engine: subprocess.Popen) -> None:
+    try:
+        children = _find_children(engine.pid)
+        for child in children:
+            _terminate_pid_tree(child)
+        try:
+            engine.kill()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _stop_watchdog(thread: threading.Thread) -> None:
+    stop_event = getattr(thread, "stop_event", None)
+    if stop_event is not None:
+        stop_event.set()
+
+
+def _find_children(parent_pid: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        out = subprocess.check_output(
+            [
+                "wmic",
+                "process",
+                "where",
+                f"(ParentProcessId={parent_pid})",
+                "get",
+                "ProcessId",
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            text=True,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit() and int(line) != parent_pid:
+                pids.append(int(line))
+    except Exception:
+        pass
+    return pids
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    children = _find_children(pid)
+    for child in children:
+        _terminate_pid_tree(child)
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 def resolve_reference_paths(raw_paths: list[str] | None) -> list[Path]:

@@ -11,12 +11,31 @@
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# 单实例互斥量名称：防止重复启动多个托盘导致多进程抢端口/多浮窗。
+# 用 Local 会话作用域（Global 需 SeCreateGlobalPrivilege，非提权下会 ACCESS_DENIED）。
+_SINGLE_INSTANCE_MUTEX = "Local\\RF4MonitorTray"
+ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance() -> None:
+    """获取全局互斥量；若另一个托盘实例已存在则直接退出。
+
+    互斥量由本进程持有时释放，进程结束自动释放，不会像锁文件那样残留。
+    """
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX)
+    if not handle or kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        sys.exit("[rf4-tray] 已有托盘实例在运行，本次启动已自动退出。")
+    # 保持句柄引用，避免被 GC 提前释放导致互斥量失效。
+    globals()["_single_instance_handle"] = handle
 
 BASE_DIR = Path(__file__).resolve().parent
 if getattr(sys, "frozen", False):
@@ -259,16 +278,21 @@ def start_monitor() -> str:
     # 把可勾选的显示项转成 --set 参数传给 addon
     for key, _, option in SHOW_ITEMS:
         launcher_cmd.extend(["--set", f"{option}={str(show_config.get(key, True)).lower()}"])
+    # 把托盘自身 PID 传给子进程，供其守护线程在托盘退出时自动清理进程链。
+    child_env = dict(os.environ)
+    child_env["RF4_TRAY_PARENT_PID"] = str(os.getpid())
     launcher = subprocess.Popen(
         launcher_cmd,
         cwd=str(BASE_DIR),
         creationflags=creationflags,
+        env=child_env,
     )
     time.sleep(1.5)
     overlay = subprocess.Popen(
         overlay_cmd,
         cwd=str(BASE_DIR),
         creationflags=creationflags,
+        env=child_env,
     )
     _state["launcher_proc"] = launcher
     _state["overlay_proc"] = overlay
@@ -332,6 +356,8 @@ def on_log(icon, item):
 
 
 def main() -> None:
+    _acquire_single_instance()
+
     show_menu_items = [
         pystray.MenuItem(label, _toggle_show, checked=_checked_show) for _, label, _ in SHOW_ITEMS
     ]
