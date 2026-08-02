@@ -46,6 +46,39 @@ LOG_DIR = BASE_DIR / "logs"
 MONITOR_LOG = LOG_DIR / "rf4_monitor.log"
 EVENT_BRIDGE_PORT = 25000
 SHOW_CONFIG_FILE = BASE_DIR / "rf4_show_config.json"
+MODE_CONFIG_FILE = BASE_DIR / "rf4_mode.json"
+
+MODE_PROXY = "proxy"
+MODE_PASSIVE = "passive"
+
+
+def _load_mode() -> str:
+    try:
+        data = json.loads(MODE_CONFIG_FILE.read_text("utf-8"))
+        if data.get("mode") == MODE_PASSIVE:
+            return MODE_PASSIVE
+    except (OSError, ValueError):
+        pass
+    return MODE_PROXY
+
+
+def _save_mode(mode: str) -> None:
+    try:
+        MODE_CONFIG_FILE.write_text(
+            json.dumps({"mode": mode}, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _toggle_mode(icon, item) -> None:
+    mode = MODE_PASSIVE if _load_mode() == MODE_PROXY else MODE_PROXY
+    _save_mode(mode)
+    icon.notify(f"已切换为{'旁路监听' if mode == MODE_PASSIVE else '代理' if mode == MODE_PROXY else '模式'}（需重启监控生效）", "RF4 Monitor")
+
+
+def _checked_mode(item) -> bool:
+    return _load_mode() == MODE_PASSIVE
 
 # 浮窗背景样式配置(与 rf4_overlay.pyw 约定一致)
 OVERLAY_CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
@@ -259,11 +292,14 @@ def start_monitor() -> str:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     show_config = _load_show_config()
     frozen = getattr(sys, "frozen", False)
+    mode = _load_mode()
+    mode_args = ["--mode", mode] if mode == MODE_PASSIVE else []
 
     if frozen:
         # 打包态：直接调用随 exe 分发的 RF4Monitor（launcher 模式）与浮窗 exe。
         launcher_cmd = [
             str(BASE_DIR / "RF4Monitor.exe"),
+            *mode_args,
             "--set",
             f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
             "--set",
@@ -276,6 +312,7 @@ def start_monitor() -> str:
         launcher_cmd = [
             pythonw,
             str(BASE_DIR / "rf4_monitor.py"),
+            *mode_args,
             "--set",
             f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
             "--set",
@@ -386,6 +423,7 @@ def main() -> None:
             pystray.MenuItem("查看日志", on_log),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示设置", pystray.Menu(*show_menu_items)),
+            pystray.MenuItem("旁路监听(纯只读)", _toggle_mode, checked=_checked_mode),
             pystray.MenuItem("浮窗样式", pystray.Menu(*style_menu_items)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),

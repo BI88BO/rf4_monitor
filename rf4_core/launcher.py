@@ -847,7 +847,74 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default="",
         help="Path to the mitmdump executable. Defaults to tools/rf4_monitor/.venv/bin/mitmdump when available, otherwise PATH.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("proxy", "passive"),
+        default="proxy",
+        help="proxy=MITM 代理(默认，可改包注入)；passive=旁路抓包监听(纯只读，不改 hosts/证书)。",
+    )
     return parser.parse_known_args(argv)
+
+
+def _run_passive_mode(reference: ReferenceTrafficInfo, passthrough: list[str]) -> int:
+    """旁路监听模式：启动 RF4Sniffer 引擎（纯只读抓包）。
+
+    不写 hosts、不伪造证书、不启动 mitmdump。打包态下以 RF4_SNIFFER_MODE=1
+    复用同一个 exe；源码态直接 import 运行 passive_engine。
+    """
+    print("[rf4-monitor-runner] 旁路监听模式：纯只读抓包，不劫持不注入。")
+    print(f"[rf4-monitor-runner] realtime 参考: {', '.join(reference.realtime_hosts)}:{reference.realtime_port}")
+
+    # 透传 --set 选项给 passive_engine
+    option_args: list[str] = []
+    index = 0
+    while index < len(passthrough):
+        arg = passthrough[index]
+        if arg == "--set" and index + 1 < len(passthrough):
+            option_args.extend(["--set", passthrough[index + 1]])
+            index += 2
+        else:
+            index += 1
+
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, *option_args]
+        process_env = dict(os.environ)
+        process_env["PYTHONUNBUFFERED"] = "1"
+        process_env["RF4_SNIFFER_MODE"] = "1"
+    else:
+        command = [sys.executable, "-m", "rf4_core.passive_engine", *option_args]
+        process_env = dict(os.environ)
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    log_file = None
+    if creationflags:
+        log_dir = THIS_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "rf4_sniffer.log"
+        log_file = log_path.open("w", encoding="utf-8")
+        print(f"[rf4-monitor-runner] sniffer output is written to {log_file.name}")
+
+    print(f"[rf4-monitor-runner] command: {quote_command(command)}")
+    try:
+        process = subprocess.Popen(
+            command,
+            creationflags=creationflags,
+            stdout=log_file,
+            stderr=log_file if log_file is not None else None,
+            env=process_env,
+        )
+    except OSError as exc:
+        print(f"[rf4-monitor-runner] error: failed to start sniffer: {exc}", file=sys.stderr)
+        return 2
+    try:
+        process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    return process.returncode if process.returncode is not None else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -872,6 +939,10 @@ def main(argv: list[str] | None = None) -> int:
         selected_reverse_targets=selected_reverse_targets,
         selected_https_upstream_overrides=selected_https_upstream_overrides,
     )
+
+    # 旁路监听模式：纯只读抓包，不写 hosts、不伪造证书、不启动 mitmdump。
+    if args.mode == "passive":
+        return _run_passive_mode(reference, passthrough)
 
     if auto_apply_hosts or args.apply_hosts or args.hosts_dry_run:
         try:
