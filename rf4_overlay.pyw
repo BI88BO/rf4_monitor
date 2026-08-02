@@ -27,8 +27,10 @@ def load_config():
 
 
 def save_config(data):
+    existing = load_config()
+    existing.update(data)
     try:
-        CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        CONFIG_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -47,6 +49,17 @@ def load_fish_labels():
 
 
 class Overlay:
+    # 背景样式
+    STYLE_DARK = "dark"
+    STYLE_TRANSPARENT = "transparent"
+    DEFAULT_STYLE = STYLE_TRANSPARENT
+    _STYLES = {STYLE_DARK, STYLE_TRANSPARENT}
+    # 样式参数：背景色 / 前景色 / 是否透明键
+    _STYLE_PARAMS = {
+        STYLE_DARK: {"bg": "#101418", "fg": "#ffd166", "transparent": False},
+        STYLE_TRANSPARENT: {"bg": "#101418", "fg": "#ffd166", "transparent": True},
+    }
+
     def __init__(self, root, host, port):
         self.root = root
         self.host = host
@@ -58,7 +71,11 @@ class Overlay:
         self._rows = {}
         self._idle_visible = False
 
-        config = load_config()
+        config = self.load_config()
+        self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
+        if self.style not in self._STYLES:
+            self.style = self.DEFAULT_STYLE
+        self._last_cfg_mtime = self._cfg_mtime()
         pos = config.get("position")
         if isinstance(pos, dict) and isinstance(pos.get("x"), (int, float)) and isinstance(pos.get("y"), (int, float)):
             x = int(pos["x"])
@@ -70,13 +87,12 @@ class Overlay:
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#101418")
 
         self.label = tk.Label(
             root,
             text="",
-            bg="#101418",
-            fg="#ffd166",
+            bg=self._STYLE_PARAMS[self.style]["bg"],
+            fg=self._STYLE_PARAMS[self.style]["fg"],
             font=("Microsoft YaHei UI", 13, "bold"),
             padx=16,
             pady=12,
@@ -84,6 +100,8 @@ class Overlay:
             justify="center",
         )
         self.label.pack(fill="both", expand=True)
+        # 统一应用背景样式(含透明键设置)
+        self.apply_style(self.style)
 
         self._apply_noactivate()
         self._bind_drag(self.root)
@@ -115,6 +133,50 @@ class Overlay:
         self.sock.settimeout(0.2)
         self._refresh_display()
         self.root.after(100, self._poll)
+        self.root.after(800, self._poll_config)
+
+    def load_config(self):
+        return load_config()
+
+    def _cfg_mtime(self):
+        try:
+            return CONFIG_FILE.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def apply_style(self, style):
+        """应用背景样式(深色/透明)，运行时可切换。"""
+        params = self._STYLE_PARAMS.get(style)
+        if params is None:
+            return
+        bg = params["bg"]
+        fg = params["fg"]
+        transparent = params["transparent"]
+        self.style = style
+        self.root.configure(bg=bg)
+        self.label.configure(bg=bg, fg=fg)
+        try:
+            if transparent:
+                self.root.wm_attributes("-transparentcolor", bg)
+            else:
+                # 传入空串关闭透明键，恢复为不透明深色气泡背景
+                self.root.wm_attributes("-transparentcolor", "")
+                self.label.configure(fg=fg)
+        except tk.TclError:
+            pass
+        self._refresh_display()
+
+    def _poll_config(self):
+        try:
+            mtime = self._cfg_mtime()
+            if mtime != self._last_cfg_mtime:
+                self._last_cfg_mtime = mtime
+                cfg = load_config()
+                style = cfg.get("style", cfg.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
+                if style in self._STYLES:
+                    self.apply_style(style)
+        finally:
+            self.root.after(800, self._poll_config)
 
     def _apply_noactivate(self):
         try:

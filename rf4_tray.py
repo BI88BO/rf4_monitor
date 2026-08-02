@@ -28,6 +28,12 @@ MONITOR_LOG = LOG_DIR / "rf4_monitor.log"
 EVENT_BRIDGE_PORT = 25000
 SHOW_CONFIG_FILE = BASE_DIR / "rf4_show_config.json"
 
+# 浮窗背景样式配置(与 rf4_overlay.pyw 约定一致)
+OVERLAY_CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
+OVERLAY_STYLE_DARK = "dark"
+OVERLAY_STYLE_TRANSPARENT = "transparent"
+OVERLAY_STYLES = (OVERLAY_STYLE_DARK, OVERLAY_STYLE_TRANSPARENT)
+
 # 可勾选的显示项：(配置键, 菜单文本, addon 选项名)
 # 这些控制浮窗显示；日志始终全量输出，不受显示设置影响。
 SHOW_ITEMS = [
@@ -64,6 +70,63 @@ def _save_show_config(config: dict) -> None:
         )
     except OSError:
         pass
+
+
+def _load_overlay_config() -> dict:
+    try:
+        if OVERLAY_CONFIG_FILE.exists():
+            data = json.loads(OVERLAY_CONFIG_FILE.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_overlay_config(data: dict) -> None:
+    merged = _load_overlay_config()
+    merged.update(data)
+    try:
+        OVERLAY_CONFIG_FILE.write_text(
+            json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _get_overlay_style() -> str:
+    cfg = _load_overlay_config()
+    style = cfg.get("style")
+    if style in OVERLAY_STYLES:
+        return style
+    return OVERLAY_STYLE_DARK
+
+
+STYLE_LABELS = {
+    OVERLAY_STYLE_DARK: "深色气泡",
+    OVERLAY_STYLE_TRANSPARENT: "透明悬浮",
+}
+
+
+def _style_label_to_value(label: str) -> str:
+    for style, lab in STYLE_LABELS.items():
+        if lab == label:
+            return style
+    return ""
+
+
+def _set_overlay_style(icon, item) -> None:
+    style = _style_label_to_value(str(item.text))
+    if not style:
+        return
+    _save_overlay_config({"style": style})
+    if _state.get("running"):
+        icon.notify(
+            f"浮窗样式已切换为 {STYLE_LABELS[style]}", "RF4 Monitor"
+        )
+
+
+def _checked_style(item) -> bool:
+    return str(item.text) == STYLE_LABELS[_get_overlay_style()]
 
 try:
     import pystray
@@ -175,6 +238,8 @@ def start_monitor() -> str:
             str(BASE_DIR / "RF4Monitor.exe"),
             "--set",
             f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
+            "--set",
+            f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
         overlay_cmd = [str(BASE_DIR / "RF4Overlay.exe")]
         creationflags = 0
@@ -185,6 +250,8 @@ def start_monitor() -> str:
             str(BASE_DIR / "rf4_monitor.py"),
             "--set",
             f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
+            "--set",
+            f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
         overlay_cmd = [pythonw, str(BASE_DIR / "rf4_overlay.pyw")]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if pythonw.endswith("python.exe") else 0
@@ -268,6 +335,12 @@ def main() -> None:
     show_menu_items = [
         pystray.MenuItem(label, _toggle_show, checked=_checked_show) for _, label, _ in SHOW_ITEMS
     ]
+    style_menu_items = [
+        pystray.MenuItem(
+            STYLE_LABELS[style], _set_overlay_style, checked=_checked_style
+        )
+        for style in OVERLAY_STYLES
+    ]
     icon = pystray.Icon(
         "rf4_monitor_tray",
         icon=_make_icon(),
@@ -278,6 +351,7 @@ def main() -> None:
             pystray.MenuItem("查看日志", on_log),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示设置", pystray.Menu(*show_menu_items)),
+            pystray.MenuItem("浮窗样式", pystray.Menu(*style_menu_items)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),
         ),

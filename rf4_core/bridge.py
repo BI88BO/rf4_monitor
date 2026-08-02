@@ -373,6 +373,12 @@ class RF4ChatBridge:
         loader.add_option("rf4_show_unknown", bool, True, "Show unknown telemetry logs (未知协议).")
         loader.add_option("rf4_show_catch_broadcast", bool, True, "Show other players' catch broadcasts in overlay (频道鱼获).")
         loader.add_option("rf4_show_chat_broadcast", bool, True, "Show public chat in overlay (公共聊天).")
+        loader.add_option(
+            "rf4_show_config_path",
+            str,
+            "",
+            "Path to rf4_show_config.json so show toggles can be hot-reloaded at runtime. Empty = use --set flags only.",
+        )
 
     def configure(self, updated) -> None:
         self._profile = get_profile(ctx.options.rf4_profile)
@@ -381,6 +387,48 @@ class RF4ChatBridge:
             self._fish_labels_zh.update(load_fish_labels(self._profile.name))
         except Exception:
             pass
+        # 显示开关热重载缓存：记录配置文件路径与上次读取时间，运行时变更可被周期感知。
+        self._show_cfg_path = getattr(ctx.options, "rf4_show_config_path", "") or ""
+        self._show_cfg_mtime = 0.0
+        self._show_cfg_cache: Dict[Tuple[str, bool], bool] = {}
+        self._show_cfg_min_interval = 1.0  # 秒，避免每次广播读盘
+
+    def _show_enabled(self, option_name: str) -> bool:
+        """显示开关运行时解析：配置文件中用短键(如 incoming/catch_broadcast)。
+
+        优先读 rf4_show_config.json 的短键值，否则回退到 --set/option 默认值。
+        """
+        fallback = bool(getattr(ctx.options, option_name, True))
+        if not self._show_cfg_path:
+            return fallback
+        key = self._option_name_to_key(option_name)
+        try:
+            mtime = os.stat(self._show_cfg_path).st_mtime
+            if mtime != self._show_cfg_mtime:
+                with open(self._show_cfg_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    self._show_cfg_cache = {
+                        str(k): bool(v) for k, v in data.items() if isinstance(v, bool)
+                    }
+                self._show_cfg_mtime = mtime
+            if key in self._show_cfg_cache:
+                return self._show_cfg_cache[key]
+        except (OSError, ValueError, TypeError):
+            pass
+        return fallback
+
+    def _option_name_to_key(self, option_name: str) -> str:
+        # 托盘 rf4_show_config.json 使用短键，这里把 option 名反转成短键
+        return {
+            "rf4_show_incoming": "incoming",
+            "rf4_show_bitten": "bitten",
+            "rf4_show_kept": "kept",
+            "rf4_show_escaped": "escaped",
+            "rf4_show_released": "released",
+            "rf4_show_catch_broadcast": "catch_broadcast",
+            "rf4_show_chat_broadcast": "chat_broadcast",
+        }.get(option_name, option_name)
 
     def server_connect(self, data) -> None:
         if data.server.address is None:
@@ -1758,7 +1806,7 @@ class RF4ChatBridge:
         return self._inject_self_synthetic_event(session, synthetic)
 
     @staticmethod
-    def _self_phase_enabled(phase: str) -> bool:
+    def _self_phase_enabled(self, phase: str) -> bool:
         phase_switch = {
             "incoming": "rf4_show_incoming",
             "bitten": "rf4_show_bitten",
@@ -1768,7 +1816,7 @@ class RF4ChatBridge:
         }.get(phase)
         if not phase_switch:
             return True
-        return bool(getattr(ctx.options, phase_switch, True))
+        return self._show_enabled(phase_switch)
 
     def _broadcast_self_event(self, synthetic: SyntheticChatEvent) -> None:
         port = int(ctx.options.rf4_event_bridge_port or 0)
@@ -1781,7 +1829,7 @@ class RF4ChatBridge:
             self.SELF_EVENT_PHASE_ESCAPED: "rf4_show_escaped",
             self.SELF_EVENT_PHASE_RELEASED: "rf4_show_released",
         }.get(synthetic.phase)
-        if phase_switch and not bool(getattr(ctx.options, phase_switch, True)):
+        if phase_switch and not self._show_enabled(phase_switch):
             return
         fish_name = self._format_fish_name(synthetic.fish_key or "")
         event_name = {
@@ -1825,7 +1873,7 @@ class RF4ChatBridge:
             "fish_catch": "rf4_show_catch_broadcast",
             "chat": "rf4_show_chat_broadcast",
         }.get(event_name)
-        if switch and not bool(getattr(ctx.options, switch, True)):
+        if switch and not self._show_enabled(switch):
             return
         payload = json.dumps(
             {
