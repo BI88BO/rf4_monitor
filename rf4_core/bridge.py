@@ -1805,7 +1805,6 @@ class RF4ChatBridge:
             return b""
         return self._inject_self_synthetic_event(session, synthetic)
 
-    @staticmethod
     def _self_phase_enabled(self, phase: str) -> bool:
         phase_switch = {
             "incoming": "rf4_show_incoming",
