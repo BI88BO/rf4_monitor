@@ -168,8 +168,7 @@ class FlowSession:
     announced_fish_setup_ids: set[str] = field(default_factory=lambda: BoundedSet(256))
     latest_location_id: Optional[str] = None
     latest_users_count: Optional[int] = None
-    gear_slots: Dict[str, int] = field(default_factory=dict)
-    next_gear_slot: int = 1
+    slot_items: Dict[int, str] = field(default_factory=dict)
     next_synthetic_event_id: int = 0x71000000
     next_synthetic_call_id: int = 0x61000000
     next_synthetic_wire_id: int = 0x100000
@@ -1391,11 +1390,16 @@ class RF4ChatBridge:
                 )
 
             slot_request_sub_cmd = session.slot_request_calls.get(envelope.call_id)
-            if slot_request_sub_cmd is not None and envelope.marker == -2 and self._equipment_details_enabled():
-                slots = parse_slot_items_response_payload(envelope.payload)
-                if slots:
-                    label = self.SLOT_COMMAND_LABELS.get(slot_request_sub_cmd, "装备槽位响应")
-                    return "item", self._format_business_line(label, self._format_slot_items(slots, session))
+            if slot_request_sub_cmd is not None and envelope.marker == -2:
+                try:
+                    self._remember_server_slot_items(session, plain_body)
+                except Exception:
+                    pass
+                if self._equipment_details_enabled():
+                    slots = parse_slot_items_response_payload(envelope.payload)
+                    if slots:
+                        label = self.SLOT_COMMAND_LABELS.get(slot_request_sub_cmd, "装备槽位响应")
+                        return "item", self._format_business_line(label, self._format_slot_items(slots, session))
 
             catalog_keys = self._extract_gear_catalog_keys(envelope.payload)
             if envelope.marker == -2 and catalog_keys:
@@ -2622,19 +2626,16 @@ class RF4ChatBridge:
             session.fishing_end_requests[fishing_end_request.call_id] = fishing_end_request
             return plain_body, []
 
-        # 按抛竿顺序分配竿号：游戏里 1/2/3 号竿对应抛竿先后。
-        # 抛竿(14/2)和准备抛竿(14/1)时把该钓组ID分配递增竿号，后续来鱼/咬钩沿用。
+        # 记录抛竿动作：用钓组ID反查快捷键槽位，便于后续显示竿号。
         if envelope.main_cmd == session.profile.fishing_main_cmd and envelope.sub_cmd in (
             session.profile.cast_sub_cmd,
             session.profile.cast_prepare_sub_cmd,
         ):
             cast_gear = parse_fishing_gear_and_setup(envelope, session.profile, envelope.sub_cmd)
             if cast_gear and cast_gear.fishing_gear_id:
-                self._assign_gear_slot(session, cast_gear.fishing_gear_id)
                 if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
                     self._log(
                         f"cast 钓组={self._short_id(cast_gear.fishing_gear_id)} "
-                        f"竿号={session.gear_slots.get(cast_gear.fishing_gear_id)} "
                         f"sub={envelope.sub_cmd}"
                     )
 
@@ -2767,7 +2768,6 @@ class RF4ChatBridge:
                 and fish_setup.fish_setup_id not in session.announced_fish_setup_ids
             ):
                 session.announced_fish_setup_ids.add(fish_setup.fish_setup_id)
-                self._assign_gear_slot(session, fish_setup.fishing_gear_id)
                 synthetic = self._build_self_synthetic_event(
                     session=session,
                     fish_key=fish_setup.fish_key,
@@ -2876,19 +2876,28 @@ class RF4ChatBridge:
         if broadcast.users_count is not None:
             session.latest_users_count = broadcast.users_count
 
-    def _assign_gear_slot(self, session: FlowSession, fishing_gear_id: Optional[str]) -> None:
-        if not fishing_gear_id or fishing_gear_id in session.gear_slots:
+    def _remember_server_slot_items(self, session: FlowSession, plain_body: bytes) -> None:
+        envelope = parse_envelope(plain_body)
+        if envelope is None or envelope.marker != -2:
             return
-        session.gear_slots[fishing_gear_id] = session.next_gear_slot
-        session.next_gear_slot += 1
+        if envelope.call_id not in session.slot_request_calls:
+            return
+        try:
+            slots = parse_slot_items_response_payload(envelope.payload)
+        except Exception:
+            return
+        if not slots:
+            return
+        for slot in slots:
+            session.slot_items[slot.slot_type] = slot.item_guid
 
     def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
         if not fishing_gear_id:
             return ""
-        slot = session.gear_slots.get(fishing_gear_id)
-        if slot is None:
-            return ""
-        return f"{slot}号杆"
+        for slot_type, item_guid in session.slot_items.items():
+            if item_guid == fishing_gear_id:
+                return f"{slot_type}号杆"
+        return ""
 
     def _build_synthetic_broadcast(
         self,
