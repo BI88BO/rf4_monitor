@@ -1,10 +1,12 @@
 import json
 import math
 import os
+import re
 import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 
@@ -47,15 +49,21 @@ from .protocol import (
     FishSaleResult,
     FishSetupMeta,
     FishingEndRequest,
+    ItemCatalogEntry,
+    ItemObjectSummary,
+    ItemStateSummary,
     KeepFishRequest,
     ObservedCatchRecord,
     PhoenixArgument,
     RC4Stream,
     RepairRequestSummary,
     RF4ProtocolProfile,
+    RigComponentSummary,
+    RigDefinitionSummary,
     RoomBroadcast,
     RoomDetailItem,
     RpcEnvelope,
+    SlotItemSummary,
     WorkshopDiagnosisSummary,
     ascii_strings,
     build_ack_frame,
@@ -75,6 +83,7 @@ from .protocol import (
     parse_fishing_end_request,
     parse_fishing_gear_and_setup,
     parse_item_scope_summary,
+    parse_item_state_summary,
     parse_keep_fish_request,
     parse_observed_catch_records,
     parse_public_chat_request,
@@ -83,6 +92,7 @@ from .protocol import (
     parse_room_ack_response,
     parse_room_broadcast,
     parse_shop_result_text,
+    parse_slot_items_response_payload,
     parse_tagged_i64,
     parse_typed_arguments,
     parse_workshop_diagnosis,
@@ -109,6 +119,8 @@ except Exception:
     )
     http = SimpleNamespace(HTTPFlow=object)
     tcp = SimpleNamespace(TCPFlow=object)
+
+THIS_DIR = Path(__file__).resolve().parent
 
 _colorize_console_text = console._colorize_console_text
 
@@ -146,6 +158,7 @@ class FlowSession:
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
     building_request_calls: Dict[int, BuildingRpcRequest] = field(default_factory=lambda: BoundedDict(256))
+    slot_request_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
     observed_catches: Dict[str, ObservedCatchRecord] = field(default_factory=lambda: BoundedDict(2048))
     room_events: Dict[int, RoomBroadcast] = field(default_factory=lambda: BoundedDict(512))
     room_ack_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
@@ -286,6 +299,91 @@ class RF4ChatBridge:
         1: "请求当前装备槽位",
         2: "切换装备槽位",
     }
+    GEAR_GROUP_LABELS = {
+        "rod_spinning": "纺车路亚竿",
+        "rod_casting": "枪柄路亚竿",
+        "rod_feeder_legacy": "老式飞德竿",
+        "rod_pilker": "Pilker 海钓竿",
+        "rod_boat": "船钓竿",
+        "rod_telescopic": "手竿",
+        "rod_bolognese": "博洛尼亚竿",
+        "rod_match": "赛竿",
+        "rod_roubaisienne": "Roubaisienne 长竿",
+        "rod_fly_one_hand": "单手飞蝇竿",
+        "rod_fly_two_hand": "双手飞蝇竿",
+        "rod_picker": "Picker 竿",
+        "rod_feeder": "飞德竿",
+        "rod_carp": "鲤鱼竿",
+        "rod_jerking": "抽停竿",
+        "rod_spod": "打窝竿",
+        "rod_marker": "标记竿",
+        "rod_other": "其他鱼竿",
+        "reel_spinning": "纺车轮",
+        "reel_baitcasting_low": "低轮廓水滴轮",
+        "reel_baitcasting_round": "圆形鼓轮",
+        "reel_conventional": "传统海钓轮",
+        "reel_fly": "飞蝇轮",
+        "reel_other": "其他卷线器",
+        "line_mono": "尼龙线",
+        "line_fluorocarbon": "碳氟线",
+        "line_braid": "编织线",
+        "line_other": "其他主线",
+        "hook": "鱼钩",
+    }
+    CONFIG_TYPE_INFO = {
+        12046: (157, "rod"),
+        12035: (149, "reel"),
+        12024: (140, "line"),
+        12020: (131, "hook"),
+    }
+    ROD_SUBTYPES = {
+        0: "rod_feeder_legacy",
+        1: "rod_spinning",
+        2: "rod_casting",
+        3: "rod_telescopic",
+        4: "rod_bolognese",
+        5: "rod_match",
+        6: "rod_roubaisienne",
+        7: "rod_fly_one_hand",
+        8: "rod_fly_two_hand",
+        9: "rod_picker",
+        10: "rod_feeder",
+        11: "rod_carp",
+        12: "rod_jerking",
+        13: "rod_spod",
+        14: "rod_marker",
+        15: "rod_pilker",
+        16: "rod_boat",
+    }
+    REEL_SUBTYPES = {
+        1: "reel_spinning",
+        2: "reel_baitcasting_low",
+        3: "reel_baitcasting_round",
+        4: "reel_conventional",
+        5: "reel_fly",
+    }
+    LINE_SUBTYPES = {
+        1: "line_mono",
+        2: "line_fluorocarbon",
+        3: "line_braid",
+    }
+    _AUTHORITATIVE_GEAR_OBJECT_TYPES = frozenset({157, 149, 140, 131})
+    GEAR_TYPE_INFO = {object_type_id: base_group for config_type_id, (object_type_id, base_group) in CONFIG_TYPE_INFO.items()}
+    CATEGORY_LABELS = {
+        "rod": "鱼竿",
+        "reel": "卷线器",
+        "line": "鱼线",
+        "hook": "鱼钩",
+        "lure": "拟饵",
+        "bait": "饵料",
+        "float": "浮漂",
+        "sinker": "铅坠",
+        "cloth": "服装",
+        "food": "食物",
+        "map": "地图",
+        "aux": "辅助物品",
+        "other": "其他",
+    }
     BUILDING_COMMAND_LABELS = {
         (3, 13): "场地厨房进食",
         (3, 25): "场景管理处处罚状态查询",
@@ -368,6 +466,57 @@ class RF4ChatBridge:
             self._fish_labels_zh.update(load_fish_labels(self._profile.name))
         except Exception:
             pass
+        self._item_catalog_index: Dict[int, Tuple[ItemCatalogEntry, ...]] = {}
+        self._catalog_key_lookup: Dict[str, ItemCatalogEntry] = {}
+        try:
+            self._load_item_catalog_index()
+        except Exception:
+            pass
+
+    def _load_item_catalog_index(self) -> None:
+        candidates = [
+            THIS_DIR.parent / "catalog" / "catalog.json",
+            THIS_DIR / "catalog" / "catalog.json",
+            Path(sys.argv[0]).resolve().parent / "catalog" / "catalog.json",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            categories = payload.get("cats") if isinstance(payload.get("cats"), dict) else {}
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            index: Dict[int, List[ItemCatalogEntry]] = {}
+            key_lookup: Dict[str, ItemCatalogEntry] = {}
+            for raw_item in items:
+                if not isinstance(raw_item, dict):
+                    continue
+                catalog_id = str(raw_item.get("id") or "").strip()
+                if not catalog_id:
+                    continue
+                category = str(raw_item.get("cat") or raw_item.get("sub") or "").strip()
+                name = str(raw_item.get("name") or raw_item.get("en") or catalog_id).strip()
+                raw_stats = raw_item.get("stats") if isinstance(raw_item.get("stats"), dict) else {}
+                entry = ItemCatalogEntry(
+                    catalog_id=catalog_id,
+                    category=category,
+                    category_label=str(categories.get(category) or category or "物品"),
+                    name=name or catalog_id,
+                    stats=dict(raw_stats),
+                )
+                key_lookup.setdefault(catalog_id, entry)
+                for token in re.findall(r"\d+", catalog_id):
+                    item_id = int(token)
+                    if item_id <= 0:
+                        continue
+                    index.setdefault(item_id, []).append(entry)
+            self._item_catalog_index = {item_id: tuple(entries) for item_id, entries in index.items()}
+            self._catalog_key_lookup = key_lookup
+            return
 
     def load(self, loader) -> None:
         loader.add_option("rf4_enable_chat_bridge", bool, True, "Enable RF4 catch-to-chat injection.")
@@ -408,6 +557,12 @@ class RF4ChatBridge:
             bool,
             True,
             "Print field-level building/shop request/response details (store, fish market, workshop, boat).",
+        )
+        loader.add_option(
+            "rf4_log_equipment_details",
+            bool,
+            True,
+            "Print field-level equipment/item state payloads (gear rod/reel/line/hook details).",
         )
         loader.add_option(
             "rf4_log_low_level_telemetry",
@@ -714,6 +869,10 @@ class RF4ChatBridge:
     @staticmethod
     def _building_protocol_details_enabled() -> bool:
         return bool(getattr(ctx.options, "rf4_log_building_protocol_details", True))
+
+    @staticmethod
+    def _equipment_details_enabled() -> bool:
+        return bool(getattr(ctx.options, "rf4_log_equipment_details", True))
 
     @staticmethod
     def _low_level_telemetry_enabled() -> bool:
@@ -1180,6 +1339,13 @@ class RF4ChatBridge:
                     f"重量={weight} 规格={catch.size_enum} 鱼编号={self._short_id(keep_request.fish_setup_id)}",
                 )
 
+            slot_request_sub_cmd = session.slot_request_calls.get(envelope.call_id)
+            if slot_request_sub_cmd is not None and envelope.marker == -2 and self._equipment_details_enabled():
+                slots = parse_slot_items_response_payload(envelope.payload)
+                if slots:
+                    label = self.SLOT_COMMAND_LABELS.get(slot_request_sub_cmd, "装备槽位响应")
+                    return "item", self._format_business_line(label, self._format_slot_items(slots))
+
             catalog_keys = self._extract_gear_catalog_keys(envelope.payload)
             if envelope.marker == -2 and catalog_keys:
                 request_command = session.rpc_request_commands.get(envelope.call_id)
@@ -1279,6 +1445,21 @@ class RF4ChatBridge:
             label = self.SERVER_PLAYER_COMMAND_LABELS.get(envelope.sub_cmd)
             if label:
                 return "player", self._format_business_line(label, self._format_generic_business_payload(envelope.payload))
+            return None
+
+        if envelope.main_cmd == 4:
+            label = self.ITEM_COMMAND_LABELS.get(envelope.sub_cmd)
+            if envelope.sub_cmd == 22:
+                if not self._equipment_details_enabled():
+                    return None
+                item_details = self._format_item_state_payload(envelope.payload)
+                if not item_details:
+                    return None
+                return "item", self._format_business_line(label or "装备/物品更新", item_details)
+            if not self._low_level_telemetry_enabled():
+                return None
+            if label:
+                return "item", self._format_business_line(label, self._format_generic_business_payload(envelope.payload))
             return None
 
         if envelope.main_cmd == profile.fishing_main_cmd:
@@ -1613,6 +1794,196 @@ class RF4ChatBridge:
                 out.append(compact)
         return out
 
+    def _gear_item_group_hint_from_rig_component(self, line_type: Optional[int]) -> Optional[str]:
+        if line_type == 17:
+            return "rod_lure"
+        if line_type == 28:
+            return "rod_hand"
+        if line_type == 12:
+            return "line_main"
+        if line_type == 27:
+            return "hook"
+        return None
+
+    def _gear_group_matches(self, config_group: str, hint_group: str) -> bool:
+        config_base = config_group.split("_", 1)[0] if "_" in config_group else config_group
+        hint_base = hint_group.split("_", 1)[0] if "_" in hint_group else hint_group
+        if config_base == hint_base:
+            return True
+        return config_group.startswith(hint_group) or hint_group.startswith(config_group)
+
+    def _gear_config_by_id_lookup(self, item_id: int) -> Optional[dict]:
+        entries = self._item_catalog_index.get(item_id)
+        if not entries:
+            return None
+        for entry in entries:
+            if not entry.catalog_id.startswith(("spin_", "tele_", "bolo_", "match_", "picker_", "feeder_", "carp_", "ffish_", "bcr_", "conv_", "rgm_", "RGM_", "mono_", "braid_", "fluoro_", "jhead_")):
+                continue
+            category = entry.category
+            group_key = {
+                "rod": "rod_other",
+                "reel": "reel_other",
+                "line": "line_other",
+                "hook": "hook",
+            }.get(category)
+            if not group_key:
+                continue
+            return {
+                "config_id": item_id,
+                "system_id": entry.catalog_id,
+                "object_type_id": 0,
+                "group_key": group_key,
+                "attributes": dict(entry.stats),
+                "catalog_name": entry.name,
+                "category": category,
+            }
+        return None
+
+    def _format_item_id(
+        self,
+        item_id: int,
+        *,
+        object_type_id: Optional[int] = None,
+        group_hint: Optional[str] = None,
+    ) -> str:
+        config = self._gear_config_by_id_lookup(item_id)
+        if config:
+            category = str(config.get("category") or "")
+            group_key = str(config.get("group_key") or "")
+            group_label = (
+                self.CATEGORY_LABELS.get(category)
+                or self.GEAR_GROUP_LABELS.get(group_key, "装备部件")
+            )
+            catalog_name = str(config.get("catalog_name") or "")
+            return f"itemId={item_id}({group_label}/{catalog_name})"
+        return f"itemId={item_id}"
+
+    def _format_item_catalog_stats(
+        self,
+        item_id: int,
+        *,
+        object_type_id: Optional[int] = None,
+        group_hint: Optional[str] = None,
+    ) -> str:
+        config = self._gear_config_by_id_lookup(item_id)
+        if not config:
+            return ""
+        attributes = config.get("attributes")
+        if not isinstance(attributes, dict):
+            return ""
+        details: List[str] = []
+        reel_size = int(attributes.get("reel_size", 0) or 0)
+        if reel_size > 0:
+            details.append(f"轮尺寸={reel_size}")
+        allowed_sizes = [
+            int(value)
+            for value in attributes.get("allowed_reel_sizes", [])
+            if int(value) > 0
+        ]
+        if allowed_sizes:
+            details.append("适配轮尺寸=" + "/".join(str(value) for value in allowed_sizes))
+        if not details:
+            return ""
+        return "属性(" + ", ".join(details) + ")"
+
+    def _looks_like_ratio(self, value: Optional[float]) -> bool:
+        return value is not None and math.isfinite(value) and -0.001 <= value <= 1.25
+
+    def _format_percent(self, value: float) -> str:
+        return f"{max(0.0, min(1.0, value)) * 100.0:.1f}%"
+
+    def _format_item_condition(self, durability: Optional[float], condition: Optional[float]) -> str:
+        parts: List[str] = []
+        if durability is not None:
+            if self._looks_like_ratio(durability):
+                state = max(0.0, min(1.0, durability))
+                parts.append(f"状态={self._format_percent(state)}")
+                parts.append(f"磨损≈{self._format_percent(1.0 - state)}")
+            else:
+                parts.append(f"数量/状态={self._format_float(durability)}")
+        if condition is not None:
+            if self._looks_like_ratio(condition):
+                label = "上限/成色"
+                if durability is not None and self._looks_like_ratio(durability) and abs(condition - durability) < 0.0005:
+                    label = "成色"
+                parts.append(f"{label}={self._format_percent(max(0.0, min(1.0, condition)))}")
+            else:
+                parts.append(f"上限/状态={self._format_float(condition)}")
+        return " ".join(parts)
+
+    def _format_rig_component(self, component: RigComponentSummary) -> str:
+        parts: List[str] = []
+        group_hint = self._gear_item_group_hint_from_rig_component(component.line_type)
+        if component.line_type is not None:
+            parts.append(f"类型{component.line_type}")
+        if component.item_id is not None:
+            parts.append(self._format_item_id(component.item_id, group_hint=group_hint))
+            stats = self._format_item_catalog_stats(component.item_id, group_hint=group_hint)
+            if stats:
+                parts.append(stats)
+        if component.component_guid:
+            parts.append(f"guid={self._short_id(component.component_guid)}")
+        return " ".join(parts) if parts else "unknown"
+
+    def _format_item_object_summary(self, item: ItemObjectSummary) -> str:
+        parts: List[str] = []
+        if item.item_id is not None:
+            parts.append(self._format_item_id(item.item_id, object_type_id=item.object_type_id))
+            stats = self._format_item_catalog_stats(
+                item.item_id,
+                object_type_id=item.object_type_id,
+            )
+            if stats:
+                parts.append(stats)
+        else:
+            parts.append("未知物品")
+        parts.append(f"对象type={item.object_type_id}")
+        if item.slot is not None:
+            parts.append(f"槽位/类别={item.slot}")
+        if item.durability is not None or item.condition is not None:
+            parts.append(self._format_item_condition(item.durability, item.condition))
+        if item.item_guid:
+            parts.append(f"物品={self._short_id(item.item_guid)}")
+        if item.parent_guid:
+            parts.append(f"父钓组={self._short_id(item.parent_guid)}")
+        return " ".join(parts)
+
+    def _format_slot_items(self, slots: Tuple[SlotItemSummary, ...]) -> str:
+        formatted = [
+            f"槽位{slot.slot_type}={self._short_id(slot.item_guid)}"
+            for slot in slots[:12]
+        ]
+        if len(slots) > 12:
+            formatted.append(f"…+{len(slots) - 12}")
+        return "[" + "; ".join(formatted) + "]" if formatted else "无"
+
+    def _format_item_state_payload(self, payload: bytes) -> str:
+        summary = parse_item_state_summary(payload)
+        parts: List[str] = []
+        for rig in summary.rig_definitions[:3]:
+            rig_parts = [f"类型={rig.rig_key}"]
+            if rig.line_type is not None:
+                rig_parts.append(f"lineType={rig.line_type}")
+            if rig.components:
+                rig_parts.append(
+                    "组件=["
+                    + ", ".join(self._format_rig_component(component) for component in rig.components[:8])
+                    + "]"
+                )
+            parts.append("钓组定义{" + " ".join(rig_parts) + "}")
+        if summary.item_objects:
+            formatted_items = [
+                self._format_item_object_summary(item)
+                for item in summary.item_objects[:8]
+            ]
+            if len(summary.item_objects) > 8:
+                formatted_items.append("...")
+            parts.append("装备/物品状态=[" + "; ".join(formatted_items) + "]")
+        catalog_keys = self._extract_gear_catalog_keys(payload)
+        if catalog_keys:
+            parts.append("名称key=[" + ", ".join(catalog_keys[:12]) + (", ..." if len(catalog_keys) > 12 else "") + "]")
+        return " ".join(part for part in parts if part)
+
     def _describe_building_response(
         self,
         session: FlowSession,
@@ -1655,12 +2026,16 @@ class RF4ChatBridge:
             if result is not None:
                 details = self._format_workshop_diagnosis(result)
         elif command in {(21, 3), (21, 4)}:
-            details = self._format_building_response_fallback(payload)
+            item_details = self._format_item_state_payload(payload) if self._equipment_details_enabled() else ""
+            details = item_details or self._format_building_response_fallback(payload)
         elif command in {(22, 2), (22, 3)}:
             result_text = parse_shop_result_text(payload)
+            item_details = self._format_item_state_payload(payload) if self._equipment_details_enabled() else ""
             parts = []
             if result_text:
                 parts.append(f"回执={self._quote_text(self._clean_text(result_text), limit=100)}")
+            if item_details:
+                parts.append(item_details)
             if not parts:
                 details = self._format_building_response_fallback(payload)
             else:
@@ -1704,9 +2079,11 @@ class RF4ChatBridge:
                     values.append(f"…+{len(catches) - 12}")
                 details = f"鱼获数量={len(catches)} 鱼获=[{'; '.join(values)}]"
             else:
-                details = self._format_building_response_fallback(payload)
+                item_details = self._format_item_state_payload(payload) if self._equipment_details_enabled() else ""
+                details = item_details or self._format_building_response_fallback(payload)
         elif command == (4, 8):
-            details = self._format_building_response_fallback(payload)
+            item_details = self._format_item_state_payload(payload) if self._equipment_details_enabled() else ""
+            details = item_details or self._format_building_response_fallback(payload)
 
         if not details:
             catalog_keys = self._extract_gear_catalog_keys(payload)
@@ -2132,6 +2509,14 @@ class RF4ChatBridge:
             return plain_body, []
         self._detect_anticheat(session, envelope, from_client=True)
 
+        # 装备槽位请求(11/x)：登记 call_id→子命令，供服务器响应时反查槽位内容。
+        if (
+            envelope.marker == -1
+            and envelope.main_cmd == 11
+            and envelope.sub_cmd is not None
+        ):
+            session.slot_request_calls[envelope.call_id] = envelope.sub_cmd
+
         # 结束钓鱼(14/4)请求：登记 call_id→请求，供服务器响应时反查鱼名/重量。
         fishing_end_request = parse_fishing_end_request(envelope, session.profile)
         if fishing_end_request:
@@ -2262,6 +2647,7 @@ class RF4ChatBridge:
         if envelope.marker == -2:
             session.building_request_calls.pop(envelope.call_id, None)
             session.rpc_request_commands.pop(envelope.call_id, None)
+            session.slot_request_calls.pop(envelope.call_id, None)
 
         fish_setup = parse_fish_setup_push(envelope, session.profile)
         if fish_setup:

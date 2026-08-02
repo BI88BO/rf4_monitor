@@ -83,6 +83,7 @@ def get_profile(name: str) -> RF4ProtocolProfile:
         raise ValueError(f"unknown RF4 profile '{name}', expected one of: {known}") from exc
 
 # --- Binary protocol codec ---
+import math
 import re
 import struct
 import time
@@ -598,6 +599,210 @@ def parse_fishing_end_request(envelope: RpcEnvelope, profile: RF4ProtocolProfile
     )
 
 
+def parse_slot_items_response_payload(data: bytes) -> Tuple[SlotItemSummary, ...]:
+    def parse_one(pos: int, end: int) -> tuple[Optional[SlotItemSummary], int]:
+        try:
+            object_type_id, pos = read_object_header(data, pos)
+        except (ValueError, IndexError):
+            return None, end
+        if object_type_id != 136 or pos + 18 > end:
+            return None, end
+        slot_type = u16(data, pos)
+        pos += 2
+        item_guid = guid_le(data[pos:pos + 16])
+        pos += 16
+        return SlotItemSummary(slot_type=slot_type, item_guid=item_guid), pos
+
+    end = len(data)
+    header = read_typed_list_header(data, 0)
+    if header is None:
+        item, _ = parse_one(0, end)
+        return (item,) if item is not None else ()
+    type_code, count, pos = header
+    if type_code != "65":
+        return ()
+    out: List[SlotItemSummary] = []
+    for _ in range(count):
+        item, pos = parse_one(pos, end)
+        if item is None:
+            break
+        out.append(item)
+    return tuple(out)
+
+
+def _scan_object_offsets(data: bytes) -> List[Tuple[int, int]]:
+    offsets: List[Tuple[int, int]] = []
+    pos = 0
+    while pos + 5 <= len(data):
+        pos = data.find(b"\x01", pos)
+        if pos < 0 or pos + 5 > len(data):
+            break
+        object_type_id = u32(data, pos + 1)
+        if 100 <= object_type_id <= 10000:
+            offsets.append((pos, object_type_id))
+            pos += 5
+        else:
+            pos += 1
+    return offsets
+
+
+def _plausible_item_float(value: Optional[float]) -> bool:
+    if value is None or not math.isfinite(value) or not (-10.0 <= value <= 100.0):
+        return False
+    if 0.0 < abs(value) < 0.00001:
+        return False
+    return True
+
+
+def _parse_rig_definition_at(data: bytes, offset: int, end: int) -> Optional[RigDefinitionSummary]:
+    try:
+        object_type_id, pos = read_object_header(data, offset)
+        if object_type_id != 153:
+            return None
+        rig_key, pos = read_short_string(data, pos)
+        if not rig_key or not rig_key.startswith("rig_"):
+            return None
+        rig_line_type = data[pos] if pos < end else None
+        if pos < end:
+            pos += 1
+        header = read_typed_list_header(data, pos)
+        if header is None:
+            return RigDefinitionSummary(rig_key=rig_key, line_type=rig_line_type, components=())
+        _, count, pos = header
+        components: List[RigComponentSummary] = []
+        for _ in range(count):
+            if pos + 26 > end:
+                break
+            component_type, pos = read_object_header(data, pos)
+            if component_type != 152:
+                break
+            line_type = data[pos] if pos < end else None
+            pos += 1
+            component_guid = None
+            if pos + 16 <= end:
+                component_guid = guid_le(data[pos:pos + 16])
+                pos += 16
+            item_id = None
+            if pos + 4 <= end:
+                item_id = i32(data, pos)
+                pos += 4
+            components.append(
+                RigComponentSummary(
+                    line_type=line_type,
+                    component_guid=component_guid,
+                    item_id=item_id if item_id is not None and item_id > 0 else None,
+                )
+            )
+        return RigDefinitionSummary(
+            rig_key=rig_key,
+            line_type=rig_line_type,
+            components=tuple(components),
+        )
+    except (ValueError, IndexError, struct.error):
+        return None
+
+
+def _find_item_object_layout(data: bytes, pos: int, end: int) -> Optional[Tuple[int, int, int, int]]:
+    best: Optional[Tuple[int, int, int, int, int]] = None
+    for gear_start in range(pos + 1, max(pos + 1, end - 45)):
+        after_guid = gear_start + 16
+        if after_guid + 30 > end:
+            continue
+        for item_id_shift in (1, 2):
+            item_id_pos = after_guid + item_id_shift
+            if item_id_pos + 12 > end:
+                continue
+            item_id = i32(data, item_id_pos)
+            durability = f32(data, item_id_pos + 4)
+            condition = f32(data, item_id_pos + 8)
+            if not (0 < item_id < 300000):
+                continue
+            if not (_plausible_item_float(durability) and _plausible_item_float(condition)):
+                continue
+            score = 0
+            if gear_start - 1 >= pos and data[gear_start - 1] in (0, 1, 0x8A):
+                score += 2
+            if gear_start - pos in (17, 21):
+                score += 2
+            if item_id_shift == 1:
+                score += 1
+            if best is None or score > best[0]:
+                best = (score, gear_start, after_guid, item_id_shift, item_id_pos)
+    if best is None:
+        return None
+    _, gear_start, after_guid, item_id_shift, item_id_pos = best
+    return gear_start, after_guid, item_id_shift, item_id_pos
+
+
+def _parse_item_object_at(
+    data: bytes,
+    pos: int,
+    end: int,
+    object_type_id: int,
+) -> Optional[ItemObjectSummary]:
+    layout = _find_item_object_layout(data, pos, end)
+    if layout is None:
+        return None
+    gear_start, after_guid, item_id_shift, item_id_pos = layout
+    item_guid = None
+    pre_parent_len = gear_start - pos
+    if pre_parent_len in (17, 21) and pos + 16 <= gear_start:
+        item_guid = guid_le(data[pos:pos + 16])
+    elif pre_parent_len > 17:
+        item_guid_pos = gear_start - 17
+        if item_guid_pos >= pos and item_guid_pos + 16 <= gear_start:
+            item_guid = guid_le(data[item_guid_pos:item_guid_pos + 16])
+    parent_guid = guid_le(data[gear_start:after_guid]) if after_guid <= end else None
+    slot = data[after_guid] if after_guid < end else None
+    item_id = i32(data, item_id_pos) if item_id_pos + 4 <= end else None
+    durability = f32(data, item_id_pos + 4) if item_id_pos + 8 <= end else None
+    condition = f32(data, item_id_pos + 8) if item_id_pos + 12 <= end else None
+    if item_id is None or item_id <= 0:
+        return None
+    if item_id_shift not in (1, 2):
+        return None
+    return ItemObjectSummary(
+        object_type_id=object_type_id,
+        item_guid=item_guid,
+        parent_guid=parent_guid,
+        slot=slot,
+        item_id=item_id,
+        durability=durability if _plausible_item_float(durability) else None,
+        condition=condition if _plausible_item_float(condition) else None,
+    )
+
+
+def parse_item_state_summary(
+    data: bytes,
+    *,
+    max_items: Optional[int] = 16,
+) -> ItemStateSummary:
+    object_offsets = _scan_object_offsets(data)
+    rigs: List[RigDefinitionSummary] = []
+    items: List[ItemObjectSummary] = []
+    for index, (offset, object_type_id) in enumerate(object_offsets):
+        next_offset = object_offsets[index + 1][0] if index + 1 < len(object_offsets) else len(data)
+        if object_type_id == 153:
+            rig_end = len(data)
+            for later_offset, later_type_id in object_offsets[index + 1:]:
+                if later_type_id != 152:
+                    rig_end = later_offset
+                    break
+            rig = _parse_rig_definition_at(data, offset, rig_end)
+            if rig is not None and rig not in rigs:
+                rigs.append(rig)
+            continue
+        if 100 <= object_type_id < 200 and object_type_id not in {141, 143, 152, 153}:
+            item = _parse_item_object_at(data, offset + 5, next_offset, object_type_id)
+            if item is not None and item not in items:
+                items.append(item)
+    visible_items = items if max_items is None else items[:max_items]
+    return ItemStateSummary(
+        rig_definitions=tuple(rigs[:8]),
+        item_objects=tuple(visible_items),
+    )
+
+
 def ascii_strings(data: bytes, min_len: int = 4) -> List[str]:
     out: List[str] = []
     buf: List[str] = []
@@ -785,6 +990,52 @@ class WorkshopPartSummary:
 class WorkshopDiagnosisSummary:
     item_guid: str
     parts: Tuple[WorkshopPartSummary, ...]
+
+
+@dataclass(frozen=True)
+class RigComponentSummary:
+    line_type: Optional[int]
+    component_guid: Optional[str]
+    item_id: Optional[int]
+
+
+@dataclass(frozen=True)
+class RigDefinitionSummary:
+    rig_key: str
+    line_type: Optional[int]
+    components: Tuple[RigComponentSummary, ...]
+
+
+@dataclass(frozen=True)
+class ItemObjectSummary:
+    object_type_id: int
+    item_guid: Optional[str]
+    parent_guid: Optional[str]
+    slot: Optional[int]
+    item_id: Optional[int]
+    durability: Optional[float]
+    condition: Optional[float]
+
+
+@dataclass(frozen=True)
+class ItemStateSummary:
+    rig_definitions: Tuple[RigDefinitionSummary, ...]
+    item_objects: Tuple[ItemObjectSummary, ...]
+
+
+@dataclass(frozen=True)
+class SlotItemSummary:
+    slot_type: int
+    item_guid: str
+
+
+@dataclass(frozen=True)
+class ItemCatalogEntry:
+    catalog_id: str
+    category: str
+    category_label: str
+    name: str
+    stats: Dict[str, object]
 
 
 class RC4Stream:
