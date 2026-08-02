@@ -159,6 +159,7 @@ class FlowSession:
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
     building_request_calls: Dict[int, BuildingRpcRequest] = field(default_factory=lambda: BoundedDict(256))
     slot_request_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
+    item_guid_to_id: Dict[str, Tuple[int, int]] = field(default_factory=lambda: BoundedDict(2048))
     observed_catches: Dict[str, ObservedCatchRecord] = field(default_factory=lambda: BoundedDict(2048))
     room_events: Dict[int, RoomBroadcast] = field(default_factory=lambda: BoundedDict(512))
     room_ack_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
@@ -1394,7 +1395,7 @@ class RF4ChatBridge:
                 slots = parse_slot_items_response_payload(envelope.payload)
                 if slots:
                     label = self.SLOT_COMMAND_LABELS.get(slot_request_sub_cmd, "装备槽位响应")
-                    return "item", self._format_business_line(label, self._format_slot_items(slots))
+                    return "item", self._format_business_line(label, self._format_slot_items(slots, session))
 
             catalog_keys = self._extract_gear_catalog_keys(envelope.payload)
             if envelope.marker == -2 and catalog_keys:
@@ -1502,6 +1503,10 @@ class RF4ChatBridge:
             if envelope.sub_cmd == 22:
                 if not self._equipment_details_enabled():
                     return None
+                try:
+                    self._remember_gear_item_guids(session, envelope.payload)
+                except Exception:
+                    pass
                 item_details = self._format_item_state_payload(envelope.payload)
                 if not item_details:
                     return None
@@ -2008,14 +2013,41 @@ class RF4ChatBridge:
             parts.append(f"父钓组={self._short_id(item.parent_guid)}")
         return " ".join(parts)
 
-    def _format_slot_items(self, slots: Tuple[SlotItemSummary, ...]) -> str:
-        formatted = [
-            f"槽位{slot.slot_type}={self._short_id(slot.item_guid)}"
-            for slot in slots[:12]
-        ]
+    def _format_slot_items(
+        self,
+        slots: Tuple[SlotItemSummary, ...],
+        session: Optional[FlowSession] = None,
+    ) -> str:
+        formatted = []
+        for slot in slots[:12]:
+            label = self._slot_item_label(session, slot.item_guid)
+            formatted.append(f"槽位{slot.slot_type}={label}")
         if len(slots) > 12:
             formatted.append(f"…+{len(slots) - 12}")
         return "[" + "; ".join(formatted) + "]" if formatted else "无"
+
+    def _slot_item_label(self, session: Optional[FlowSession], item_guid: str) -> str:
+        short_id = self._short_id(item_guid)
+        if not session:
+            return short_id
+        resolved = session.item_guid_to_id.get(item_guid)
+        if not resolved:
+            return short_id
+        item_id, object_type_id = resolved
+        name = self._format_item_id(item_id, object_type_id=object_type_id)
+        return f"{name} {short_id}"
+
+    def _remember_gear_item_guids(self, session: FlowSession, payload: bytes) -> None:
+        summary = parse_item_state_summary(payload)
+        for item in summary.item_objects:
+            if not item.item_guid or item.item_id is None:
+                continue
+            session.item_guid_to_id[item.item_guid] = (item.item_id, item.object_type_id)
+        for rig in summary.rig_definitions:
+            for component in rig.components:
+                if not component.component_guid or component.item_id is None:
+                    continue
+                session.item_guid_to_id[component.component_guid] = (component.item_id, 152)
 
     def _format_item_state_payload(self, payload: bytes) -> str:
         summary = parse_item_state_summary(payload)
@@ -2703,6 +2735,13 @@ class RF4ChatBridge:
         if not envelope:
             return bytes(out)
         self._detect_anticheat(session, envelope, from_client=False)
+
+        # 4/22 装备/物品状态推送：学习 item_guid→item_id 映射，供槽位反查杆子型号。
+        if envelope.marker == -1 and envelope.main_cmd == 4 and envelope.sub_cmd == 22:
+            try:
+                self._remember_gear_item_guids(session, envelope.payload)
+            except Exception:
+                pass
 
         if envelope.marker == -2:
             session.building_request_calls.pop(envelope.call_id, None)
