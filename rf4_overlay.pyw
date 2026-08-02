@@ -60,6 +60,8 @@ class Overlay:
     STYLE_TRANSPARENT = "transparent"
     DEFAULT_STYLE = STYLE_TRANSPARENT
     _STYLES = {STYLE_DARK, STYLE_TRANSPARENT}
+    # 遥测信息区最多保留的行数
+    MAX_TELEMETRY_ROWS = 8
     # 样式参数：背景色 / 前景色 / 透明键色
     # 透明模式：用背景色作为透明键，仅文字可见。
     # 深色模式：透明键设为一个绝不出现的哨兵色，背景即恢复不透明。
@@ -75,8 +77,11 @@ class Overlay:
         self.labels = load_fish_labels()
         self.visible = False
         self._drag_offset = None
-        # 按杆号分行显示：key=杆号文本, value=该杆最新状态行
+        # 按竿号分行显示：key=竿号文本, value=该竿最新状态行
         self._rows = {}
+        # 遥测信息区：多条(商店/装备等)，有序，最多保留 MAX_TELEMETRY_ROWS 条
+        self._telemetry_rows = {}
+        self._telemetry_seq = 0
         self._idle_visible = False
 
         config = self.load_config()
@@ -105,7 +110,8 @@ class Overlay:
             padx=16,
             pady=12,
             wraplength=WINDOW_WIDTH - 32,
-            justify="center",
+            justify="left",
+            anchor="w",
         )
         self.label.pack(fill="both", expand=True)
         # 统一应用背景样式(含透明键设置)
@@ -230,10 +236,34 @@ class Overlay:
                 self._rows.pop("", None)
             self._refresh_display()
 
+    def _show_telemetry(self, text):
+        # 遥测信息独立成区：新消息追加，不覆盖旧的；超限时丢弃最旧。
+        self._telemetry_seq += 1
+        self._telemetry_rows[self._telemetry_seq] = text
+        if len(self._telemetry_rows) > self.MAX_TELEMETRY_ROWS:
+            oldest = next(iter(self._telemetry_rows))
+            self._telemetry_rows.pop(oldest, None)
+        seq = self._telemetry_seq
+        self._refresh_display()
+        self.root.after(3000, lambda: self._clear_telemetry(seq, text))
+
+    def _clear_telemetry(self, seq, expected_text):
+        if self._telemetry_rows.get(seq) == expected_text:
+            self._telemetry_rows.pop(seq, None)
+            self._refresh_display()
+
     def _refresh_display(self):
-        lines = list(self._rows.values())
-        if not lines:
-            lines = ["RF4 来鱼提醒 · 待机中"]
+        # 分区：先鱼事件行(按竿号)，再遥测信息区；无内容时回到待机。
+        sections = []
+        fish_lines = list(self._rows.values())
+        if fish_lines:
+            sections.append("\n".join(fish_lines))
+        tele_lines = list(self._telemetry_rows.values())
+        if tele_lines:
+            if sections:
+                sections.append("-" * 8)
+            sections.append("\n".join(tele_lines))
+        lines = sections or ["RF4 来鱼提醒 · 待机中"]
         display = "\n".join(lines)
         self.label.config(text=display)
         # 按内容实际需求高度调整窗口，避免多杆/换行时内容被裁切
@@ -299,15 +329,17 @@ class Overlay:
         self._update_row(gear_slot, f"【我自己】：{prefix}放生了 {name}", clear_after=3000)
 
     def _show_generic(self, text):
-        self._update_row("", text, clear_after=3000)
+        # 频道鱼获/公共聊天/遥测等"信息类"统一进遥测区，独立分行显示。
+        self._show_telemetry(text)
 
     def _show_anticheat(self, text):
         self.label.config(fg="#ff5252")
-        self._update_row("", text, clear_after=8000)
+        self._show_telemetry(text)
         self.root.after(8000, lambda: self.label.config(fg="#ffd166"))
 
     def _reset_to_idle(self):
         self._rows.clear()
+        self._telemetry_rows.clear()
         self._refresh_display()
 
     def _hide(self):
