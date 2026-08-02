@@ -6,11 +6,16 @@
 import json
 import math
 import socket
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # 打包态：__file__ 指向临时解压区(_MEIPASS)，改用 exe 所在目录，
+    # 才能正确读写随 exe 分发的 rf4_overlay_config.json 与鱼种标签。
+    BASE_DIR = Path(sys.executable).resolve().parent
 CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
 
 DEFAULT_HOST = "127.0.0.1"
