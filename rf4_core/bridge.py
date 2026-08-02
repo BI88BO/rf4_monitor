@@ -658,6 +658,8 @@ class RF4ChatBridge:
         loader.add_option("rf4_show_room", bool, True, "Show room telemetry logs (房间消息).")
         loader.add_option("rf4_show_session", bool, True, "Show session telemetry logs (会话信息).")
         loader.add_option("rf4_show_unknown", bool, True, "Show unknown telemetry logs (未知协议).")
+        loader.add_option("rf4_show_item", bool, True, "Show item/equipment telemetry logs (装备/物品).")
+        loader.add_option("rf4_show_building", bool, True, "Show building/shop telemetry logs (商店/鱼市/工坊/船).")
         loader.add_option("rf4_show_catch_broadcast", bool, True, "Show other players' catch broadcasts in overlay (频道鱼获).")
         loader.add_option("rf4_show_chat_broadcast", bool, True, "Show public chat in overlay (公共聊天).")
         loader.add_option(
@@ -715,6 +717,15 @@ class RF4ChatBridge:
             "rf4_show_released": "released",
             "rf4_show_catch_broadcast": "catch_broadcast",
             "rf4_show_chat_broadcast": "chat_broadcast",
+            "rf4_show_fish": "telemetry_fish",
+            "rf4_show_player": "telemetry_player",
+            "rf4_show_feed": "telemetry_feed",
+            "rf4_show_chat": "telemetry_chat",
+            "rf4_show_room": "telemetry_room",
+            "rf4_show_session": "telemetry_session",
+            "rf4_show_unknown": "telemetry_unknown",
+            "rf4_show_item": "telemetry_item",
+            "rf4_show_building": "telemetry_building",
         }.get(option_name, option_name)
 
     def server_connect(self, data) -> None:
@@ -893,6 +904,51 @@ class RF4ChatBridge:
         if not self._telemetry_enabled(category):
             return
         self._safe_log(text)
+        self._broadcast_telemetry(category, text)
+
+    def _broadcast_telemetry(self, category: str, text: str) -> None:
+        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
+        if port <= 0:
+            return
+        switch = self._telemetry_show_option(category)
+        if switch and not self._show_enabled(switch):
+            return
+        payload = json.dumps(
+            {
+                "event": "telemetry",
+                "category": category,
+                "text": text,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            import socket
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.sendto(payload.encode("utf-8"), (ctx.options.rf4_event_bridge_host, port))
+            finally:
+                sock.close()
+        except OSError:
+            if ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"failed to broadcast telemetry {category} on {ctx.options.rf4_event_bridge_host}:{port}"
+                )
+
+    @staticmethod
+    def _telemetry_show_option(category: str) -> str:
+        return {
+            "fish": "rf4_show_fish",
+            "player": "rf4_show_player",
+            "feed": "rf4_show_feed",
+            "chat": "rf4_show_chat",
+            "room": "rf4_show_room",
+            "session": "rf4_show_session",
+            "unknown": "rf4_show_unknown",
+            "item": "rf4_show_item",
+            "building": "rf4_show_building",
+        }.get(category, "rf4_show_unknown")
 
     @staticmethod
     def _telemetry_enabled(category: str) -> bool:

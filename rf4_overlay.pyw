@@ -348,6 +348,10 @@ class Overlay:
                     self.root.after(0, self._show_released, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
                 elif name in ("fish_catch", "chat"):
                     self.root.after(0, self._show_generic, event.get("text") or "")
+                elif name == "telemetry":
+                    text = event.get("text") or ""
+                    if text:
+                        self.root.after(0, self._show_generic, text)
                 elif name == "anticheat":
                     self.root.after(0, self._show_anticheat, event.get("text") or "")
         finally:

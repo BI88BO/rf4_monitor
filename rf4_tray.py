@@ -63,6 +63,15 @@ SHOW_ITEMS = [
     ("released", "自己放生", "rf4_show_released"),
     ("catch_broadcast", "频道鱼获（其他玩家）", "rf4_show_catch_broadcast"),
     ("chat_broadcast", "公共聊天", "rf4_show_chat_broadcast"),
+    ("telemetry_fish", "遥测·钓鱼过程", "rf4_show_fish"),
+    ("telemetry_player", "遥测·玩家坐标/状态", "rf4_show_player"),
+    ("telemetry_feed", "遥测·打窝/投喂", "rf4_show_feed"),
+    ("telemetry_chat", "遥测·公共聊天", "rf4_show_chat"),
+    ("telemetry_room", "遥测·房间消息", "rf4_show_room"),
+    ("telemetry_session", "遥测·会话信息", "rf4_show_session"),
+    ("telemetry_item", "遥测·装备/物品", "rf4_show_item"),
+    ("telemetry_building", "遥测·商店/鱼市/工坊/船", "rf4_show_building"),
+    ("telemetry_unknown", "遥测·未知协议", "rf4_show_unknown"),
 ]
 
 DEFAULT_SHOW = {key: True for key, _, _ in SHOW_ITEMS}
