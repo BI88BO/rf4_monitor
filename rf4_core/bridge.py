@@ -169,8 +169,6 @@ class FlowSession:
     latest_location_id: Optional[str] = None
     latest_users_count: Optional[int] = None
     slot_items: Dict[int, str] = field(default_factory=dict)
-    active_slot_type: Optional[int] = None
-    active_slot_guid: Optional[str] = None
     next_synthetic_event_id: int = 0x71000000
     next_synthetic_call_id: int = 0x61000000
     next_synthetic_wire_id: int = 0x100000
@@ -2951,12 +2949,9 @@ class RF4ChatBridge:
         if not slots:
             return
         # 11/1(请求当前装备槽位)响应包含完整快捷键槽位映射，可更新 slot_items 反查竿号。
-        # 11/2(切换装备槽位)响应只是"当前活动槽位"单条，用它覆盖会把快捷键映射污染，
-        # 导致竿号错乱，因此只记录当前活动槽位、不覆盖映射。
+        # 11/2(切换装备槽位)响应只是"当前活动槽位"单条(slot_type 恒为 4，非快捷键编号)，
+        # 不更新映射也不参与竿号显示，直接忽略。
         if sub_cmd == 2:
-            for slot in slots:
-                session.active_slot_type = slot.slot_type
-                session.active_slot_guid = slot.item_guid
             return
         for slot in slots:
             session.slot_items[slot.slot_type] = slot.item_guid
@@ -2964,9 +2959,9 @@ class RF4ChatBridge:
     def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
         if not fishing_gear_id:
             return ""
-        # 当前活动槽位优先：11/2 切换槽位记录的是玩家当前操作的竿位。
-        if session.active_slot_guid == fishing_gear_id and session.active_slot_type is not None:
-            return f"{session.active_slot_type}号杆"
+        # 竿号只来自 11/1 请求当前装备槽位的完整快捷键映射(slot_items 1/2/3...)。
+        # 注意：11/2 切换槽位响应的 slot_type 恒为 4(当前活动位)，不是快捷键编号，
+        # 不能用它反查竿号，否则会错误显示"4号杆"。
         for slot_type, item_guid in session.slot_items.items():
             if item_guid == fishing_gear_id:
                 return f"{slot_type}号杆"
