@@ -54,6 +54,9 @@ class Overlay:
         self.labels = load_fish_labels()
         self.visible = False
         self._drag_offset = None
+        # 按杆号分行显示：key=杆号文本, value=该杆最新状态行
+        self._rows = {}
+        self._idle_visible = False
 
         config = load_config()
         pos = config.get("position")
@@ -110,8 +113,7 @@ class Overlay:
             return
 
         self.sock.settimeout(0.2)
-        self.label.config(text="RF4 来鱼提醒 · 待机中")
-        self._show()
+        self._refresh_display()
         self.root.after(100, self._poll)
 
     def _apply_noactivate(self):
@@ -143,35 +145,89 @@ class Overlay:
         self._drag_offset = None
         save_config({"position": {"x": self.root.winfo_x(), "y": self.root.winfo_y()}})
 
-    def _show_incoming(self, fish_key, fish_name, weight_g):
+    def _update_row(self, gear_slot, text, clear_after=0):
+        if gear_slot:
+            self._rows[gear_slot] = text
+        else:
+            self._rows[""] = text
+        self._refresh_display()
+        if clear_after > 0:
+            self.root.after(clear_after, lambda: self._clear_row(gear_slot, text))
+
+    def _clear_row(self, gear_slot, expected_text):
+        # 只有在该行仍显示传入文本时才清除，避免误删更新的状态。
+        current = self._rows.get(gear_slot) if gear_slot else self._rows.get("")
+        if current == expected_text:
+            if gear_slot:
+                self._rows.pop(gear_slot, None)
+            else:
+                self._rows.pop("", None)
+            self._refresh_display()
+
+    def _refresh_display(self):
+        lines = list(self._rows.values())
+        if not lines:
+            lines = ["RF4 来鱼提醒 · 待机中"]
+        display = "\n".join(lines)
+        self.label.config(text=display)
+        # 按行数调整窗口高度
+        row_h = 26
+        h = 40 + row_h * len(lines)
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self.root.geometry(f"{WINDOW_WIDTH}x{h}+{x}+{y}")
+        self._show()
+
+    def _show_incoming(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
         weight = ""
         if weight_g:
             weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        self.label.config(text=f"【我自己】： 有{name} {weight} 过来了")
-        self._show()
+        prefix = f"[{gear_slot}] " if gear_slot else ""
+        self._update_row(gear_slot, f"【我自己】：{prefix}有{name} {weight} 过来了")
 
-    def _show_kept(self, fish_key, fish_name, weight_g):
+    def _show_bitten(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
         weight = ""
         if weight_g:
             weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        self.label.config(text=f"【我自己】： 有{name} {weight} 入护了")
-        self._show()
+        prefix = f"[{gear_slot}] " if gear_slot else ""
+        weight_text = f" {weight}" if weight else ""
+        self._update_row(gear_slot, f"【我自己】：{prefix}{name}{weight_text} 咬钩了")
 
-    def _show_escaped(self, fish_key, fish_name, weight_g):
+    def _show_kept(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        self.label.config(text=f"【我自己】： {name} 挣脱跑了（脱钩）")
-        self._show()
+        weight = ""
+        if weight_g:
+            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
+        prefix = f"[{gear_slot}] " if gear_slot else ""
+        self._update_row(gear_slot, f"【我自己】：{prefix}有{name} {weight} 入护了", clear_after=3000)
 
-    def _show_released(self, fish_key, fish_name, weight_g):
+    def _show_escaped(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        self.label.config(text=f"【我自己】： 放生了 {name}")
-        self._show()
+        weight = ""
+        if weight_g:
+            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
+        prefix = f"[{gear_slot}] " if gear_slot else ""
+        weight_text = f" {weight}" if weight else ""
+        self._update_row(gear_slot, f"【我自己】：{prefix}{name}{weight_text} 挣脱跑了（脱钩）", clear_after=3000)
+
+    def _show_released(self, fish_key, fish_name, weight_g, gear_slot=""):
+        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
+        prefix = f"[{gear_slot}] " if gear_slot else ""
+        self._update_row(gear_slot, f"【我自己】：{prefix}放生了 {name}", clear_after=3000)
+
+    def _show_generic(self, text):
+        self._update_row("", text, clear_after=3000)
+
+    def _show_anticheat(self, text):
+        self.label.config(fg="#ff5252")
+        self._update_row("", text, clear_after=8000)
+        self.root.after(8000, lambda: self.label.config(fg="#ffd166"))
 
     def _reset_to_idle(self):
-        self.label.config(text="RF4 来鱼提醒 · 待机中")
-        self._show()
+        self._rows.clear()
+        self._refresh_display()
 
     def _hide(self):
         if self.visible:
@@ -198,14 +254,21 @@ class Overlay:
                 except (UnicodeDecodeError, ValueError):
                     continue
                 name = event.get("event")
+                gear_slot = event.get("gear_slot") or ""
                 if name == "fish_incoming":
-                    self.root.after(0, self._show_incoming, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"))
+                    self.root.after(0, self._show_incoming, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
+                elif name == "fish_bitten":
+                    self.root.after(0, self._show_bitten, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
                 elif name == "fish_kept":
-                    self.root.after(0, self._show_kept, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"))
+                    self.root.after(0, self._show_kept, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
                 elif name == "fish_escaped":
-                    self.root.after(0, self._show_escaped, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"))
+                    self.root.after(0, self._show_escaped, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
                 elif name == "fish_released":
-                    self.root.after(0, self._show_released, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"))
+                    self.root.after(0, self._show_released, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
+                elif name in ("fish_catch", "chat"):
+                    self.root.after(0, self._show_generic, event.get("text") or "")
+                elif name == "anticheat":
+                    self.root.after(0, self._show_anticheat, event.get("text") or "")
         finally:
             self.root.after(100, self._poll)
 

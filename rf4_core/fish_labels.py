@@ -6,8 +6,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
+from . import data_root
+
 PACKAGE_DIR = Path(__file__).resolve().parent
-THIS_DIR = PACKAGE_DIR.parent
+# 打包态(exe)下数据根指向 exe 所在目录，源码运行时指向脚本目录，保证可写数据(exe 旁)可定位。
+THIS_DIR = data_root()
 REPO_ROOT = THIS_DIR.parents[1]
 
 BASE = THIS_DIR

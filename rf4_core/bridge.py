@@ -60,6 +60,7 @@ from .protocol import (
     parse_contact_left,
     parse_envelope,
     parse_fish_setup_push,
+    parse_fishing_gear_and_setup,
     parse_keep_fish_request,
     parse_public_chat_request,
     parse_release_fish_request,
@@ -99,6 +100,8 @@ class SyntheticChatEvent:
     phase: str = "kept"
     sender_name: str = "【我自己】"
     line_type: int = 3
+    fishing_gear_id: str = ""
+    gear_slot_text: str = ""
 
 
 @dataclass
@@ -124,6 +127,8 @@ class FlowSession:
     announced_fish_setup_ids: set[str] = field(default_factory=lambda: BoundedSet(256))
     latest_location_id: Optional[str] = None
     latest_users_count: Optional[int] = None
+    gear_slots: Dict[str, int] = field(default_factory=dict)
+    next_gear_slot: int = 1
     next_synthetic_event_id: int = 0x71000000
     next_synthetic_call_id: int = 0x61000000
     next_synthetic_wire_id: int = 0x100000
@@ -177,6 +182,7 @@ class FlowSession:
 
 class RF4ChatBridge:
     SELF_EVENT_PHASE_INCOMING = "incoming"
+    SELF_EVENT_PHASE_BITTEN = "bitten"
     SELF_EVENT_PHASE_KEPT = "kept"
     SELF_EVENT_PHASE_ESCAPED = "escaped"
     SELF_EVENT_PHASE_RELEASED = "released"
@@ -353,6 +359,20 @@ class RF4ChatBridge:
             0,
             "UDP port used to broadcast fish incoming/kept events. 0 disables the event bridge.",
         )
+        loader.add_option("rf4_show_incoming", bool, True, "Show self fish incoming events (来鱼).")
+        loader.add_option("rf4_show_bitten", bool, True, "Show self fish bitten events (确认咬钩).")
+        loader.add_option("rf4_show_kept", bool, True, "Show self fish kept events (入护).")
+        loader.add_option("rf4_show_escaped", bool, True, "Show self fish escaped events (脱钩).")
+        loader.add_option("rf4_show_released", bool, True, "Show self fish released events (放生).")
+        loader.add_option("rf4_show_fish", bool, True, "Show fish telemetry logs (搏鱼/来鱼过程).")
+        loader.add_option("rf4_show_player", bool, True, "Show player telemetry logs (坐标/状态).")
+        loader.add_option("rf4_show_feed", bool, True, "Show feed telemetry logs (打窝/投喂).")
+        loader.add_option("rf4_show_chat", bool, True, "Show chat telemetry logs (公共聊天/频道鱼获).")
+        loader.add_option("rf4_show_room", bool, True, "Show room telemetry logs (房间消息).")
+        loader.add_option("rf4_show_session", bool, True, "Show session telemetry logs (会话信息).")
+        loader.add_option("rf4_show_unknown", bool, True, "Show unknown telemetry logs (未知协议).")
+        loader.add_option("rf4_show_catch_broadcast", bool, True, "Show other players' catch broadcasts in overlay (频道鱼获).")
+        loader.add_option("rf4_show_chat_broadcast", bool, True, "Show public chat in overlay (公共聊天).")
 
     def configure(self, updated) -> None:
         self._profile = get_profile(ctx.options.rf4_profile)
@@ -543,13 +563,15 @@ class RF4ChatBridge:
     def _telemetry_enabled(category: str) -> bool:
         if not bool(getattr(ctx.options, "rf4_log_telemetry", True)):
             return False
+        # 日志始终全量输出，不受显示设置勾选影响。
+        category = category.lower()
         raw_categories = str(getattr(ctx.options, "rf4_telemetry_categories", "all") or "all")
         categories = {item.strip().lower() for item in raw_categories.split(",") if item.strip()}
         if not categories or "all" in categories or "*" in categories:
             return True
         if "none" in categories or "off" in categories or "false" in categories:
             return False
-        return category.lower() in categories
+        return category in categories
 
     @staticmethod
     def _self_chat_injection_enabled() -> bool:
@@ -1356,6 +1378,24 @@ class RF4ChatBridge:
             return value
         return value[:8] + "..."
 
+    def _detect_anticheat(self, session: FlowSession, envelope: RpcEnvelope, from_client: bool = True) -> None:
+        """记录反作弊相关消息的完整内容，供识别其结构(是系统上报还是违规)。"""
+        if envelope.marker != -1:
+            return
+        if envelope.main_cmd != session.profile.session_main_cmd:
+            return
+        if envelope.sub_cmd not in (8, 9):
+            return
+        label = self.SESSION_COMMAND_LABELS.get(envelope.sub_cmd, "反作弊")
+        direction = "C->S" if from_client else "S->C"
+        ascii_str = self._format_ascii_strings(envelope.payload, limit=20)
+        self._log(
+            f"反作弊消息 {direction} {label} "
+            f"ascii={ascii_str} "
+            f"hex={envelope.payload.hex()} "
+            f"len={len(envelope.payload)}"
+        )
+
     def _handle_client_frame(
         self,
         session: FlowSession,
@@ -1363,6 +1403,44 @@ class RF4ChatBridge:
     ) -> tuple[Optional[bytes], List[bytes]]:
         envelope = parse_envelope(plain_body)
         if not envelope:
+            return plain_body, []
+        self._detect_anticheat(session, envelope, from_client=True)
+
+        # 按抛竿顺序分配竿号：游戏里 1/2/3 号竿对应抛竿先后。
+        # 抛竿(14/2)和准备抛竿(14/1)时把该钓组ID分配递增竿号，后续来鱼/咬钩沿用。
+        if envelope.main_cmd == session.profile.fishing_main_cmd and envelope.sub_cmd in (
+            session.profile.cast_sub_cmd,
+            session.profile.cast_prepare_sub_cmd,
+        ):
+            cast_gear = parse_fishing_gear_and_setup(envelope, session.profile, envelope.sub_cmd)
+            if cast_gear and cast_gear.fishing_gear_id:
+                self._assign_gear_slot(session, cast_gear.fishing_gear_id)
+                if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                    self._log(
+                        f"cast 钓组={self._short_id(cast_gear.fishing_gear_id)} "
+                        f"竿号={session.gear_slots.get(cast_gear.fishing_gear_id)} "
+                        f"sub={envelope.sub_cmd}"
+                    )
+
+        # 进入搏鱼阶段(14/11)：客户端确认鱼已挂牢咬钩，触发"确认咬钩"事件。
+        fight_stage = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_stage_sub_cmd)
+        if fight_stage and fight_stage.fish_setup_id:
+            meta = session.fish_setup_cache.get(fight_stage.fish_setup_id)
+            if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"fight_stage 钓组={self._short_id(fight_stage.fishing_gear_id)} "
+                    f"鱼编号={self._short_id(fight_stage.fish_setup_id)} "
+                    f"hex={self._hex_preview(envelope.payload, limit=160)}"
+                )
+            synthetic = self._build_self_synthetic_event(
+                session=session,
+                fish_key=meta.fish_key if meta else "",
+                weight_raw=meta.weight_hint_raw if meta else 0,
+                phase=self.SELF_EVENT_PHASE_BITTEN,
+                fishing_gear_id=fight_stage.fishing_gear_id or (meta.fishing_gear_id if meta else None),
+                fish_setup_id=fight_stage.fish_setup_id,
+            )
+            self._emit_self_event(session, synthetic)
             return plain_body, []
 
         keep_request = parse_keep_fish_request(envelope, session.profile)
@@ -1380,6 +1458,8 @@ class RF4ChatBridge:
                     fish_key=meta.fish_key if meta else "",
                     weight_raw=meta.weight_hint_raw if meta else 0,
                     phase=self.SELF_EVENT_PHASE_RELEASED,
+                    fishing_gear_id=release_request.fishing_gear_id,
+                    fish_setup_id=release_request.fish_setup_id,
                 )
                 self._emit_self_event(session, synthetic)
             return plain_body, []
@@ -1395,13 +1475,17 @@ class RF4ChatBridge:
                     fish_key=meta.fish_key if meta else "",
                     weight_raw=meta.weight_hint_raw if meta else 0,
                     phase=self.SELF_EVENT_PHASE_ESCAPED,
+                    fishing_gear_id=contact_left.fishing_gear_id,
+                    fish_setup_id=contact_left.fish_setup_id,
                 )
                 self._emit_self_event(session, synthetic)
             return plain_body, []
 
         public_chat = parse_public_chat_request(envelope, session.profile)
         if public_chat and public_chat.message:
-            self._log_event(f"\u4f60: {self._clean_text(public_chat.message)}")
+            text = f"\u4f60: {self._clean_text(public_chat.message)}"
+            self._log_event(text)
+            self._broadcast_generic_event("chat", text)
             return plain_body, []
 
         ack_request = parse_room_ack_request(envelope, session.profile)
@@ -1434,20 +1518,31 @@ class RF4ChatBridge:
         out = bytearray()
         if not envelope:
             return bytes(out)
+        self._detect_anticheat(session, envelope, from_client=False)
 
         fish_setup = parse_fish_setup_push(envelope, session.profile)
         if fish_setup:
             session.fish_setup_cache[fish_setup.fish_setup_id] = fish_setup
+            # 详细记录来鱼推送的字段，用于确认竿位编号(gear slot)的来源。
+            if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"fish_setup_push 钓组={self._short_id(fish_setup.fishing_gear_id)} "
+                    f"鱼编号={self._short_id(fish_setup.fish_setup_id)} "
+                    f"鱼名key={fish_setup.fish_key} setup_enum={fish_setup.setup_enum} "
+                    f"hex={self._hex_preview(envelope.payload, limit=160)}"
+                )
             if (
                 fish_setup.weight_hint_raw
                 and fish_setup.fish_setup_id not in session.announced_fish_setup_ids
             ):
                 session.announced_fish_setup_ids.add(fish_setup.fish_setup_id)
+                self._assign_gear_slot(session, fish_setup.fishing_gear_id)
                 synthetic = self._build_self_synthetic_event(
                     session=session,
                     fish_key=fish_setup.fish_key,
                     weight_raw=fish_setup.weight_hint_raw,
                     phase=self.SELF_EVENT_PHASE_INCOMING,
+                    fishing_gear_id=fish_setup.fishing_gear_id,
                 )
                 out.extend(self._emit_self_event(session, synthetic))
             return bytes(out)
@@ -1462,6 +1557,8 @@ class RF4ChatBridge:
                     fish_key=meta.fish_key if meta else "",
                     weight_raw=meta.weight_hint_raw if meta else 0,
                     phase=self.SELF_EVENT_PHASE_ESCAPED,
+                    fishing_gear_id=meta.fishing_gear_id if meta else None,
+                    fish_setup_id=contact_left.fish_setup_id,
                 )
                 out.extend(self._emit_self_event(session, synthetic))
             return bytes(out)
@@ -1483,6 +1580,7 @@ class RF4ChatBridge:
             )
             if line:
                 self._log_event(line)
+                self._broadcast_generic_event("fish_catch", line)
             return bytes(out)
 
         keep_request = session.keep_requests.pop(envelope.call_id, None)
@@ -1501,9 +1599,9 @@ class RF4ChatBridge:
                     fish_key=catch.fish_key or "",
                     weight_raw=catch.weight_raw or 0,
                     phase=self.SELF_EVENT_PHASE_KEPT,
+                    fishing_gear_id=keep_request.fishing_gear_id,
+                    fish_setup_id=keep_request.fish_setup_id,
                 )
-                self._log_self_event(self._format_self_event_log_line(synthetic))
-                self._broadcast_self_event(synthetic)
             if synthetic:
                 out.extend(self._emit_self_event(session, synthetic))
 
@@ -1541,6 +1639,20 @@ class RF4ChatBridge:
         if broadcast.users_count is not None:
             session.latest_users_count = broadcast.users_count
 
+    def _assign_gear_slot(self, session: FlowSession, fishing_gear_id: Optional[str]) -> None:
+        if not fishing_gear_id or fishing_gear_id in session.gear_slots:
+            return
+        session.gear_slots[fishing_gear_id] = session.next_gear_slot
+        session.next_gear_slot += 1
+
+    def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
+        if not fishing_gear_id:
+            return ""
+        slot = session.gear_slots.get(fishing_gear_id)
+        if slot is None:
+            return ""
+        return f"{slot}号杆"
+
     def _build_synthetic_broadcast(
         self,
         session: FlowSession,
@@ -1571,6 +1683,8 @@ class RF4ChatBridge:
             fish_key=fish_key,
             weight_raw=weight_raw,
             phase=self.SELF_EVENT_PHASE_KEPT,
+            fishing_gear_id=keep_request.fishing_gear_id,
+            fish_setup_id=keep_request.fish_setup_id,
         )
 
     def _build_self_synthetic_event(
@@ -1579,6 +1693,8 @@ class RF4ChatBridge:
         fish_key: str,
         weight_raw: int,
         phase: str,
+        fishing_gear_id: Optional[str] = None,
+        fish_setup_id: Optional[str] = None,
     ) -> SyntheticChatEvent:
         location_id = session.latest_location_id
         if location_id is None:
@@ -1587,6 +1703,12 @@ class RF4ChatBridge:
         users_count = session.latest_users_count
         if users_count is None:
             users_count = ctx.options.rf4_default_users_count
+
+        # 若钓组ID缺失，尝试从 fish_setup_cache 按 fish_setup_id 反查，保证杆号能显示。
+        if not fishing_gear_id and fish_setup_id:
+            meta = session.fish_setup_cache.get(fish_setup_id)
+            if meta:
+                fishing_gear_id = meta.fishing_gear_id
 
         return SyntheticChatEvent(
             event_id=session.alloc_event_id(),
@@ -1597,6 +1719,8 @@ class RF4ChatBridge:
             phase=phase,
             sender_name=self._self_sender_name(phase),
             line_type=session.profile.room_message_line_type_catch,
+            fishing_gear_id=fishing_gear_id or "",
+            gear_slot_text=self._gear_slot_text(session, fishing_gear_id),
         )
 
     def _inject_self_synthetic_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
@@ -1622,21 +1746,47 @@ class RF4ChatBridge:
         return session.build_server_injection(injected_body)
 
     def _emit_self_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
+        # 日志始终全量输出；只有浮窗广播受勾选开关控制。
         self._log_self_event(self._format_self_event_log_line(synthetic))
         self._broadcast_self_event(synthetic)
+        if not self._self_phase_enabled(synthetic.phase):
+            return b""
         if not self._self_chat_injection_enabled():
             return b""
         if synthetic.phase in {self.SELF_EVENT_PHASE_ESCAPED, self.SELF_EVENT_PHASE_RELEASED}:
             return b""
         return self._inject_self_synthetic_event(session, synthetic)
 
+    @staticmethod
+    def _self_phase_enabled(phase: str) -> bool:
+        phase_switch = {
+            "incoming": "rf4_show_incoming",
+            "bitten": "rf4_show_bitten",
+            "kept": "rf4_show_kept",
+            "escaped": "rf4_show_escaped",
+            "released": "rf4_show_released",
+        }.get(phase)
+        if not phase_switch:
+            return True
+        return bool(getattr(ctx.options, phase_switch, True))
+
     def _broadcast_self_event(self, synthetic: SyntheticChatEvent) -> None:
         port = int(ctx.options.rf4_event_bridge_port or 0)
         if port <= 0:
             return
+        phase_switch = {
+            self.SELF_EVENT_PHASE_INCOMING: "rf4_show_incoming",
+            self.SELF_EVENT_PHASE_BITTEN: "rf4_show_bitten",
+            self.SELF_EVENT_PHASE_KEPT: "rf4_show_kept",
+            self.SELF_EVENT_PHASE_ESCAPED: "rf4_show_escaped",
+            self.SELF_EVENT_PHASE_RELEASED: "rf4_show_released",
+        }.get(synthetic.phase)
+        if phase_switch and not bool(getattr(ctx.options, phase_switch, True)):
+            return
         fish_name = self._format_fish_name(synthetic.fish_key or "")
         event_name = {
             self.SELF_EVENT_PHASE_INCOMING: "fish_incoming",
+            self.SELF_EVENT_PHASE_BITTEN: "fish_bitten",
             self.SELF_EVENT_PHASE_KEPT: "fish_kept",
             self.SELF_EVENT_PHASE_ESCAPED: "fish_escaped",
             self.SELF_EVENT_PHASE_RELEASED: "fish_released",
@@ -1647,6 +1797,7 @@ class RF4ChatBridge:
                 "fish_key": synthetic.fish_key,
                 "fish_name": fish_name,
                 "weight_g": synthetic.weight_raw,
+                "gear_slot": synthetic.gear_slot_text,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1663,6 +1814,39 @@ class RF4ChatBridge:
             if ctx.options.rf4_verbose_logging:
                 self._log(
                     f"failed to broadcast self event on {ctx.options.rf4_event_bridge_host}:{port}"
+                )
+
+    def _broadcast_generic_event(self, event_name: str, text: str) -> None:
+        """广播其他事件(频道鱼获/公共聊天等)到浮窗，受显示设置勾选控制。"""
+        port = int(ctx.options.rf4_event_bridge_port or 0)
+        if port <= 0:
+            return
+        switch = {
+            "fish_catch": "rf4_show_catch_broadcast",
+            "chat": "rf4_show_chat_broadcast",
+        }.get(event_name)
+        if switch and not bool(getattr(ctx.options, switch, True)):
+            return
+        payload = json.dumps(
+            {
+                "event": event_name,
+                "text": text,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            import socket
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.sendto(payload.encode("utf-8"), (ctx.options.rf4_event_bridge_host, port))
+            finally:
+                sock.close()
+        except OSError:
+            if ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"failed to broadcast {event_name} on {ctx.options.rf4_event_bridge_host}:{port}"
                 )
 
     @staticmethod
@@ -1706,13 +1890,16 @@ class RF4ChatBridge:
     def _format_self_event_log_line(self, event: SyntheticChatEvent) -> str:
         fish_name = self._format_fish_name(event.fish_key)
         weight = self._format_chat_weight(event.weight_raw)
+        prefix = f"[{event.gear_slot_text}]" if event.gear_slot_text else ""
         if event.phase == self.SELF_EVENT_PHASE_INCOMING:
-            return f"【我自己】： 有{fish_name} {weight} 过来了"
+            return f"【我自己】：{prefix} 有{fish_name} {weight} 过来了"
+        if event.phase == self.SELF_EVENT_PHASE_BITTEN:
+            return f"【我自己】：{prefix} {fish_name} 咬钩了"
         if event.phase == self.SELF_EVENT_PHASE_ESCAPED:
-            return f"【我自己】： {fish_name} 挣脱跑了（脱钩）"
+            return f"【我自己】：{prefix} {fish_name} {weight} 挣脱跑了（脱钩）"
         if event.phase == self.SELF_EVENT_PHASE_RELEASED:
-            return f"【我自己】： 放生了 {fish_name}"
-        return f"【我自己】： 有{fish_name} {weight} 入护了"
+            return f"【我自己】：{prefix} 放生了 {fish_name}"
+        return f"【我自己】：{prefix} 有{fish_name} {weight} 入护了"
 
     def _format_record_chat_line(self, sender_name: str, broadcast: RoomBroadcast) -> str:
         fish_name = self._format_fish_name(broadcast.fish_key or "")

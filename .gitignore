@@ -10,4 +10,11 @@ __pycache__/
 # RF4 runtime artifacts
 logs/
 rf4_overlay_config.json
+rf4_show_config.json
+
+# Build / distribution artifacts
+build/
+dist/
+*.spec
+screenshot/
 

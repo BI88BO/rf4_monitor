@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from . import data_root
 
 if __name__ not in sys.modules:
     sys.modules[__name__] = types.ModuleType(__name__)
@@ -124,7 +125,7 @@ class LoginRewriteResult:
     redirected_port: int
 
 
-THIS_DIR = Path(__file__).resolve().parent.parent
+THIS_DIR = data_root()
 REPO_ROOT = THIS_DIR.parents[1]
 BUNDLED_REFERENCE_PATH = THIS_DIR / "reference_defaults.txt"
 
@@ -959,6 +960,10 @@ def main(argv: list[str] | None = None) -> int:
             # mitmproxy 10 在非 TTY(无窗口)环境下 stdout 会块缓冲，日志积压在缓冲区
             # 不落盘；设置 PYTHONUNBUFFERED 让 mitmdump 的每行日志即时写入文件。
             process_env["PYTHONUNBUFFERED"] = "1"
+            # 打包态下：由同一个 exe 扮演 mitmdump 引擎（见打包入口 frozen_entry），
+            # 用它自身吸收 --rf4-engine 标志后来到 DumpMaster 引擎分支。
+            if getattr(sys, "frozen", False):
+                process_env["RF4_ENGINE_MODE"] = "1"
             process = subprocess.Popen(
                 command,
                 creationflags=creationflags,
@@ -1002,6 +1007,10 @@ def resolve_reference_paths(raw_paths: list[str] | None) -> list[Path]:
 def resolve_mitmdump_binary(raw_value: str, *, base_dir: Path = THIS_DIR) -> str:
     if raw_value.strip():
         return str(Path(raw_value).expanduser())
+
+    # 打包态：同一个 exe 就是 mitmdump 引擎（frozen_entry 通过 RF4_ENGINE_MODE 区分）。
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve())
 
     bundled_candidates = (
         base_dir / ".venv" / "bin" / "mitmdump",
