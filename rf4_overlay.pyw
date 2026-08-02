@@ -61,7 +61,7 @@ class Overlay:
     DEFAULT_STYLE = STYLE_TRANSPARENT
     _STYLES = {STYLE_DARK, STYLE_TRANSPARENT}
     # 遥测信息区最多保留的行数
-    MAX_TELEMETRY_ROWS = 8
+    MAX_TELEMETRY_ROWS = 4
     # 样式参数：背景色 / 前景色 / 透明键色
     # 透明模式：用背景色作为透明键，仅文字可见。
     # 深色模式：透明键设为一个绝不出现的哨兵色，背景即恢复不透明。
@@ -253,17 +253,12 @@ class Overlay:
             self._refresh_display()
 
     def _refresh_display(self):
-        # 分区：先鱼事件行(按竿号)，再遥测信息区；无内容时回到待机。
-        sections = []
-        fish_lines = list(self._rows.values())
-        if fish_lines:
-            sections.append("\n".join(fish_lines))
-        tele_lines = list(self._telemetry_rows.values())
-        if tele_lines:
-            if sections:
-                sections.append("-" * 8)
-            sections.append("\n".join(tele_lines))
-        lines = sections or ["RF4 来鱼提醒 · 待机中"]
+        # 简单分行：所有行(鱼事件按竿号 + 遥测/频道/聊天)按序拼接；无内容回待机。
+        lines = list(self._rows.values())
+        for seq, text in self._telemetry_rows.items():
+            lines.append(text)
+        if not lines:
+            lines = ["RF4 来鱼提醒 · 待机中"]
         display = "\n".join(lines)
         self.label.config(text=display)
         # 按内容实际需求高度调整窗口，避免多杆/换行时内容被裁切
@@ -280,14 +275,15 @@ class Overlay:
 
             wrap_px = WINDOW_WIDTH - 32
             f = tkfont.Font(self.root, font=self.label.cget("font"))
-            row_h = 24
+            row_h = f.metrics("linespace") + 4
             total = 0
             for line in lines:
                 visual = max(1, math.ceil(f.measure(line) / max(wrap_px, 1)))
                 total += visual * row_h
-            return max(40, 8 + 24 + len(lines) * row_h, total + 8)
+            # 顶部 + 底部 padding(padx/pady) + 边框余量
+            return max(40, total + 40)
         except Exception:
-            return 40 + 26 * len(lines)
+            return 40 + 28 * len(lines)
 
     def _show_incoming(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
