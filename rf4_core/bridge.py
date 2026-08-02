@@ -472,6 +472,56 @@ class RF4ChatBridge:
             self._load_item_catalog_index()
         except Exception:
             pass
+        self._gear_config_by_id: Dict[int, dict] = {}
+        try:
+            self._load_gear_config_from_cache()
+        except Exception:
+            pass
+
+    def _load_gear_config_from_cache(self) -> None:
+        try:
+            from .game_catalog import (
+                extract_gear_config_records_from_cache,
+                local_config_cache_candidates,
+                preferred_local_config_cache_path,
+            )
+        except Exception:
+            return
+        try:
+            cache_paths = local_config_cache_candidates()
+        except Exception:
+            cache_paths = []
+        known_system_ids = {
+            key
+            for key in self._fish_labels_zh
+            if key and not key.startswith("card_")
+        }
+        best: list = []
+        for path in cache_paths:
+            try:
+                records = extract_gear_config_records_from_cache(
+                    path=path,
+                    known_system_ids=known_system_ids,
+                )
+            except Exception:
+                records = []
+            if len(records) > len(best):
+                best = records
+        by_id: Dict[int, dict] = {}
+        for record in best:
+            attributes = dict(record.attributes)
+            by_id[int(record.config_id)] = {
+                "config_id": int(record.config_id),
+                "system_id": str(record.system_id),
+                "object_type_id": int(record.object_type_id),
+                "group_key": str(record.group_key),
+                "attributes": attributes,
+            }
+        self._gear_config_by_id = by_id
+        if self._gear_config_by_id:
+            self._log(
+                f"已从游戏本地缓存读取真实装备部件目录：{len(self._gear_config_by_id)} 件"
+            )
 
     def _load_item_catalog_index(self) -> None:
         candidates = [
@@ -1813,6 +1863,16 @@ class RF4ChatBridge:
         return config_group.startswith(hint_group) or hint_group.startswith(config_group)
 
     def _gear_config_by_id_lookup(self, item_id: int) -> Optional[dict]:
+        config = self._gear_config_by_id.get(item_id)
+        if config:
+            system_id = str(config.get("system_id") or "")
+            catalog_name = ""
+            entry = self._catalog_key_lookup.get(system_id)
+            if entry:
+                catalog_name = entry.name
+            config = dict(config)
+            config["catalog_name"] = catalog_name
+            return config
         entries = self._item_catalog_index.get(item_id)
         if not entries:
             return None
