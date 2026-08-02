@@ -23,6 +23,7 @@ from .sniffer_core import (
     AdapterHandle,
     TcpSegment,
     enumerate_adapters,
+    enumerate_adapters_with_desc,
     packet_available,
     parse_packet,
 )
@@ -58,8 +59,21 @@ class PassiveEngine:
         for key, value in merged.items():
             setattr(opts, key, value)
         bridge_mod.ctx.options = opts
+        # passive 模式无 mitmproxy：给 ctx.log 挂上真实输出，否则 bridge 日志被丢弃。
+        bridge_mod.ctx.log = SimpleNamespace(
+            info=lambda text=None, *a, **k: self._emit_log_line(text),
+        )
         try:
             self._bridge.configure(set())
+        except Exception:
+            pass
+
+    def _emit_log_line(self, text) -> None:
+        if text is None:
+            return
+        line = str(text)
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
         except Exception:
             pass
 
@@ -68,11 +82,11 @@ class PassiveEngine:
             print("错误：Npcap/Packet.dll 不可用，无法旁路抓包。请安装 Npcap 后重试。", file=sys.stderr)
             return 2
         self._apply_options()
-        adapters = enumerate_adapters()
-        if not adapters:
+        pairs = enumerate_adapters_with_desc()
+        if not pairs:
             print("错误：未找到可用网卡。", file=sys.stderr)
             return 2
-        selected = self._pick_adapters(adapters)
+        selected = self._pick_adapters(pairs)
         if not selected:
             print("错误：未找到适合抓包的网卡。", file=sys.stderr)
             return 2
@@ -88,16 +102,25 @@ class PassiveEngine:
             return 1
         return 0
 
-    def _pick_adapters(self, adapters: List[str]) -> List[str]:
-        # 同时抓 Npcap Loopback（游戏走 127.0.0.1:9442）和第一个真实网卡
-        # （游戏直连真实服务器时出站流量），保证两种路径都覆盖。
+    def _pick_adapters(self, pairs: List[Tuple[str, str]]) -> List[str]:
+        # 同时抓 Npcap Loopback（游戏走 127.0.0.1:9442）和真实联网网卡
+        # （游戏直连真实服务器时出站流量）。
         selected: List[str] = []
-        loopback = next((a for a in adapters if "Loopback" in a), None)
+        loopback = next((a for a, _d in pairs if "Loopback" in a), None)
         if loopback:
             selected.append(loopback)
-        real = [a for a in adapters if "Loopback" not in a]
-        if real:
-            selected.append(real[0])
+        # 按描述优先选真实联网网卡（WLAN/以太网/Wireless/Ethernet/Realtek/Intel）。
+        real_net = [
+            a for a, d in pairs
+            if "Loopback" not in a
+            and any(k in d for k in ("Wireless", "WLAN", "Ethernet", "GbE", "Realtek", "Intel"))
+        ]
+        if real_net:
+            selected.append(real_net[0])
+        else:
+            real = [a for a, _d in pairs if "Loopback" not in a]
+            if real:
+                selected.append(real[0])
         return selected
 
     def _capture_loop(self, adapter_names: List[str]) -> None:

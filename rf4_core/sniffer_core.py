@@ -80,17 +80,26 @@ class _PacketStruct(ctypes.Structure):
 
 def enumerate_adapters() -> List[str]:
     """枚举可用网卡，返回适配器名列表（\\Device\\NPF_...）。"""
+    return [name for name, _desc in enumerate_adapters_with_desc()]
+
+
+def enumerate_adapters_with_desc() -> List[Tuple[str, str]]:
+    """枚举可用网卡，返回 (适配器名, 描述) 列表。
+
+    描述用于识别真实联网网卡（如 Intel Wireless / Realtek GbE），
+    避免选中 WAN Miniport / 虚拟网卡等抓不到业务流量的适配器。
+    """
     if _packet_dll is None:
         return []
-    buf = ctypes.create_string_buffer(32768)
-    buf_len = ctypes.c_ulong(32768)
+    buf = ctypes.create_string_buffer(65536)
+    buf_len = ctypes.c_ulong(65536)
     ret = _packet_dll.PacketGetAdapterNames(buf, ctypes.byref(buf_len))
     if not ret:
         return []
     data = buf.raw[: buf_len.value]
     parts = data.split(b"\x00")
-    # 前半部分是适配器名（\\Device\\NPF_...），后半部分是描述
     names: List[str] = []
+    descs: List[str] = []
     for part in parts:
         if not part:
             continue
@@ -100,7 +109,14 @@ def enumerate_adapters() -> List[str]:
             continue
         if text.startswith("\\Device\\NPF_"):
             names.append(text)
-    return names
+        elif text and not text.startswith("\\Device\\"):
+            descs.append(text)
+    # PacketGetAdapterNames 顺序：先全部名字，再全部描述。
+    pairs: List[Tuple[str, str]] = []
+    for index, name in enumerate(names):
+        desc = descs[index] if index < len(descs) else ""
+        pairs.append((name, desc))
+    return pairs
 
 
 @dataclass

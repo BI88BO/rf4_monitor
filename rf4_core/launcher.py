@@ -884,6 +884,8 @@ def _run_passive_mode(reference: ReferenceTrafficInfo, passthrough: list[str]) -
     else:
         command = [sys.executable, "-m", "rf4_core.passive_engine", *option_args]
         process_env = dict(os.environ)
+        # 源码态下 python 默认块缓冲，日志积压不落盘；强制 unbuffered。
+        process_env["PYTHONUNBUFFERED"] = "1"
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     log_file = None
