@@ -22,14 +22,11 @@ from .protocol import RC4Stream, take_complete_frames, try_parse_auth_packet
 from .sniffer_core import (
     AdapterHandle,
     TcpSegment,
-    enumerate_adapters,
     enumerate_adapters_with_desc,
     packet_available,
     parse_packet,
 )
 from .tcp_reassembly import TcpFlowState, TcpStreamAssembler
-
-DEFAULT_REALTIME_PORTS = (9442, 9569)
 
 
 class FakeFlow:
@@ -42,7 +39,7 @@ class PassiveEngine:
         self._bridge = RF4ChatBridge()
         self._options = options if options is not None else {}
         self._running = False
-        self._assembler = TcpStreamAssembler(target_ports=DEFAULT_REALTIME_PORTS)
+        self._assembler = TcpStreamAssembler()
         self._sessions: Dict[str, FlowSession] = {}
 
     # ------------------------------------------------------------------
@@ -76,29 +73,49 @@ class PassiveEngine:
             print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
         except Exception:
             pass
+        self._write_log(f"[{time.strftime('%H:%M:%S')}] {line}")
+
+    def _write_log(self, line: str) -> None:
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+            if getattr(sys, "frozen", False):
+                log_dir = os.path.join(os.path.dirname(sys.executable), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, "rf4_sniffer.log")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
+    def _log(self, text: str) -> None:
+        self._write_log(text)
+        try:
+            print(text, flush=True)
+        except Exception:
+            pass
 
     def run(self) -> int:
         if not packet_available():
-            print("错误：Npcap/Packet.dll 不可用，无法旁路抓包。请安装 Npcap 后重试。", file=sys.stderr)
+            self._log("错误：Npcap/Packet.dll 不可用，无法旁路抓包。请安装 Npcap 后重试。")
             return 2
         self._apply_options()
         pairs = enumerate_adapters_with_desc()
         if not pairs:
-            print("错误：未找到可用网卡。", file=sys.stderr)
+            self._log("错误：未找到可用网卡。")
             return 2
         selected = self._pick_adapters(pairs)
         if not selected:
-            print("错误：未找到适合抓包的网卡。", file=sys.stderr)
+            self._log("错误：未找到适合抓包的网卡。")
             return 2
-        print(f"[rf4-sniffer] 监听网卡: {', '.join(selected)}")
-        print(f"[rf4-sniffer] 目标端口: {DEFAULT_REALTIME_PORTS}")
+        self._log(f"[rf4-sniffer] 监听网卡: {', '.join(selected)}")
+        self._log("[rf4-sniffer] 目标: 动态识别 RF4 realtime 流（auth 特征，不限定端口）")
         self._running = True
         try:
             self._capture_loop(selected)
         except KeyboardInterrupt:
             pass
         except Exception as exc:
-            print(f"[rf4-sniffer] 抓包失败: {exc}", file=sys.stderr)
+            self._log(f"[rf4-sniffer] 抓包失败: {exc}")
             return 1
         return 0
 
