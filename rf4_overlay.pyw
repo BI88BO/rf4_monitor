@@ -4,6 +4,7 @@
 入护后消失。可按住鼠标拖动到任意位置，位置会自动记忆。
 """
 import json
+import math
 import socket
 import threading
 import tkinter as tk
@@ -54,10 +55,12 @@ class Overlay:
     STYLE_TRANSPARENT = "transparent"
     DEFAULT_STYLE = STYLE_TRANSPARENT
     _STYLES = {STYLE_DARK, STYLE_TRANSPARENT}
-    # 样式参数：背景色 / 前景色 / 是否透明键
+    # 样式参数：背景色 / 前景色 / 透明键色
+    # 透明模式：用背景色作为透明键，仅文字可见。
+    # 深色模式：透明键设为一个绝不出现的哨兵色，背景即恢复不透明。
     _STYLE_PARAMS = {
-        STYLE_DARK: {"bg": "#101418", "fg": "#ffd166", "transparent": False},
-        STYLE_TRANSPARENT: {"bg": "#101418", "fg": "#ffd166", "transparent": True},
+        STYLE_DARK: {"bg": "#101418", "fg": "#ffd166", "key": "#0000FF"},
+        STYLE_TRANSPARENT: {"bg": "#101418", "fg": "#ffd166", "key": "#101418"},
     }
 
     def __init__(self, root, host, port):
@@ -151,17 +154,13 @@ class Overlay:
             return
         bg = params["bg"]
         fg = params["fg"]
-        transparent = params["transparent"]
+        key = params["key"]
         self.style = style
         self.root.configure(bg=bg)
         self.label.configure(bg=bg, fg=fg)
         try:
-            if transparent:
-                self.root.wm_attributes("-transparentcolor", bg)
-            else:
-                # 传入空串关闭透明键，恢复为不透明深色气泡背景
-                self.root.wm_attributes("-transparentcolor", "")
-                self.label.configure(fg=fg)
+            # Windows 透明键：设置对应颜色键。深色模式用哨兵色(窗口不使用)令背景恢复不透明。
+            self.root.wm_attributes("-transparentcolor", key)
         except tk.TclError:
             pass
         self._refresh_display()
@@ -232,13 +231,28 @@ class Overlay:
             lines = ["RF4 来鱼提醒 · 待机中"]
         display = "\n".join(lines)
         self.label.config(text=display)
-        # 按行数调整窗口高度
-        row_h = 26
-        h = 40 + row_h * len(lines)
+        # 按内容实际需求高度调整窗口，避免多杆/换行时内容被裁切
+        need_h = self._content_height(lines)
         x = self.root.winfo_x()
         y = self.root.winfo_y()
-        self.root.geometry(f"{WINDOW_WIDTH}x{h}+{x}+{y}")
+        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}+{x}+{y}")
         self._show()
+
+    def _content_height(self, lines):
+        """按换行数估算需求高度：长消息按实际换行行数计算，避免被裁切。"""
+        try:
+            import tkinter.font as tkfont
+
+            wrap_px = WINDOW_WIDTH - 32
+            f = tkfont.Font(self.root, font=self.label.cget("font"))
+            row_h = 24
+            total = 0
+            for line in lines:
+                visual = max(1, math.ceil(f.measure(line) / max(wrap_px, 1)))
+                total += visual * row_h
+            return max(40, 8 + 24 + len(lines) * row_h, total + 8)
+        except Exception:
+            return 40 + 26 * len(lines)
 
     def _show_incoming(self, fish_key, fish_name, weight_g, gear_slot=""):
         name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
