@@ -3,8 +3,9 @@ import math
 import os
 import struct
 import sys
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 
 class BoundedDict(dict):
@@ -40,15 +41,22 @@ from . import console
 from .fish_labels import load_fish_labels
 from .launcher import parse_https_upstream_map, rewrite_login_logon_info
 from .protocol import (
+    BuildingRpcRequest,
     BusinessPayloadSummary,
     CatchSummary,
+    FishSaleResult,
     FishSetupMeta,
+    FishingEndRequest,
     KeepFishRequest,
+    ObservedCatchRecord,
+    PhoenixArgument,
     RC4Stream,
+    RepairRequestSummary,
     RF4ProtocolProfile,
     RoomBroadcast,
     RoomDetailItem,
     RpcEnvelope,
+    WorkshopDiagnosisSummary,
     ascii_strings,
     build_ack_frame,
     build_frame,
@@ -58,22 +66,35 @@ from .protocol import (
     get_profile,
     guid_le,
     is_complete_but_invalid_auth_packet,
+    parse_admin_status,
+    parse_cafe_delivery_result,
     parse_contact_left,
     parse_envelope,
+    parse_fish_sale_results,
     parse_fish_setup_push,
+    parse_fishing_end_request,
     parse_fishing_gear_and_setup,
+    parse_item_scope_summary,
     parse_keep_fish_request,
+    parse_observed_catch_records,
     parse_public_chat_request,
     parse_release_fish_request,
     parse_room_ack_request,
     parse_room_ack_response,
     parse_room_broadcast,
+    parse_shop_result_text,
+    parse_tagged_i64,
+    parse_typed_arguments,
+    parse_workshop_diagnosis,
     read_arg_header,
+    read_guid_array,
     read_marked_string,
+    read_typed_list_header,
     take_complete_frames,
     try_parse_auth_packet,
     try_parse_first_frame,
     try_parse_uuid_packet,
+    u16,
     u32,
 )
 
@@ -120,7 +141,12 @@ class FlowSession:
     server_read_rc4: Optional[RC4Stream] = None
     server_write_rc4: Optional[RC4Stream] = None
     fish_setup_cache: Dict[str, FishSetupMeta] = field(default_factory=lambda: BoundedDict(1024))
+    fish_setup_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
+    fishing_end_requests: Dict[int, FishingEndRequest] = field(default_factory=lambda: BoundedDict(128))
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
+    rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
+    building_request_calls: Dict[int, BuildingRpcRequest] = field(default_factory=lambda: BoundedDict(256))
+    observed_catches: Dict[str, ObservedCatchRecord] = field(default_factory=lambda: BoundedDict(2048))
     room_events: Dict[int, RoomBroadcast] = field(default_factory=lambda: BoundedDict(512))
     room_ack_calls: Dict[int, int] = field(default_factory=lambda: BoundedDict(128))
     synthetic_events: Dict[int, SyntheticChatEvent] = field(default_factory=lambda: BoundedDict(64))
@@ -250,6 +276,55 @@ class RF4ChatBridge:
     FEEDING_COMMAND_LABELS = {
         1: "打窝/投喂",
     }
+    ITEM_COMMAND_LABELS = {
+        1: "物品位置概览",
+        4: "物品位置分页",
+        5: "物品详情读取",
+        22: "装备/物品更新",
+    }
+    SLOT_COMMAND_LABELS = {
+        1: "请求当前装备槽位",
+        2: "切换装备槽位",
+    }
+    BUILDING_COMMAND_LABELS = {
+        (3, 13): "场地厨房进食",
+        (3, 25): "场景管理处处罚状态查询",
+        (3, 26): "登录处罚欢迎提示查询",
+        (4, 1): "物品位置概览",
+        (4, 4): "物品位置分页",
+        (4, 5): "物品详情读取",
+        (4, 6): "仓储/物品位置转移",
+        (4, 7): "物品位置操作",
+        (4, 8): "使用物品/执行物品动作",
+        (20, 2): "鱼市出售",
+        (20, 4): "咖啡馆订单交付",
+        (21, 2): "工坊诊断",
+        (21, 3): "工坊金币维修",
+        (21, 4): "工坊普通维修",
+        (22, 2): "商店银币购买",
+        (22, 3): "商店金币购买",
+        (22, 4): "商店退货",
+        (25, 3): "船只/载具位置操作",
+        (25, 4): "加油站确认加油",
+        (25, 6): "加油站询价",
+    }
+    BUILDING_DOMAIN_LABELS = {
+        20: "鱼市/咖啡馆",
+        21: "工坊",
+        22: "商店",
+        25: "船只/载具服务",
+    }
+    GEAR_CATALOG_CATEGORIES = {
+        "rod",
+        "reel",
+        "line",
+        "hook",
+        "lure",
+        "bait",
+        "float",
+        "sinker",
+        "aux",
+    }
     DEFAULT_FISH_LABELS_ZH = {
         "a.sleeper": "葛氏鲈塘鳢",
         "a_smelt": "亚洲胡瓜鱼",
@@ -327,6 +402,12 @@ class RF4ChatBridge:
             bool,
             False,
             "Print low-level 24/19 room-message lookup request/response details.",
+        )
+        loader.add_option(
+            "rf4_log_building_protocol_details",
+            bool,
+            True,
+            "Print field-level building/shop request/response details (store, fish market, workshop, boat).",
         )
         loader.add_option(
             "rf4_log_low_level_telemetry",
@@ -631,6 +712,10 @@ class RF4ChatBridge:
         return bool(getattr(ctx.options, "rf4_log_room_protocol_details", False))
 
     @staticmethod
+    def _building_protocol_details_enabled() -> bool:
+        return bool(getattr(ctx.options, "rf4_log_building_protocol_details", True))
+
+    @staticmethod
     def _low_level_telemetry_enabled() -> bool:
         return bool(getattr(ctx.options, "rf4_log_low_level_telemetry", False))
 
@@ -904,6 +989,12 @@ class RF4ChatBridge:
                 continue
 
             plain_body = read_cipher.crypt(frame.payload)
+            if from_client:
+                try:
+                    self._track_rpc_request_command(session, plain_body)
+                    self._track_building_rpc_request(session, plain_body)
+                except Exception:
+                    pass
             try:
                 self._maybe_log_telemetry_frame(flow, session, from_client, plain_body)
             except Exception:
@@ -980,6 +1071,22 @@ class RF4ChatBridge:
         prefix = self._telemetry_prefix(direction, kind, envelope)
 
         if from_client:
+            building = self._describe_building_request(session, envelope)
+            if building:
+                return building
+            fishing_end_request = parse_fishing_end_request(envelope, session.profile)
+            if fishing_end_request:
+                meta = self._fish_setup_meta_for_request(session, fishing_end_request)
+                fish_key = meta.fish_key if meta else None
+                fish_name = self._format_fish_name(fish_key) if fish_key else "unknown"
+                weight = self._format_chat_weight(meta.weight_hint_raw) if meta and meta.weight_hint_raw else "unknown"
+                return (
+                    "fish",
+                    f"请求结算鱼获 | 鱼={fish_name} 鱼名key={fish_key or 'unknown'} "
+                    f"预估重量={weight} 鱼编号={self._short_id(fishing_end_request.fish_setup_id or (meta.fish_setup_id if meta else None))} "
+                    f"钓组={self._short_id(fishing_end_request.fishing_gear_id)}",
+                )
+
             keep_request = parse_keep_fish_request(envelope, session.profile)
             if keep_request:
                 return (
@@ -1003,6 +1110,26 @@ class RF4ChatBridge:
                 return known
 
         else:
+            building = self._describe_building_response(session, envelope)
+            if building:
+                return building
+            fishing_end_request = session.fishing_end_requests.get(envelope.call_id)
+            if fishing_end_request and envelope.marker == -2:
+                catch = extract_catch_summary_from_response(plain_body)
+                fish_key = catch.fish_key
+                weight_raw = catch.weight_raw
+                meta = self._fish_setup_meta_for_request(session, fishing_end_request)
+                if meta:
+                    fish_key = fish_key or meta.fish_key
+                    weight_raw = weight_raw or meta.weight_hint_raw
+                fish_name = self._format_fish_name(fish_key) if fish_key else "unknown"
+                weight = self._format_chat_weight(weight_raw) if weight_raw else "unknown"
+                return (
+                    "fish",
+                    f"结算结果 | 鱼={fish_name} 鱼名key={fish_key or 'unknown'} "
+                    f"重量={weight} 规格={catch.size_enum} 鱼编号={self._short_id(fishing_end_request.fish_setup_id)}",
+                )
+
             fish_setup = parse_fish_setup_push(envelope, session.profile)
             if fish_setup:
                 weight = self._format_chat_weight(fish_setup.weight_hint_raw) if fish_setup.weight_hint_raw else "unknown"
@@ -1051,6 +1178,29 @@ class RF4ChatBridge:
                     "fish",
                     f"入护结果 | 鱼={fish_name} 鱼名key={fish_key or 'unknown'} "
                     f"重量={weight} 规格={catch.size_enum} 鱼编号={self._short_id(keep_request.fish_setup_id)}",
+                )
+
+            catalog_keys = self._extract_gear_catalog_keys(envelope.payload)
+            if envelope.marker == -2 and catalog_keys:
+                request_command = session.rpc_request_commands.get(envelope.call_id)
+                protocol = (
+                    f"{request_command[0]}/{request_command[1]}"
+                    if request_command is not None
+                    else "unknown"
+                )
+                formatted = [self._format_system_item_name(value) for value in catalog_keys[:12]]
+                if len(catalog_keys) > 12:
+                    formatted.append(f"…+{len(catalog_keys) - 12}")
+                category = (
+                    "building"
+                    if request_command is not None and request_command[0] in {20, 21, 22, 25}
+                    else "item"
+                )
+                label = "建筑/商店资源目录" if category == "building" else "资源名称目录"
+                return (
+                    category,
+                    f"{label}响应#{envelope.call_id} | 来源协议={protocol} "
+                    f"名称数={len(catalog_keys)} 名称=[{'; '.join(formatted)}]",
                 )
 
             known = self._describe_known_server_business_telemetry(session, prefix, envelope)
@@ -1135,6 +1285,454 @@ class RF4ChatBridge:
             label = self.FISHING_COMMAND_LABELS.get(envelope.sub_cmd)
             if label:
                 return "fish", self._format_business_line(label, self._format_generic_business_payload(envelope.payload))
+        return None
+
+    def _track_rpc_request_command(self, session: FlowSession, plain_body: bytes) -> None:
+        envelope = parse_envelope(plain_body)
+        if (
+            envelope is None
+            or envelope.marker != -1
+            or envelope.main_cmd is None
+            or envelope.sub_cmd is None
+        ):
+            return
+        session.rpc_request_commands[envelope.call_id] = (
+            envelope.main_cmd,
+            envelope.sub_cmd,
+            time.monotonic(),
+        )
+        if len(session.rpc_request_commands) > 512:
+            oldest_call = min(
+                session.rpc_request_commands,
+                key=lambda call_id: session.rpc_request_commands[call_id][2],
+            )
+            session.rpc_request_commands.pop(oldest_call, None)
+
+    def _track_building_rpc_request(self, session: FlowSession, plain_body: bytes) -> None:
+        if not self._building_protocol_details_enabled():
+            return
+        envelope = parse_envelope(plain_body)
+        if (
+            envelope is None
+            or envelope.marker != -1
+            or envelope.main_cmd is None
+            or envelope.sub_cmd is None
+            or (
+                (envelope.main_cmd, envelope.sub_cmd) not in self.BUILDING_COMMAND_LABELS
+                and envelope.main_cmd not in self.BUILDING_DOMAIN_LABELS
+            )
+        ):
+            return
+        try:
+            arguments = parse_typed_arguments(envelope.payload)
+        except (ValueError, IndexError, struct.error):
+            arguments = ()
+        session.building_request_calls[envelope.call_id] = BuildingRpcRequest(
+            call_id=envelope.call_id,
+            main_cmd=envelope.main_cmd,
+            sub_cmd=envelope.sub_cmd,
+            arguments=arguments,
+            payload=bytes(envelope.payload),
+            created_at=time.monotonic(),
+        )
+        if len(session.building_request_calls) > 256:
+            oldest = min(
+                session.building_request_calls.values(),
+                key=lambda value: value.created_at,
+            )
+            session.building_request_calls.pop(oldest.call_id, None)
+
+    @staticmethod
+    def _building_argument(trace: BuildingRpcRequest, index: int) -> Optional[PhoenixArgument]:
+        if index < 0 or index >= len(trace.arguments):
+            return None
+        return trace.arguments[index]
+
+    @staticmethod
+    def _building_argument_value(trace: BuildingRpcRequest, index: int, default=None):
+        argument = RF4ChatBridge._building_argument(trace, index)
+        return argument.value if argument is not None else default
+
+    @staticmethod
+    def _numeric_building_argument(trace: BuildingRpcRequest, index: int) -> Optional[int]:
+        argument = RF4ChatBridge._building_argument(trace, index)
+        if argument is None or argument.kind not in {"i32", "u32", "i64"}:
+            return None
+        return int(argument.value)
+
+    @staticmethod
+    def _guid_array_building_argument(trace: BuildingRpcRequest, index: int) -> Tuple[str, ...]:
+        argument = RF4ChatBridge._building_argument(trace, index)
+        if argument is None or argument.kind != "guid_array" or not isinstance(argument.value, tuple):
+            return ()
+        return tuple(str(value) for value in argument.value)
+
+    @staticmethod
+    def _format_money_raw(value: int) -> str:
+        return f"{int(value) / 100.0:.2f} (raw={int(value)})"
+
+    def _format_system_item_name(self, system_id: object) -> str:
+        key = str(system_id or "").strip()
+        if not key:
+            return "unknown"
+        game_name = str(self._fish_labels_zh.get(key) or "").strip()
+        if game_name and game_name != key:
+            return f"{self._quote_text(self._clean_text(game_name), limit=60)}({key})"
+        return key
+
+    def _format_guid_sequence(self, values: Sequence[str], limit: int = 8) -> str:
+        items = [self._short_id(str(value)) for value in values[:limit]]
+        if len(values) > limit:
+            items.append(f"…+{len(values) - limit}")
+        return "[" + ", ".join(items) + "]"
+
+    def _format_observed_catch(self, session: FlowSession, guid: str) -> str:
+        record = session.observed_catches.get(guid)
+        if record is None:
+            return self._short_id(guid)
+        fish_name = self._format_fish_name(record.fish_key)
+        return (
+            f"{fish_name}/{self._format_chat_weight(record.weight_raw)}"
+            f"/{self._short_id(guid)}"
+        )
+
+    def _format_catch_guid_sequence(
+        self,
+        session: FlowSession,
+        values: Sequence[str],
+        limit: int = 8,
+    ) -> str:
+        items = [self._format_observed_catch(session, str(value)) for value in values[:limit]]
+        if len(values) > limit:
+            items.append(f"…+{len(values) - limit}")
+        return "[" + "; ".join(items) + "]"
+
+    def _format_repair_request_summary(self, request: RepairRequestSummary) -> str:
+        selections = [
+            f"{value.component_type}"
+            + (f"/{value.component_key}" if value.component_key else "")
+            for value in request.selections[:12]
+        ]
+        if len(request.selections) > 12:
+            selections.append(f"…+{len(request.selections) - 12}")
+        return (
+            f"物品={self._short_id(request.item_guid)} "
+            f"部件=[{', '.join(selections)}] "
+            f"选项={str(request.option_enabled).lower()} "
+            f"报价={self._format_money_raw(request.quoted_cost_raw)}"
+        )
+
+    def _format_phoenix_arguments(self, arguments: Sequence[PhoenixArgument]) -> str:
+        values: List[str] = []
+        for index, argument in enumerate(arguments[:12], start=1):
+            if argument.kind == "guid":
+                value = self._short_id(str(argument.value))
+            elif argument.kind == "guid_array" and isinstance(argument.value, tuple):
+                value = self._format_guid_sequence(argument.value)
+            elif argument.kind == "repair_request" and isinstance(argument.value, RepairRequestSummary):
+                value = self._format_repair_request_summary(argument.value)
+            elif argument.kind == "string":
+                value = self._quote_text(str(argument.value or ""), limit=60)
+            elif argument.kind == "bool":
+                value = str(bool(argument.value)).lower()
+            else:
+                value = str(argument.value)
+            values.append(f"{index}:{argument.kind}={value}")
+        if len(arguments) > 12:
+            values.append(f"…+{len(arguments) - 12}")
+        return "参数=[" + "; ".join(values) + "]" if values else "无参数"
+
+    def _building_command_label(self, command: Tuple[int, int]) -> str:
+        verified = self.BUILDING_COMMAND_LABELS.get(command)
+        if verified:
+            return verified
+        domain = self.BUILDING_DOMAIN_LABELS.get(command[0], "建筑/商店")
+        return f"{domain}未识别操作 {command[0]}/{command[1]}"
+
+    def _describe_building_request(
+        self,
+        session: FlowSession,
+        envelope: RpcEnvelope,
+    ) -> Optional[tuple[str, str]]:
+        if not self._building_protocol_details_enabled():
+            return None
+        trace = session.building_request_calls.get(envelope.call_id)
+        if trace is None:
+            return None
+        command = (trace.main_cmd, trace.sub_cmd)
+        label = self._building_command_label(command)
+        parts: List[str] = []
+
+        if command in {(22, 2), (22, 3)}:
+            store_id = self._building_argument_value(trace, 0, "")
+            system_id = self._building_argument_value(trace, 1, "")
+            cost_raw = self._numeric_building_argument(trace, 2)
+            parts.extend(
+                (
+                    f"商店={self._quote_text(str(store_id or ''), limit=60)}",
+                    f"物品={self._format_system_item_name(system_id)}",
+                    f"支付={'金币' if command == (22, 3) else '银币'}",
+                )
+            )
+            if cost_raw is not None:
+                parts.append(f"报价={self._format_money_raw(cost_raw)}")
+        elif command == (22, 4):
+            parts.append(f"商店={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+            parts.append(f"物品={self._short_id(str(self._building_argument_value(trace, 1, '')))}")
+        elif command == (20, 2):
+            fish_ids = self._guid_array_building_argument(trace, 1)
+            parts.append(f"鱼市={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+            parts.append(f"鱼={self._format_catch_guid_sequence(session, fish_ids)}")
+            parts.append(f"数量={len(fish_ids)}")
+        elif command == (20, 4):
+            fish_ids = self._guid_array_building_argument(trace, 2)
+            parts.append(f"咖啡馆/市场={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+            parts.append(f"订单={self._short_id(str(self._building_argument_value(trace, 1, '')))}")
+            parts.append(f"鱼={self._format_catch_guid_sequence(session, fish_ids)}")
+            parts.append(f"数量={len(fish_ids)}")
+        elif command == (21, 2):
+            parts.append(f"工坊={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+            parts.append(f"物品={self._short_id(str(self._building_argument_value(trace, 1, '')))}")
+        elif command in {(21, 3), (21, 4)}:
+            parts.append(f"工坊={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+            request = self._building_argument_value(trace, 1)
+            if isinstance(request, RepairRequestSummary):
+                parts.append(self._format_repair_request_summary(request))
+        elif command in {(25, 4), (25, 6)}:
+            parts.append(f"船={self._short_id(str(self._building_argument_value(trace, 0, '')))}")
+            parts.append(f"加油站={self._quote_text(str(self._building_argument_value(trace, 1, '')), limit=60)}")
+        elif command in {(3, 25), (3, 26)}:
+            parts.append("无参数")
+        elif command == (25, 3):
+            parts.append(f"位置枚举={self._numeric_building_argument(trace, 0)}")
+            parts.append(f"船只/载具={self._short_id(str(self._building_argument_value(trace, 1, '')))}")
+        elif command == (3, 13):
+            parts.append(f"厨房={self._quote_text(str(self._building_argument_value(trace, 0, '')), limit=60)}")
+        elif command == (4, 1):
+            parts.append(f"位置={self._numeric_building_argument(trace, 0)}")
+        elif command == (4, 4):
+            parts.extend(
+                (
+                    f"位置={self._numeric_building_argument(trace, 0)}",
+                    f"偏移={self._numeric_building_argument(trace, 1)}",
+                    f"数量={self._numeric_building_argument(trace, 2)}",
+                )
+            )
+        elif command == (4, 5):
+            item_ids = self._guid_array_building_argument(trace, 1)
+            parts.append(f"位置={self._numeric_building_argument(trace, 0)}")
+            parts.append(f"物品={self._format_guid_sequence(item_ids)}")
+            parts.append(f"数量={len(item_ids)}")
+        elif command == (4, 6):
+            item_ids = self._guid_array_building_argument(trace, 0)
+            parts.append(f"物品={self._format_guid_sequence(item_ids)}")
+            parts.append(f"从={self._numeric_building_argument(trace, 1)}")
+            parts.append(f"到={self._numeric_building_argument(trace, 2)}")
+        elif command in {(4, 7), (4, 8)}:
+            parts.append(self._format_phoenix_arguments(trace.arguments))
+
+        if not parts or not trace.arguments and command not in {(3, 25), (3, 26)}:
+            details = (
+                self._format_phoenix_arguments(trace.arguments)
+                if trace.arguments
+                else self._format_generic_business_payload(trace.payload)
+            )
+            if details not in parts:
+                parts.append(details)
+        category = "item" if command[0] == 4 else "building"
+        return category, f"{label}请求#{trace.call_id} | {' '.join(parts)}"
+
+    def _remember_observed_catches(
+        self,
+        session: FlowSession,
+        records: Sequence[ObservedCatchRecord],
+    ) -> None:
+        for record in records:
+            session.observed_catches[record.record_guid] = record
+        if len(session.observed_catches) > 2048:
+            for guid in tuple(session.observed_catches)[: len(session.observed_catches) - 2048]:
+                session.observed_catches.pop(guid, None)
+
+    def _format_workshop_diagnosis(self, summary: WorkshopDiagnosisSummary) -> str:
+        parts: List[str] = []
+        for value in summary.parts[:12]:
+            condition = (
+                f"{max(0.0, min(1.0, value.condition)) * 100.0:.1f}%"
+                if math.isfinite(value.condition) and -0.001 <= value.condition <= 1.2
+                else self._format_float(value.condition)
+            )
+            parts.append(
+                f"{self._short_id(value.part_guid)} "
+                f"状态={condition} 银币={self._format_money_raw(value.silver_raw)} "
+                f"金币={self._format_money_raw(value.gold_raw)} "
+                f"耗时/数量={value.duration_or_count} 状态枚举={value.status} "
+                f"子项={value.subpart_count}"
+            )
+        if len(summary.parts) > 12:
+            parts.append(f"…+{len(summary.parts) - 12}")
+        return (
+            f"物品={self._short_id(summary.item_guid)} 部件=["
+            + "; ".join(parts)
+            + "]"
+        )
+
+    def _format_building_response_fallback(self, payload: bytes) -> str:
+        if not payload or payload in {b"\x00", b"\x0e"}:
+            return "服务器已确认"
+        details = self._format_generic_business_payload(payload)
+        if payload[:1] == b"\x01" and len(payload) >= 5:
+            return f"对象type={u32(payload, 1)} {details}"
+        return details
+
+    @staticmethod
+    def _extract_gear_catalog_keys(payload: bytes) -> List[str]:
+        prefixes = (
+            "spin_",
+            "tele_",
+            "bolo_",
+            "match_",
+            "picker_",
+            "feeder_",
+            "carp_",
+            "ffish_",
+            "bcr_",
+            "conv_",
+            "rgm_",
+            "RGM_",
+            "mono_",
+            "braid_",
+            "fluoro_",
+            "jhead_",
+        )
+        out: List[str] = []
+        for value in ascii_strings(payload, min_len=6):
+            if not value.startswith(prefixes):
+                continue
+            compact = value[:80]
+            if compact not in out:
+                out.append(compact)
+        return out
+
+    def _describe_building_response(
+        self,
+        session: FlowSession,
+        envelope: RpcEnvelope,
+    ) -> Optional[tuple[str, str]]:
+        if not self._building_protocol_details_enabled() or envelope.marker != -2:
+            return None
+        trace = session.building_request_calls.get(envelope.call_id)
+        if trace is None:
+            return None
+        command = (trace.main_cmd, trace.sub_cmd)
+        label = self._building_command_label(command)
+        payload = envelope.payload
+        details = ""
+
+        if command == (20, 2):
+            results = parse_fish_sale_results(payload)
+            if results:
+                lines = []
+                total_raw = 0
+                for value in results[:12]:
+                    if value.status == 0:
+                        total_raw += value.paid_raw
+                    lines.append(
+                        f"{self._format_observed_catch(session, value.fish_guid)} "
+                        f"金额={self._format_money_raw(value.paid_raw)} 状态={value.status}"
+                    )
+                if len(results) > 12:
+                    lines.append(f"…+{len(results) - 12}")
+                details = (
+                    f"结果=[{'; '.join(lines)}] "
+                    f"成功合计={self._format_money_raw(total_raw)}"
+                )
+        elif command == (20, 4):
+            result = parse_cafe_delivery_result(payload)
+            if result is not None:
+                details = f"奖励={self._format_money_raw(result[0])} 状态={result[1]}"
+        elif command == (21, 2):
+            result = parse_workshop_diagnosis(payload)
+            if result is not None:
+                details = self._format_workshop_diagnosis(result)
+        elif command in {(21, 3), (21, 4)}:
+            details = self._format_building_response_fallback(payload)
+        elif command in {(22, 2), (22, 3)}:
+            result_text = parse_shop_result_text(payload)
+            parts = []
+            if result_text:
+                parts.append(f"回执={self._quote_text(self._clean_text(result_text), limit=100)}")
+            if not parts:
+                details = self._format_building_response_fallback(payload)
+            else:
+                details = " ".join(parts)
+        elif command == (25, 6):
+            price_raw = parse_tagged_i64(payload)
+            if price_raw is not None:
+                details = f"报价={self._format_money_raw(price_raw)}"
+        elif command in {(3, 25), (3, 26)}:
+            result = parse_admin_status(payload)
+            if result is not None:
+                details = (
+                    f"文本={self._quote_text(self._clean_text(result[0] or ''), limit=100)} "
+                    f"数值={self._format_float(result[1])}"
+                )
+        elif command == (4, 1):
+            result = parse_item_scope_summary(payload)
+            if result is not None:
+                details = (
+                    f"可用/总数={result[0]} 容量/起点={result[1]} "
+                    f"限制/页大小={result[2]}"
+                )
+        elif command == (4, 4):
+            try:
+                values, _ = read_guid_array(payload, 0, marker=True)
+            except (ValueError, IndexError):
+                values = ()
+            if values or payload.startswith(b"\x06\x00\x00"):
+                details = f"数量={len(values)} 物品={self._format_guid_sequence(values, limit=12)}"
+        elif command == (4, 5):
+            catches = parse_observed_catch_records(payload)
+            if catches:
+                self._remember_observed_catches(session, catches)
+                values = [
+                    f"{self._format_fish_name(value.fish_key)}/"
+                    f"{self._format_chat_weight(value.weight_raw)}/"
+                    f"规格={value.size_enum}/{self._short_id(value.record_guid)}"
+                    for value in catches[:12]
+                ]
+                if len(catches) > 12:
+                    values.append(f"…+{len(catches) - 12}")
+                details = f"鱼获数量={len(catches)} 鱼获=[{'; '.join(values)}]"
+            else:
+                details = self._format_building_response_fallback(payload)
+        elif command == (4, 8):
+            details = self._format_building_response_fallback(payload)
+
+        if not details:
+            catalog_keys = self._extract_gear_catalog_keys(payload)
+            if catalog_keys:
+                formatted = [self._format_system_item_name(value) for value in catalog_keys[:20]]
+                if len(catalog_keys) > 20:
+                    formatted.append(f"…+{len(catalog_keys) - 20}")
+                details = f"资源名称数={len(catalog_keys)} 名称=[{'; '.join(formatted)}]"
+        if not details:
+            details = self._format_building_response_fallback(payload)
+        category = "item" if command[0] == 4 else "building"
+        return category, f"{label}响应#{trace.call_id} | {details}"
+
+    @staticmethod
+    def _fish_setup_meta_for_request(
+        session: FlowSession,
+        request: Union[FishingEndRequest, KeepFishRequest],
+    ) -> Optional[FishSetupMeta]:
+        if request.fish_setup_id:
+            meta = session.fish_setup_cache.get(request.fish_setup_id)
+            if meta:
+                return meta
+        if request.fishing_gear_id:
+            setup_id = session.fish_setup_by_gear.get(request.fishing_gear_id)
+            if setup_id:
+                return session.fish_setup_cache.get(setup_id)
         return None
 
     @staticmethod
@@ -1534,6 +2132,19 @@ class RF4ChatBridge:
             return plain_body, []
         self._detect_anticheat(session, envelope, from_client=True)
 
+        # 结束钓鱼(14/4)请求：登记 call_id→请求，供服务器响应时反查鱼名/重量。
+        fishing_end_request = parse_fishing_end_request(envelope, session.profile)
+        if fishing_end_request:
+            meta = self._fish_setup_meta_for_request(session, fishing_end_request)
+            if meta and not fishing_end_request.fish_setup_id:
+                fishing_end_request = FishingEndRequest(
+                    call_id=fishing_end_request.call_id,
+                    fishing_gear_id=fishing_end_request.fishing_gear_id,
+                    fish_setup_id=meta.fish_setup_id,
+                )
+            session.fishing_end_requests[fishing_end_request.call_id] = fishing_end_request
+            return plain_body, []
+
         # 按抛竿顺序分配竿号：游戏里 1/2/3 号竿对应抛竿先后。
         # 抛竿(14/2)和准备抛竿(14/1)时把该钓组ID分配递增竿号，后续来鱼/咬钩沿用。
         if envelope.main_cmd == session.profile.fishing_main_cmd and envelope.sub_cmd in (
@@ -1648,9 +2259,16 @@ class RF4ChatBridge:
             return bytes(out)
         self._detect_anticheat(session, envelope, from_client=False)
 
+        if envelope.marker == -2:
+            session.building_request_calls.pop(envelope.call_id, None)
+            session.rpc_request_commands.pop(envelope.call_id, None)
+
         fish_setup = parse_fish_setup_push(envelope, session.profile)
         if fish_setup:
             session.fish_setup_cache[fish_setup.fish_setup_id] = fish_setup
+            # 记录 钓组→鱼编号 反查表：14/4 结算请求可能不带 setup_id，用钓组ID补全。
+            if fish_setup.fishing_gear_id:
+                session.fish_setup_by_gear[fish_setup.fishing_gear_id] = fish_setup.fish_setup_id
             # 详细记录来鱼推送的字段，用于确认竿位编号(gear slot)的来源。
             if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
                 self._log(
@@ -1709,6 +2327,12 @@ class RF4ChatBridge:
             if line:
                 self._log_event(line)
                 self._broadcast_generic_event("fish_catch", line)
+            return bytes(out)
+
+        fishing_end_request = session.fishing_end_requests.pop(envelope.call_id, None)
+        if fishing_end_request and envelope.marker == -2:
+            if fishing_end_request.fish_setup_id:
+                session.announced_fish_setup_ids.discard(fishing_end_request.fish_setup_id)
             return bytes(out)
 
         keep_request = session.keep_requests.pop(envelope.call_id, None)

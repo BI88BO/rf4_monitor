@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict
 
@@ -102,6 +104,14 @@ def u32(data: bytes, pos: int) -> int:
     return int.from_bytes(data[pos:pos + 4], "little", signed=False)
 
 
+def i32(data: bytes, pos: int) -> int:
+    return int.from_bytes(data[pos:pos + 4], "little", signed=True)
+
+
+def f32(data: bytes, pos: int) -> float:
+    return struct.unpack_from("<f", data, pos)[0]
+
+
 def u64(data: bytes, pos: int) -> int:
     return int.from_bytes(data[pos:pos + 8], "little", signed=False)
 
@@ -124,6 +134,83 @@ def xor_bytes(left: bytes, right: bytes) -> bytes:
 
 def guid_le(raw: bytes) -> str:
     return str(uuid.UUID(bytes_le=raw))
+
+
+def _require_bytes(data: bytes, pos: int, size: int, label: str) -> None:
+    if pos < 0 or size < 0 or pos + size > len(data):
+        raise ValueError(f"truncated {label}")
+
+
+def read_typed_list_header(data: bytes, pos: int) -> Optional[Tuple[str, int, int]]:
+    if pos + 4 > len(data) or data[pos] != 0x03:
+        return None
+    size = data[pos + 1]
+    start = pos + 2
+    end = start + size
+    if size <= 0 or end + 2 > len(data):
+        return None
+    try:
+        type_code = data[start:end].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not type_code.isdigit():
+        return None
+    return type_code, u16(data, end), end + 2
+
+
+def read_guid_array(data: bytes, pos: int, marker: bool = True) -> Tuple[Tuple[str, ...], int]:
+    if marker:
+        _require_bytes(data, pos, 1, "Guid array marker")
+        if data[pos] != 0x06:
+            raise ValueError(f"expected Guid array marker at {pos}")
+        pos += 1
+    _require_bytes(data, pos, 2, "Guid array count")
+    count = u16(data, pos)
+    pos += 2
+    if count > 4096:
+        raise ValueError("Guid array count is unreasonable")
+    _require_bytes(data, pos, count * 16, "Guid array")
+    values = tuple(
+        guid_le(data[pos + index * 16:pos + (index + 1) * 16])
+        for index in range(count)
+    )
+    return values, pos + count * 16
+
+
+def read_phoenix_string(data: bytes, pos: int) -> Tuple[Optional[str], int]:
+    _require_bytes(data, pos, 1, "Phoenix string marker")
+    marker = data[pos]
+    if marker == 0xFF:
+        return None, pos + 1
+    widths = {0x14: 1, 0x15: 2, 0x16: 4}
+    width = widths.get(marker)
+    if width is None:
+        raise ValueError(f"unsupported Phoenix string marker 0x{marker:02x}")
+    _require_bytes(data, pos + 1, width, "Phoenix string length")
+    size = int.from_bytes(data[pos + 1:pos + 1 + width], "little", signed=False)
+    start = pos + 1 + width
+    _require_bytes(data, start, size, "Phoenix string")
+    return data[start:start + size].decode("utf-8", errors="replace"), start + size
+
+
+def _read_nullable_short_string_strict(data: bytes, pos: int) -> Tuple[Optional[str], int]:
+    _require_bytes(data, pos, 1, "short string")
+    if data[pos] == 0xFF:
+        return None, pos + 1
+    size = data[pos]
+    start = pos + 1
+    _require_bytes(data, start, size, "short string")
+    return data[start:start + size].decode("utf-8", errors="replace"), start + size
+
+
+def _read_money_pair_object(data: bytes, pos: int) -> Tuple[Tuple[int, int], int]:
+    object_type_id, pos = read_object_header(data, pos)
+    if object_type_id != 17497:
+        raise ValueError(f"expected money pair type 17497, got {object_type_id}")
+    _require_bytes(data, pos, 16, "money pair")
+    silver_raw = int.from_bytes(data[pos:pos + 8], "little", signed=True)
+    gold_raw = int.from_bytes(data[pos + 8:pos + 16], "little", signed=True)
+    return (silver_raw, gold_raw), pos + 16
 
 
 def pack_guid_marker(value: str) -> bytes:
@@ -212,6 +299,303 @@ def read_guid(data: bytes, pos: int, marker: bool) -> Tuple[str, int]:
     if pos + 16 > len(data):
         raise ValueError("truncated guid")
     return guid_le(data[pos:pos + 16]), pos + 16
+
+
+def _read_repair_request_object(data: bytes, pos: int) -> Tuple[RepairRequestSummary, int]:
+    object_type_id, pos = read_object_header(data, pos)
+    if object_type_id != 17510:
+        raise ValueError(f"expected repair request type 17510, got {object_type_id}")
+    item_guid, pos = read_guid(data, pos, marker=False)
+    selections: List[RepairSelectionSummary] = []
+    header = read_typed_list_header(data, pos)
+    if header is None:
+        if pos >= len(data) or data[pos] != 0xFF:
+            raise ValueError("missing repair component list")
+        pos += 1
+    else:
+        _, count, pos = header
+        if count > 256:
+            raise ValueError("repair component count is unreasonable")
+        for _ in range(count):
+            selection_type_id, pos = read_object_header(data, pos)
+            if selection_type_id != 17509:
+                raise ValueError(f"expected repair selection type 17509, got {selection_type_id}")
+            _require_bytes(data, pos, 1, "repair component enum")
+            component_type = data[pos]
+            component_key, pos = _read_nullable_short_string_strict(data, pos + 1)
+            selections.append(
+                RepairSelectionSummary(
+                    component_type=component_type,
+                    component_key=component_key,
+                )
+            )
+    _require_bytes(data, pos, 9, "repair request tail")
+    option_enabled = bool(data[pos])
+    quoted_cost_raw = int.from_bytes(data[pos + 1:pos + 9], "little", signed=True)
+    return (
+        RepairRequestSummary(
+            item_guid=item_guid,
+            selections=tuple(selections),
+            option_enabled=option_enabled,
+            quoted_cost_raw=quoted_cost_raw,
+        ),
+        pos + 9,
+    )
+
+
+def read_phoenix_argument(data: bytes, pos: int) -> Tuple[PhoenixArgument, int]:
+    _require_bytes(data, pos, 1, "Phoenix argument")
+    marker = data[pos]
+    if marker in (0x14, 0x15, 0x16, 0xFF):
+        value, next_pos = read_phoenix_string(data, pos)
+        return PhoenixArgument(marker=marker, kind="string", value=value), next_pos
+    if marker == 0x0C:
+        value, next_pos = read_guid(data, pos, marker=True)
+        return PhoenixArgument(marker=marker, kind="guid", value=value), next_pos
+    if marker == 0x0D:
+        _require_bytes(data, pos + 1, 4, "Int32 argument")
+        return PhoenixArgument(marker=marker, kind="i32", value=i32(data, pos + 1)), pos + 5
+    if marker in (0x0E, 0x0F):
+        return PhoenixArgument(marker=marker, kind="bool", value=marker == 0x0E), pos + 1
+    if marker == 0x10:
+        _require_bytes(data, pos + 1, 4, "UInt32 argument")
+        return PhoenixArgument(marker=marker, kind="u32", value=u32(data, pos + 1)), pos + 5
+    if marker == 0x11:
+        _require_bytes(data, pos + 1, 8, "Int64 argument")
+        value = int.from_bytes(data[pos + 1:pos + 9], "little", signed=True)
+        return PhoenixArgument(marker=marker, kind="i64", value=value), pos + 9
+    if marker == 0x13:
+        _require_bytes(data, pos + 1, 4, "Single argument")
+        return PhoenixArgument(marker=marker, kind="f32", value=f32(data, pos + 1)), pos + 5
+    if marker == 0x06:
+        value, next_pos = read_guid_array(data, pos, marker=True)
+        return PhoenixArgument(marker=marker, kind="guid_array", value=value), next_pos
+    if marker == 0x01:
+        object_type_id = u32(data, pos + 1) if pos + 5 <= len(data) else -1
+        if object_type_id == 17510:
+            value, next_pos = _read_repair_request_object(data, pos)
+            return PhoenixArgument(marker=marker, kind="repair_request", value=value), next_pos
+        raise ValueError(f"unsupported Phoenix argument object type {object_type_id}")
+    raise ValueError(f"unsupported Phoenix argument marker 0x{marker:02x}")
+
+
+def parse_typed_arguments(data: bytes) -> Tuple[PhoenixArgument, ...]:
+    count, pos = read_arg_header(data, 0)
+    if count > 256:
+        raise ValueError("typed argument count is unreasonable")
+    arguments: List[PhoenixArgument] = []
+    for _ in range(count):
+        argument, pos = read_phoenix_argument(data, pos)
+        arguments.append(argument)
+    return tuple(arguments)
+
+
+def parse_observed_catch_records(data: bytes) -> Tuple[ObservedCatchRecord, ...]:
+    needle = b"\x01\x19\x00\x00\x00"
+    records: List[ObservedCatchRecord] = []
+    pos = 0
+    while len(records) < 512:
+        offset = data.find(needle, pos)
+        if offset < 0:
+            break
+        pos = offset + len(needle)
+        try:
+            fish_key, pos = _read_nullable_short_string_strict(data, pos)
+            if not fish_key or not plausible_fish_key(fish_key):
+                continue
+            _require_bytes(data, pos, 18, "catch record prefix")
+            weight_raw = u32(data, pos)
+            pos += 4
+            _ = f32(data, pos)
+            pos += 4
+            size_enum = u16(data, pos)
+            pos += 2
+            pos += 8
+            if pos + 5 <= len(data) and data[pos] == 0x01 and u32(data, pos + 1) == 600:
+                pos += 5
+                _require_bytes(data, pos, 12, "catch metadata")
+                pos += 12
+            _require_bytes(data, pos, 1, "catch bait prefix")
+            _, pos = _read_nullable_short_string_strict(data, pos + 1)
+            _require_bytes(data, pos, 1, "catch level prefix")
+            _, pos = _read_nullable_short_string_strict(data, pos + 1)
+            _require_bytes(data, pos, 22, "catch record identity")
+            pos += 6
+            record_guid = guid_le(data[pos:pos + 16])
+            pos += 16
+            if 0 < weight_raw < 10_000_000 and record_guid != str(uuid.UUID(int=0)):
+                records.append(
+                    ObservedCatchRecord(
+                        record_guid=record_guid,
+                        fish_key=fish_key,
+                        weight_raw=weight_raw,
+                        size_enum=size_enum,
+                    )
+                )
+        except (ValueError, IndexError, struct.error):
+            pos = offset + 1
+    unique = {record.record_guid: record for record in records}
+    return tuple(unique.values())
+
+
+def parse_fish_sale_results(data: bytes) -> Tuple[FishSaleResult, ...]:
+    header = read_typed_list_header(data, 0)
+    if header is None:
+        return ()
+    _, count, pos = header
+    if count > 4096:
+        return ()
+    results: List[FishSaleResult] = []
+    try:
+        for _ in range(count):
+            object_type_id, pos = read_object_header(data, pos)
+            if object_type_id != 303:
+                return ()
+            fish_guid, pos = read_guid(data, pos, marker=False)
+            _require_bytes(data, pos, 9, "fish sale result")
+            paid_raw = int.from_bytes(data[pos:pos + 8], "little", signed=True)
+            status = data[pos + 8]
+            pos += 9
+            results.append(FishSaleResult(fish_guid=fish_guid, paid_raw=paid_raw, status=status))
+    except (ValueError, IndexError):
+        return ()
+    return tuple(results)
+
+
+def parse_cafe_delivery_result(data: bytes) -> Optional[Tuple[int, int]]:
+    try:
+        object_type_id, pos = read_object_header(data, 0)
+        if object_type_id != 300:
+            return None
+        _require_bytes(data, pos, 9, "cafe delivery result")
+        reward_raw = int.from_bytes(data[pos:pos + 8], "little", signed=True)
+        return reward_raw, data[pos + 8]
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_workshop_diagnosis(data: bytes) -> Optional[WorkshopDiagnosisSummary]:
+    try:
+        object_type_id, pos = read_object_header(data, 0)
+        if object_type_id != 503:
+            return None
+        item_guid, pos = read_guid(data, pos, marker=False)
+        header = read_typed_list_header(data, pos)
+        if header is None:
+            return WorkshopDiagnosisSummary(item_guid=item_guid, parts=())
+        _, count, pos = header
+        if count > 256:
+            return None
+        parts: List[WorkshopPartSummary] = []
+        for _ in range(count):
+            part_type_id, pos = read_object_header(data, pos)
+            if part_type_id != 504:
+                return None
+            part_guid, pos = read_guid(data, pos, marker=False)
+            _require_bytes(data, pos, 8, "workshop part state")
+            condition = f32(data, pos)
+            duration_or_count = i32(data, pos + 4)
+            pos += 8
+            (silver_raw, gold_raw), pos = _read_money_pair_object(data, pos)
+            _require_bytes(data, pos, 1, "workshop part status")
+            status = data[pos]
+            pos += 1
+            subpart_count = 0
+            sub_header = read_typed_list_header(data, pos)
+            if sub_header is None:
+                if pos < len(data) and data[pos] == 0xFF:
+                    pos += 1
+                else:
+                    return None
+            else:
+                _, subpart_count, pos = sub_header
+                if subpart_count > 512:
+                    return None
+                for _ in range(subpart_count):
+                    subpart_type_id, pos = read_object_header(data, pos)
+                    if subpart_type_id != 507:
+                        return None
+                    _, pos = _read_nullable_short_string_strict(data, pos)
+                    _, pos = _read_money_pair_object(data, pos)
+                    _, pos = _read_money_pair_object(data, pos)
+                    _require_bytes(data, pos, 4, "workshop subpart tail")
+                    pos += 4
+            parts.append(
+                WorkshopPartSummary(
+                    part_guid=part_guid,
+                    condition=condition,
+                    duration_or_count=duration_or_count,
+                    silver_raw=silver_raw,
+                    gold_raw=gold_raw,
+                    status=status,
+                    subpart_count=subpart_count,
+                )
+            )
+        return WorkshopDiagnosisSummary(item_guid=item_guid, parts=tuple(parts))
+    except (ValueError, IndexError, struct.error):
+        return None
+
+
+def parse_admin_status(data: bytes) -> Optional[Tuple[Optional[str], float]]:
+    try:
+        object_type_id, pos = read_object_header(data, 0)
+        if object_type_id != 304:
+            return None
+        text, pos = _read_nullable_short_string_strict(data, pos)
+        _require_bytes(data, pos, 4, "admin status value")
+        return text, f32(data, pos)
+    except (ValueError, IndexError, struct.error):
+        return None
+
+
+def parse_tagged_i64(data: bytes) -> Optional[int]:
+    if len(data) < 9 or data[0] != 0x11:
+        return None
+    return int.from_bytes(data[1:9], "little", signed=True)
+
+
+def parse_item_scope_summary(data: bytes) -> Optional[Tuple[int, int, int]]:
+    try:
+        object_type_id, pos = read_object_header(data, 0)
+        if object_type_id != 133:
+            return None
+        _require_bytes(data, pos, 12, "item scope summary")
+        return i32(data, pos), i32(data, pos + 4), i32(data, pos + 8)
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_shop_result_text(data: bytes) -> Optional[str]:
+    try:
+        object_type_id, pos = read_object_header(data, 0)
+        if object_type_id != 804:
+            return None
+        value, _ = _read_nullable_short_string_strict(data, pos)
+        return value
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_fishing_end_request(envelope: RpcEnvelope, profile: RF4ProtocolProfile) -> Optional[FishingEndRequest]:
+    if envelope.marker != -1:
+        return None
+    if envelope.main_cmd != profile.fishing_main_cmd or envelope.sub_cmd != profile.fishing_end_sub_cmd:
+        return None
+    try:
+        _, pos = read_arg_header(envelope.payload, 0)
+        fishing_gear_id = None
+        fish_setup_id = None
+        if pos < len(envelope.payload) and envelope.payload[pos] == 0x0C:
+            fishing_gear_id, pos = read_guid(envelope.payload, pos, marker=True)
+        if pos < len(envelope.payload) and envelope.payload[pos] == 0x0C:
+            fish_setup_id, pos = read_guid(envelope.payload, pos, marker=True)
+    except (ValueError, IndexError):
+        return None
+    return FishingEndRequest(
+        call_id=envelope.call_id,
+        fishing_gear_id=fishing_gear_id,
+        fish_setup_id=fish_setup_id,
+    )
 
 
 def ascii_strings(data: bytes, min_len: int = 4) -> List[str]:
@@ -331,6 +715,76 @@ class BusinessPayloadSummary:
     guids: Tuple[str, ...]
     u32_values: Tuple[int, ...]
     float_groups: Tuple[Tuple[float, ...], ...]
+
+
+@dataclass(frozen=True)
+class FishingEndRequest:
+    call_id: int
+    fishing_gear_id: Optional[str]
+    fish_setup_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class RepairSelectionSummary:
+    component_type: int
+    component_key: Optional[str]
+
+
+@dataclass(frozen=True)
+class RepairRequestSummary:
+    item_guid: str
+    selections: Tuple[RepairSelectionSummary, ...]
+    option_enabled: bool
+    quoted_cost_raw: int
+
+
+@dataclass(frozen=True)
+class PhoenixArgument:
+    marker: int
+    kind: str
+    value: object
+
+
+@dataclass(frozen=True)
+class BuildingRpcRequest:
+    call_id: int
+    main_cmd: int
+    sub_cmd: int
+    arguments: Tuple[PhoenixArgument, ...]
+    payload: bytes
+    created_at: float
+
+
+@dataclass(frozen=True)
+class ObservedCatchRecord:
+    record_guid: str
+    fish_key: str
+    weight_raw: int
+    size_enum: Optional[int]
+
+
+@dataclass(frozen=True)
+class FishSaleResult:
+    fish_guid: str
+    paid_raw: int
+    status: int
+
+
+@dataclass(frozen=True)
+class WorkshopPartSummary:
+    part_guid: str
+    condition: float
+    duration_or_count: int
+    silver_raw: int
+    gold_raw: int
+    status: int
+    subpart_count: int
+
+
+@dataclass(frozen=True)
+class WorkshopDiagnosisSummary:
+    item_guid: str
+    parts: Tuple[WorkshopPartSummary, ...]
 
 
 class RC4Stream:
