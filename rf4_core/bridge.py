@@ -2727,19 +2727,22 @@ class RF4ChatBridge:
 
         release_request = parse_release_fish_request(envelope, session.profile)
         if release_request and release_request.fish_setup_id:
-            # 放生提示不依赖 announced 集合：海钓/结算场景鱼可能不经过 14/14 来鱼推送，
-            # 只要客户端发了 14/6 放生请求就显示（鱼名从缓存反查，无鱼名则显示未知）。
-            session.announced_fish_setup_ids.discard(release_request.fish_setup_id)
-            meta = session.fish_setup_cache.get(release_request.fish_setup_id)
-            synthetic = self._build_self_synthetic_event(
-                session=session,
-                fish_key=meta.fish_key if meta else "",
-                weight_raw=meta.weight_hint_raw if meta else 0,
-                phase=self.SELF_EVENT_PHASE_RELEASED,
-                fishing_gear_id=release_request.fishing_gear_id,
-                fish_setup_id=release_request.fish_setup_id,
-            )
-            self._emit_self_event(session, synthetic)
+            # 只有当该鱼确实经历过 14/14 来鱼推送（announced）时才显示放生，
+            # 避免把监控启动前就在搏鱼的旧鱼误报。旧版本无 14/4 结算追踪，
+            # 14/6 到达时 id 仍在 announced 中，故能正常显示；
+            # 不再提前 discard 后即恢复该行为。
+            if release_request.fish_setup_id in session.announced_fish_setup_ids:
+                session.announced_fish_setup_ids.discard(release_request.fish_setup_id)
+                meta = session.fish_setup_cache.get(release_request.fish_setup_id)
+                synthetic = self._build_self_synthetic_event(
+                    session=session,
+                    fish_key=meta.fish_key if meta else "",
+                    weight_raw=meta.weight_hint_raw if meta else 0,
+                    phase=self.SELF_EVENT_PHASE_RELEASED,
+                    fishing_gear_id=release_request.fishing_gear_id,
+                    fish_setup_id=release_request.fish_setup_id,
+                )
+                self._emit_self_event(session, synthetic)
             return plain_body, []
 
         # 脱钩/脱离由客户端完成判定后上报，不能只依赖服务器方向（14/12）。
@@ -2877,8 +2880,10 @@ class RF4ChatBridge:
 
         fishing_end_request = session.fishing_end_requests.pop(envelope.call_id, None)
         if fishing_end_request and envelope.marker == -2:
-            if fishing_end_request.fish_setup_id:
-                session.announced_fish_setup_ids.discard(fishing_end_request.fish_setup_id)
+            # 不要在此处从 announced_fish_setup_ids 移除该鱼：14/4 结算响应总是先于
+            # 随后的 14/5 入护 / 14/6 放生请求到达，提前 discard 会让放生/脱钩事件
+            # 因为已不在 announced 集合而被跳过（旧版本无 14/4 追踪故正常）。
+            # 由 14/5、14/6、14/12 各自的消费逻辑负责清理。
             return bytes(out)
 
         keep_request = session.keep_requests.pop(envelope.call_id, None)
