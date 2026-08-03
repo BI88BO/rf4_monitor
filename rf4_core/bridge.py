@@ -2727,18 +2727,19 @@ class RF4ChatBridge:
 
         release_request = parse_release_fish_request(envelope, session.profile)
         if release_request and release_request.fish_setup_id:
-            if release_request.fish_setup_id in session.announced_fish_setup_ids:
-                session.announced_fish_setup_ids.discard(release_request.fish_setup_id)
-                meta = session.fish_setup_cache.get(release_request.fish_setup_id)
-                synthetic = self._build_self_synthetic_event(
-                    session=session,
-                    fish_key=meta.fish_key if meta else "",
-                    weight_raw=meta.weight_hint_raw if meta else 0,
-                    phase=self.SELF_EVENT_PHASE_RELEASED,
-                    fishing_gear_id=release_request.fishing_gear_id,
-                    fish_setup_id=release_request.fish_setup_id,
-                )
-                self._emit_self_event(session, synthetic)
+            # 放生提示不依赖 announced 集合：海钓/结算场景鱼可能不经过 14/14 来鱼推送，
+            # 只要客户端发了 14/6 放生请求就显示（鱼名从缓存反查，无鱼名则显示未知）。
+            session.announced_fish_setup_ids.discard(release_request.fish_setup_id)
+            meta = session.fish_setup_cache.get(release_request.fish_setup_id)
+            synthetic = self._build_self_synthetic_event(
+                session=session,
+                fish_key=meta.fish_key if meta else "",
+                weight_raw=meta.weight_hint_raw if meta else 0,
+                phase=self.SELF_EVENT_PHASE_RELEASED,
+                fishing_gear_id=release_request.fishing_gear_id,
+                fish_setup_id=release_request.fish_setup_id,
+            )
+            self._emit_self_event(session, synthetic)
             return plain_body, []
 
         # 脱钩/脱离由客户端完成判定后上报，不能只依赖服务器方向（14/12）。
@@ -3211,7 +3212,7 @@ class RF4ChatBridge:
         if event.phase == self.SELF_EVENT_PHASE_ESCAPED:
             return f"【我自己】：{prefix} {fish_name} {weight} 挣脱跑了（脱钩）"
         if event.phase == self.SELF_EVENT_PHASE_RELEASED:
-            return f"【我自己】：{prefix} 放生了 {fish_name}"
+            return f"【我自己】：{prefix} 放生了 {fish_name}" if fish_name else f"【我自己】：{prefix} 放生了"
         return f"【我自己】：{prefix} 有{fish_name} {weight} 入护了"
 
     def _format_record_chat_line(self, sender_name: str, broadcast: RoomBroadcast) -> str:
