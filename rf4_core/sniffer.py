@@ -914,7 +914,6 @@ def _run_dynamic_windows_capture(
                 "store": False,
                 "filter": packet_filter,
                 "promisc": promiscuous,
-                "bufsize": buffer_mb * 1024 * 1024,
             }
             try:
                 sniff(**kwargs)
