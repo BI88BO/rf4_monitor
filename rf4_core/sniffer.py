@@ -1177,26 +1177,34 @@ def run_capture(args, *, default_port: int = 0) -> int:
     )
 
     requested_backend = getattr(args, "capture_backend", "auto")
-    if not args.pcap_file and requested_backend in {"windivert", "auto"}:
+    # 默认优先 Npcap：Npcap 走 NDIS 层，不经过 WFP，避免与火绒/加速器/NetFilter
+    # 等多 WFP 驱动冲突导致 WinDivert 长跑后静默失效。仅当显式要求 windivert，
+    # 或 Npcap 后端不可用时才回退 WinDivert。
+    if requested_backend == "windivert":
         if sys.platform != "win32":
-            if requested_backend == "windivert":
-                _print_line("error", "WinDivert 后端仅支持 Windows")
-                return 2
-        else:
-            try:
-                return _run_windivert_capture(args, observer, default_port=default_port)
-            except (OSError, RuntimeError) as exc:
-                if requested_backend == "windivert":
-                    _print_line("error", f"无法启动 WinDivert：{exc}")
-                    _print_line("warning", "请以管理员身份运行，并重新执行 安装依赖.bat")
-                    return 2
-                _print_line("warning", f"WinDivert 不可用，将回退 Npcap：{exc}")
+            _print_line("error", "WinDivert 后端仅支持 Windows")
+            return 2
+        try:
+            return _run_windivert_capture(args, observer, default_port=default_port)
+        except (OSError, RuntimeError) as exc:
+            _print_line("error", f"无法启动 WinDivert：{exc}")
+            _print_line("warning", "请以管理员身份运行，并重新执行 安装依赖.bat")
+            return 2
 
     try:
         from scapy.all import conf, sniff
     except ImportError:
+        if requested_backend == "auto":
+            _print_line("warning", "缺少 scapy，将回退 WinDivert 后端")
+            if sys.platform == "win32":
+                try:
+                    return _run_windivert_capture(args, observer, default_port=default_port)
+                except (OSError, RuntimeError) as exc:
+                    _print_line("error", f"无法启动 WinDivert：{exc}")
+                    return 2
         _print_line("error", "缺少 scapy，请先运行安装依赖.bat 或 pip install -r requirements.txt")
         return 2
+
 
     if sys.platform == "win32":
         # Npcap/libpcap is more reliable than Scapy's native Windows sockets for
@@ -1360,7 +1368,7 @@ def parse_passive_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "--capture-backend",
         choices=("npcap", "windivert", "auto"),
         default=cfg("backend", "auto"),
-        help="Windows live-capture backend: auto (prefers WinDivert), windivert, or npcap.",
+        help="Windows live-capture backend: auto/npcap prefer Npcap (NDIS, avoids WFP conflicts), windivert forces WinDivert.",
     )
     parser.add_argument(
         "--capture-host",
