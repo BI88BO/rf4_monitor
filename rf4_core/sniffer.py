@@ -825,10 +825,29 @@ def _select_live_interfaces(requested: str):
         candidates.append(interface)
 
     if not candidates:
-        interface = conf.iface
+        # 兜底：至少选一个有可用 IPv4 的接口；都没有则用 scapy 默认接口。
+        fallback = None
+        for interface in get_working_ifaces():
+            ipv4_values = list(getattr(interface, "ips", {}).get(4, []))
+            if any(
+                not ipaddress.ip_address(v).is_link_local
+                for v in ipv4_values
+                if _is_valid_ipv4(v)
+            ):
+                fallback = interface
+                break
+        interface = fallback or conf.iface
         return interface, _interface_label(interface)
     labels = "; ".join(_interface_label(interface) for interface in candidates)
     return candidates, labels
+
+
+def _is_valid_ipv4(value) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.version == 4
 
 
 def _is_relevant_capture_interface(label: str, has_usable_ipv4: bool) -> bool:
@@ -837,7 +856,13 @@ def _is_relevant_capture_interface(label: str, has_usable_ipv4: bool) -> bool:
     looks_irrelevant = any(hint in normalized for hint in IGNORED_INTERFACE_HINTS)
     if looks_irrelevant and not looks_virtual:
         return False
-    return has_usable_ipv4 or looks_virtual
+    if not has_usable_ipv4:
+        # 只有 link-local/无 IPv4 的纯虚拟接口（如空闲 TAP/VPN 适配器）不承载
+        # 游戏流量，排除它们以减少抓包线程竞争和重复提交导致的乱序丢包。
+        if looks_virtual and any(hint in normalized for hint in ("wintun", "wireguard", "tap")):
+            return False
+        return False
+    return True
 
 
 def _interface_label(interface) -> str:
@@ -871,6 +896,7 @@ def _run_dynamic_windows_capture(
     packet_filter: str,
     queue_size: int,
     promiscuous: bool,
+    buffer_mb: int = 64,
 ) -> int:
     """Keep existing Npcap readers alive while adding newly created adapters."""
     workers: dict[str, threading.Thread] = {}
@@ -888,6 +914,7 @@ def _run_dynamic_windows_capture(
                 "store": False,
                 "filter": packet_filter,
                 "promisc": promiscuous,
+                "bufsize": buffer_mb * 1024 * 1024,
             }
             try:
                 sniff(**kwargs)
@@ -1269,6 +1296,7 @@ def run_capture(args, *, default_port: int = 0) -> int:
             packet_filter=packet_filter,
             queue_size=args.capture_queue_size,
             promiscuous=args.capture_promiscuous,
+            buffer_mb=args.capture_buffer_mb,
         )
 
     dispatcher = None
@@ -1384,8 +1412,8 @@ def parse_passive_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--capture-buffer-mb",
         type=bounded_int(minimum=1, maximum=256),
-        default=int(cfg("buffer_mb", 32) or 32),
-        help="Npcap receive-buffer target in MiB. Defaults to 32.",
+        default=int(cfg("buffer_mb", 64) or 64),
+        help="Npcap receive-buffer target in MiB. Defaults to 64.",
     )
     parser.add_argument(
         "--capture-queue-size",
