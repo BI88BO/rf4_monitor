@@ -531,7 +531,10 @@ class PacketObserver:
         payload: bytes,
         flags: int,
     ) -> None:
-        if self.realtime_hosts and src not in self.realtime_hosts and dst not in self.realtime_hosts:
+        # 自动识别模式（realtime_port==0）不依赖硬编码 host 白名单：游戏 realtime
+        # 服务器会负载均衡到多个 IP（91.132/185.71/5.35/91.194 等），硬编码列表
+        # 会在连接切换到新 IP 时漏掉。改为对所有 TCP 连接按协议特征识别。
+        if self.realtime_port != 0 and self.realtime_hosts and src not in self.realtime_hosts and dst not in self.realtime_hosts:
             return
 
         source = (src, sport)
@@ -968,22 +971,10 @@ def _windivert_filter(realtime_host: str, realtime_port: int) -> str:
         conditions.append(
             f"(tcp.SrcPort == {realtime_port} or tcp.DstPort == {realtime_port})"
         )
-    if realtime_host:
-        host_clauses = []
-        for raw in str(realtime_host).replace(",", ";").split(";"):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                address = ipaddress.ip_address(raw)
-            except ValueError:
-                continue
-            prefix = "ip" if address.version == 4 else "ipv6"
-            host_clauses.append(
-                f"({prefix}.SrcAddr == {address} or {prefix}.DstAddr == {address})"
-            )
-        if host_clauses:
-            conditions.append("(" + " or ".join(host_clauses) + ")")
+    elif realtime_host:
+        # 自动识别模式不按 host 白名单过滤：游戏 realtime 服务器会负载均衡到多个
+        # IP，硬编码列表在连接切换时漏抓。抓所有 TCP 由用户态按协议特征识别。
+        pass
     return " and ".join(conditions)
 
 
@@ -1279,7 +1270,9 @@ def run_capture(args, *, default_port: int = 0) -> int:
         packet_filter = f"tcp port {realtime_port}"
     elif args.capture_host:
         host_terms = [value.strip() for value in str(args.capture_host).replace(",", ";").split(";") if value.strip()]
-        packet_filter = f"tcp and ({' or '.join(f'host {value}' for value in host_terms)})" if host_terms else "tcp"
+        # 游戏 realtime 服务器会负载均衡到多个 IP，硬编码 host 过滤会漏掉未在
+        # 列表中的新服务器。内核层抓所有 TCP，交由用户态按协议特征识别。
+        packet_filter = "tcp" if host_terms else "tcp"
     else:
         packet_filter = "tcp"
 
