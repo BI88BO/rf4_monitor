@@ -17,4 +17,5 @@ build/
 dist/
 *.spec
 screenshot/
+dist_backup_*/
 

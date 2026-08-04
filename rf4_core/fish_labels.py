@@ -146,6 +146,66 @@ def _write_cache(cache_path: Path, resources_assets: Path, labels: Dict[str, str
     cache_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
 
+DEFAULT_FISH_GRADE_LABELS = {
+    1: "不达标",
+    2: "达标",
+    3: "稀有★",
+    4: "超级稀有◆",
+}
+DEFAULT_FISH_GRADE_BY_LINE_TYPE = {
+    25: 3,
+    26: 4,
+}
+
+
+def load_fish_grade_config() -> tuple[Dict[int, str], Dict[int, int]]:
+    """Load readable grade labels while keeping safe protocol defaults."""
+    labels = dict(DEFAULT_FISH_GRADE_LABELS)
+    line_types = dict(DEFAULT_FISH_GRADE_BY_LINE_TYPE)
+    try:
+        payload = json.loads(BUNDLED_LABEL_PATH.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return labels, line_types
+
+    raw_labels = payload.get("grade_labels", {}) if isinstance(payload, dict) else {}
+    if isinstance(raw_labels, dict):
+        for raw_grade, raw_label in raw_labels.items():
+            try:
+                grade = int(raw_grade)
+            except (TypeError, ValueError):
+                continue
+            if grade in DEFAULT_FISH_GRADE_LABELS and isinstance(raw_label, str) and raw_label.strip():
+                labels[grade] = raw_label.strip()
+
+    raw_line_types = payload.get("line_type_grades", {}) if isinstance(payload, dict) else {}
+    if isinstance(raw_line_types, dict):
+        for raw_line_type, raw_grade in raw_line_types.items():
+            try:
+                line_type = int(raw_line_type)
+                grade = int(raw_grade)
+            except (TypeError, ValueError):
+                continue
+            if grade in labels:
+                line_types[line_type] = grade
+    return labels, line_types
+
+
+def load_unlocalized_fish_keys() -> set[str]:
+    """Return catalog keys for which the bundled game locale has no Chinese name."""
+    try:
+        payload = json.loads(BUNDLED_LABEL_PATH.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    raw_keys = payload.get("unlocalized_keys", []) if isinstance(payload, dict) else []
+    if not isinstance(raw_keys, list):
+        return set()
+    result: set[str] = set()
+    for value in raw_keys:
+        if isinstance(value, str) and value:
+            result.add(value)
+    return result
+
+
 @lru_cache(maxsize=None)
 def load_fish_labels(profile_name: str, locale_id: str = "zh_CN") -> Dict[str, str]:
     cache_path = _cache_path(profile_name)

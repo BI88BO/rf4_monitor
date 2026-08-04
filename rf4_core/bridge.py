@@ -40,7 +40,7 @@ class BoundedSet(set):
             self.discard(next(iter(self)))
 
 from . import console
-from .fish_labels import load_fish_labels
+from .fish_labels import load_fish_grade_config, load_fish_labels, load_unlocalized_fish_keys
 from .launcher import parse_https_upstream_map, rewrite_login_logon_info
 from .protocol import (
     BuildingRpcRequest,
@@ -136,6 +136,7 @@ class SyntheticChatEvent:
     line_type: int = 3
     fishing_gear_id: str = ""
     gear_slot_text: str = ""
+    grade_enum: Optional[int] = None
 
 
 @dataclass
@@ -477,6 +478,12 @@ class RF4ChatBridge:
             self._load_gear_config_from_cache()
         except Exception:
             pass
+        self._show_cfg_path = getattr(getattr(ctx, "options", None), "rf4_show_config_path", "") or ""
+        self._show_cfg_mtime = 0.0
+        self._show_cfg_cache: Dict[Tuple[str, bool], bool] = {}
+        self._show_cfg_min_interval = 1.0  # 秒，避免每次广播读盘
+        self._fish_grade_labels, self._fish_grade_by_line_type = load_fish_grade_config()
+        self._unlocalized_fish_keys = load_unlocalized_fish_keys()
 
     def _load_gear_config_from_cache(self) -> None:
         try:
@@ -676,6 +683,8 @@ class RF4ChatBridge:
             self._fish_labels_zh.update(load_fish_labels(self._profile.name))
         except Exception:
             pass
+        self._fish_grade_labels, self._fish_grade_by_line_type = load_fish_grade_config()
+        self._unlocalized_fish_keys = load_unlocalized_fish_keys()
         # 显示开关热重载缓存：记录配置文件路径与上次读取时间，运行时变更可被周期感知。
         self._show_cfg_path = getattr(ctx.options, "rf4_show_config_path", "") or ""
         self._show_cfg_mtime = 0.0
@@ -927,13 +936,14 @@ class RF4ChatBridge:
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                sock.sendto(payload.encode("utf-8"), (ctx.options.rf4_event_bridge_host, port))
+                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
+                sock.sendto(payload.encode("utf-8"), (host, port))
             finally:
                 sock.close()
         except OSError:
             if ctx.options.rf4_verbose_logging:
                 self._log(
-                    f"failed to broadcast telemetry {category} on {ctx.options.rf4_event_bridge_host}:{port}"
+                    f"failed to broadcast telemetry {category} on {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
                 )
 
     @staticmethod
@@ -2838,6 +2848,8 @@ class RF4ChatBridge:
                     weight_raw=fish_setup.weight_hint_raw,
                     phase=self.SELF_EVENT_PHASE_INCOMING,
                     fishing_gear_id=fish_setup.fishing_gear_id,
+                    fish_setup_id=fish_setup.fish_setup_id,
+                    grade_enum=fish_setup.setup_enum,
                 )
                 out.extend(self._emit_self_event(session, synthetic))
             return bytes(out)
@@ -2987,13 +2999,16 @@ class RF4ChatBridge:
         # 入护响应的提取依赖位置猜测，可能失败或取错字段。
         fish_key = meta.fish_key if (meta and meta.fish_key) else None
         weight_raw = meta.weight_hint_raw if (meta and meta.weight_hint_raw) else None
+        grade_hint = meta.setup_enum if (meta and meta.setup_enum is not None) else None
 
-        if not fish_key or not weight_raw:
+        if not fish_key or not weight_raw or not grade_hint:
             catch = extract_catch_summary_from_response(plain_body)
             if not fish_key:
                 fish_key = catch.fish_key
             if not weight_raw:
                 weight_raw = catch.weight_raw
+            if not grade_hint:
+                grade_hint = catch.size_enum
 
         if not fish_key or not weight_raw:
             return None
@@ -3005,6 +3020,7 @@ class RF4ChatBridge:
             phase=self.SELF_EVENT_PHASE_KEPT,
             fishing_gear_id=keep_request.fishing_gear_id,
             fish_setup_id=keep_request.fish_setup_id,
+            grade_enum=grade_hint,
         )
 
     def _build_self_synthetic_event(
@@ -3015,6 +3031,7 @@ class RF4ChatBridge:
         phase: str,
         fishing_gear_id: Optional[str] = None,
         fish_setup_id: Optional[str] = None,
+        grade_enum: Optional[int] = None,
     ) -> SyntheticChatEvent:
         location_id = session.latest_location_id
         if location_id is None:
@@ -3030,6 +3047,12 @@ class RF4ChatBridge:
             if meta:
                 fishing_gear_id = meta.fishing_gear_id
 
+        # 等级枚举缺失时，回退到缓存的来鱼钓组字段（入护响应可能不含规格）。
+        if grade_enum is None and fish_setup_id:
+            meta = session.fish_setup_cache.get(fish_setup_id)
+            if meta:
+                grade_enum = meta.setup_enum
+
         return SyntheticChatEvent(
             event_id=session.alloc_event_id(),
             fish_key=fish_key,
@@ -3041,6 +3064,7 @@ class RF4ChatBridge:
             line_type=session.profile.room_message_line_type_catch,
             fishing_gear_id=fishing_gear_id or "",
             gear_slot_text=self._gear_slot_text(session, fishing_gear_id),
+            grade_enum=grade_enum,
         )
 
     def _inject_self_synthetic_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
@@ -3065,8 +3089,19 @@ class RF4ChatBridge:
         )
         return session.build_server_injection(injected_body)
 
+    def _write_emit_probe(self, text: str) -> None:
+        try:
+            import os
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "emit_probe.txt"), "a", encoding="utf-8") as f:
+                f.write(f"{text}\n")
+        except Exception:
+            pass
+
     def _emit_self_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
         # 日志始终全量输出；只有浮窗广播受勾选开关控制。
+        self._write_emit_probe(
+            f"{synthetic.phase}|{synthetic.fish_key}|bridge={self.__class__.__module__}.{self.__class__.__qualname__}"
+        )
         self._log_self_event(self._format_self_event_log_line(synthetic))
         self._broadcast_self_event(synthetic)
         if not self._self_phase_enabled(synthetic.phase):
@@ -3090,8 +3125,15 @@ class RF4ChatBridge:
         return self._show_enabled(phase_switch)
 
     def _broadcast_self_event(self, synthetic: SyntheticChatEvent) -> None:
-        port = int(ctx.options.rf4_event_bridge_port or 0)
+        try:
+            self._broadcast_self_event_impl(synthetic)
+        except Exception as e:
+            self._write_emit_probe(f"broadcast_exc|{type(e).__name__}|{e}")
+
+    def _broadcast_self_event_impl(self, synthetic: SyntheticChatEvent) -> None:
+        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
         if port <= 0:
+            self._log(f"[广播]跳过: port={getattr(ctx.options, 'rf4_event_bridge_port', 0)!r}")
             return
         phase_switch = {
             self.SELF_EVENT_PHASE_INCOMING: "rf4_show_incoming",
@@ -3101,8 +3143,10 @@ class RF4ChatBridge:
             self.SELF_EVENT_PHASE_RELEASED: "rf4_show_released",
         }.get(synthetic.phase)
         if phase_switch and not self._show_enabled(phase_switch):
+            self._log(f"[广播]被显示开关过滤 {phase_switch}")
             return
         fish_name = self._format_fish_name(synthetic.fish_key or "")
+        grade_label = self._format_grade_enum(synthetic.grade_enum) or ""
         event_name = {
             self.SELF_EVENT_PHASE_INCOMING: "fish_incoming",
             self.SELF_EVENT_PHASE_BITTEN: "fish_bitten",
@@ -3117,6 +3161,9 @@ class RF4ChatBridge:
                 "fish_name": fish_name,
                 "weight_g": synthetic.weight_raw,
                 "gear_slot": synthetic.gear_slot_text,
+                "grade_enum": synthetic.grade_enum,
+                "grade_label": grade_label,
+                "text": self._format_self_event_log_line(synthetic),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -3126,18 +3173,19 @@ class RF4ChatBridge:
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                sock.sendto(payload.encode("utf-8"), (ctx.options.rf4_event_bridge_host, port))
+                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
+                sock.sendto(payload.encode("utf-8"), (host, port))
+                self._log(f"[广播]已发送 {event_name} -> {host}:{port} 字节={len(payload)}")
             finally:
                 sock.close()
         except OSError:
-            if ctx.options.rf4_verbose_logging:
-                self._log(
-                    f"failed to broadcast self event on {ctx.options.rf4_event_bridge_host}:{port}"
-                )
+            self._log(
+                f"[广播]发送失败 {event_name} -> {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
+            )
 
     def _broadcast_generic_event(self, event_name: str, text: str) -> None:
         """广播其他事件(频道鱼获/公共聊天等)到浮窗，受显示设置勾选控制。"""
-        port = int(ctx.options.rf4_event_bridge_port or 0)
+        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
         if port <= 0:
             return
         switch = {
@@ -3159,13 +3207,14 @@ class RF4ChatBridge:
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                sock.sendto(payload.encode("utf-8"), (ctx.options.rf4_event_bridge_host, port))
+                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
+                sock.sendto(payload.encode("utf-8"), (host, port))
             finally:
                 sock.close()
         except OSError:
             if ctx.options.rf4_verbose_logging:
                 self._log(
-                    f"failed to broadcast {event_name} on {ctx.options.rf4_event_bridge_host}:{port}"
+                    f"failed to broadcast {event_name} on {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
                 )
 
     @staticmethod
@@ -3207,13 +3256,13 @@ class RF4ChatBridge:
         return f"{sender_name} 钓到了 {self._format_chat_weight(weight_raw)} {fish_name}"
 
     def _format_self_event_log_line(self, event: SyntheticChatEvent) -> str:
-        fish_name = self._format_fish_name(event.fish_key)
+        fish_name = self._format_graded_fish_name(event.fish_key, event.grade_enum)
         weight = self._format_chat_weight(event.weight_raw)
         prefix = f"[{event.gear_slot_text}]" if event.gear_slot_text else ""
         if event.phase == self.SELF_EVENT_PHASE_INCOMING:
             return f"【我自己】：{prefix} 有{fish_name} {weight} 过来了"
         if event.phase == self.SELF_EVENT_PHASE_BITTEN:
-            return f"【我自己】：{prefix} {fish_name} 咬钩了"
+            return f"【我自己】：{prefix} {fish_name} {weight} 咬钩了"
         if event.phase == self.SELF_EVENT_PHASE_ESCAPED:
             return f"【我自己】：{prefix} {fish_name} {weight} 挣脱跑了（脱钩）"
         if event.phase == self.SELF_EVENT_PHASE_RELEASED:
@@ -3242,7 +3291,17 @@ class RF4ChatBridge:
     def _format_grade_label(self, line_type: Optional[int]) -> Optional[str]:
         if line_type is None:
             return None
-        return self.GRADE_LABELS_BY_LINE_TYPE.get(line_type)
+        return self._format_grade_enum(self._fish_grade_by_line_type.get(line_type))
+
+    def _format_grade_enum(self, grade_enum: Optional[int]) -> Optional[str]:
+        if grade_enum is None:
+            return None
+        return self._fish_grade_labels.get(grade_enum)
+
+    def _format_graded_fish_name(self, fish_key: str, grade_enum: Optional[int]) -> str:
+        fish_name = self._format_fish_name(fish_key)
+        grade = self._format_grade_enum(grade_enum)
+        return f"[{grade}] {fish_name}" if grade else fish_name
 
     def _record_class_label(self, broadcast: RoomBroadcast) -> Optional[str]:
         for item in broadcast.details:

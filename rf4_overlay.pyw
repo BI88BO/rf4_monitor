@@ -285,44 +285,11 @@ class Overlay:
         except Exception:
             return 40 + 28 * len(lines)
 
-    def _show_incoming(self, fish_key, fish_name, weight_g, gear_slot=""):
-        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        weight = ""
-        if weight_g:
-            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        prefix = f"[{gear_slot}] " if gear_slot else ""
-        self._update_row(gear_slot, f"【我自己】：{prefix}有{name} {weight} 过来了")
-
-    def _show_bitten(self, fish_key, fish_name, weight_g, gear_slot=""):
-        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        weight = ""
-        if weight_g:
-            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        prefix = f"[{gear_slot}] " if gear_slot else ""
-        weight_text = f" {weight}" if weight else ""
-        self._update_row(gear_slot, f"【我自己】：{prefix}{name}{weight_text} 咬钩了")
-
-    def _show_kept(self, fish_key, fish_name, weight_g, gear_slot=""):
-        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        weight = ""
-        if weight_g:
-            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        prefix = f"[{gear_slot}] " if gear_slot else ""
-        self._update_row(gear_slot, f"【我自己】：{prefix}有{name} {weight} 入护了", clear_after=3000)
-
-    def _show_escaped(self, fish_key, fish_name, weight_g, gear_slot=""):
-        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        weight = ""
-        if weight_g:
-            weight = f"{weight_g}克" if weight_g < 1000 else f"{weight_g / 1000:.3f}公斤"
-        prefix = f"[{gear_slot}] " if gear_slot else ""
-        weight_text = f" {weight}" if weight else ""
-        self._update_row(gear_slot, f"【我自己】：{prefix}{name}{weight_text} 挣脱跑了（脱钩）", clear_after=3000)
-
-    def _show_released(self, fish_key, fish_name, weight_g, gear_slot=""):
-        name = self.labels.get(fish_key) or fish_name or fish_key or "未知鱼类"
-        prefix = f"[{gear_slot}] " if gear_slot else ""
-        self._update_row(gear_slot, f"【我自己】：{prefix}放生了 {name}", clear_after=3000)
+    def _show_self_event(self, gear_slot, text, clear_after=0):
+        # 直接使用与日志一致的整行文本（已含【我自己】与等级前缀），按竿号分行。
+        if not text:
+            return
+        self._update_row(gear_slot or "", text, clear_after)
 
     def _show_generic(self, text):
         # 频道鱼获/公共聊天/遥测等"信息类"统一进遥测区，独立分行显示。
@@ -364,16 +331,10 @@ class Overlay:
                     continue
                 name = event.get("event")
                 gear_slot = event.get("gear_slot") or ""
-                if name == "fish_incoming":
-                    self.root.after(0, self._show_incoming, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
-                elif name == "fish_bitten":
-                    self.root.after(0, self._show_bitten, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
-                elif name == "fish_kept":
-                    self.root.after(0, self._show_kept, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
-                elif name == "fish_escaped":
-                    self.root.after(0, self._show_escaped, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
-                elif name == "fish_released":
-                    self.root.after(0, self._show_released, event.get("fish_key"), event.get("fish_name"), event.get("weight_g"), gear_slot)
+                text = event.get("text") or ""
+                clear_after = 3000 if name in ("fish_kept", "fish_escaped", "fish_released") else 0
+                if name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
+                    self.root.after(0, self._show_self_event, gear_slot, text, clear_after)
                 elif name in ("fish_catch", "chat"):
                     self.root.after(0, self._show_generic, event.get("text") or "")
                 elif name == "telemetry":
