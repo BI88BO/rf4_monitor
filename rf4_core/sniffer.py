@@ -50,6 +50,9 @@ DISCOVERY_MAX_STREAM_BYTES = 256 * 1024
 DISCOVERY_MAX_CANDIDATES = 2048
 DYNAMIC_INTERFACE_SCAN_SECONDS = 1.0
 TCP_GAP_WARNING_SECONDS = 2.0
+# 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
+# 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
+TCP_GAP_STALL_SECONDS = 30.0
 VIRTUAL_INTERFACE_HINTS = (
     "accelerator",
     "clash",
@@ -151,6 +154,141 @@ class PacketDispatcher:
                 self.queue.task_done()
 
 
+_PCAP_STATS_INTERVAL_SECONDS = 10.0
+
+
+class PcapDropMonitor:
+    """Periodically read Npcap ``pcap_stats`` to surface kernel-side drops.
+
+    Windows Npcap captures run inside the kernel NPF driver; packets dropped
+    there never reach user space and are invisible to the reassembler.  A
+    periodic ``pcap_stats`` read distinguishes "buffered but dropped by the
+    kernel" (ps_drop/ps_ifdrop) from "never delivered by the 802.11 driver",
+    which is exactly what we need after the wireless driver upgrade.
+    """
+
+    _instance: Optional["PcapDropMonitor"] = None
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._handles: list[tuple[str, int]] = []
+        self._last_stats: dict[int, tuple[int, int, int]] = {}
+        self._reported_once = False
+        self._thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def instance(cls) -> "PcapDropMonitor":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def register(self, handle) -> None:
+        try:
+            if handle is None or not handle:
+                return
+            handle = int(ctypes.cast(handle, ctypes.c_void_p).value or 0)
+        except Exception:
+            return
+        if not handle:
+            return
+        with self._lock:
+            if handle not in self._last_stats:
+                self._last_stats[handle] = (0, 0, 0)
+            if handle not in self._handles:
+                self._handles.append(handle)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="rf4-pcap-stats",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(_PCAP_STATS_INTERVAL_SECONDS)
+            try:
+                self._sample()
+            except Exception:
+                pass
+
+    def _sample(self) -> None:
+        from scapy.libs.winpcapy import pcap_stats  # local import: lazy Npcap
+
+        try:
+            fn = pcap_stats
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+        except Exception:
+            return
+        stat = _PcapStat()
+        with self._lock:
+            handles = list(self._handles)
+        total_recv = total_drop = total_ifdrop = 0
+        active = []
+        for handle in handles:
+            try:
+                rc = fn(handle, ctypes.byref(stat))
+            except Exception:
+                rc = -1
+            if rc != 0:
+                continue
+            recv, drop, ifdrop = stat.ps_recv, stat.ps_drop, stat.ps_ifdrop
+            last = self._last_stats.get(handle, (0, 0, 0))
+            self._last_stats[handle] = (recv, drop, ifdrop)
+            d_recv = recv - last[0]
+            d_drop = drop - last[1]
+            d_ifdrop = ifdrop - last[2]
+            total_recv += d_recv
+            total_drop += d_drop
+            total_ifdrop += d_ifdrop
+            active.append((handle, d_recv, d_drop, d_ifdrop))
+        if not active:
+            return
+        summary = (
+            f"Npcap 内核统计: 收包+{total_recv} 内核丢弃+{total_drop} "
+            f"驱动丢弃+{total_ifdrop} / 间隔{int(_PCAP_STATS_INTERVAL_SECONDS)}s"
+        )
+        if total_drop or total_ifdrop:
+            _print_line(
+                "warning",
+                f"{summary}（存在内核级丢包，抓包缓冲可能不足或无线驱动丢帧）",
+            )
+        else:
+            if not self._reported_once:
+                _print_line("status", summary)
+                self._reported_once = True
+
+
+class _PcapStat(ctypes.Structure):
+    _fields_ = [
+        ("ps_recv", ctypes.c_uint),
+        ("ps_drop", ctypes.c_uint),
+        ("ps_ifdrop", ctypes.c_uint),
+    ]
+
+
+def _install_pcap_stats_hook() -> None:
+    """Record every opened Npcap handle so PcapDropMonitor can read pcap_stats."""
+    try:
+        from scapy.arch.libpcap import _PcapWrapper_libpcap
+    except Exception:
+        return
+
+    original_init = _PcapWrapper_libpcap.__init__
+
+    def patched_init(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        handle = getattr(self, "pcap", None)
+        if handle:
+            PcapDropMonitor.instance().register(handle)
+
+    _PcapWrapper_libpcap.__init__ = patched_init
+
+
 @dataclass
 class TcpStreamReassembler:
     """Small in-order TCP payload reassembler with retransmission handling."""
@@ -232,6 +370,7 @@ class PassiveSession:
     client_tcp: TcpStreamReassembler = field(default_factory=TcpStreamReassembler)
     server_tcp: TcpStreamReassembler = field(default_factory=TcpStreamReassembler)
     failed: bool = False
+    downlink_stalled: bool = False
     decrypted_frames: int = 0
     valid_business_frames: int = 0
     invalid_business_frames: int = 0
@@ -270,11 +409,28 @@ class PassiveSession:
                 f" 缓存={reassembler.pending_bytes}字节"
                 f" | 会话={self.session_id}",
             )
+        if not from_client and not self.downlink_stalled:
+            # 下行序号缺口持续超阈值仍未填补 = 真丢包（非乱序），RC4 流不可恢复。
+            # 冻结该会话下行解析，避免来鱼推送被静默吞掉；等下次 realtime 重连自动恢复。
+            if (
+                reassembler.pending_bytes
+                and reassembler.gap_age() >= TCP_GAP_STALL_SECONDS
+            ):
+                self.downlink_stalled = True
+                self.warned_tcp_gaps.add(direction)
+                _print_line(
+                    "warning",
+                    f"服务器下行已因序号缺口失步，来鱼推送暂时无法显示"
+                    f" | 等待序号={reassembler.next_seq}"
+                    f" 已见后续序号={reassembler.first_pending_seq()}"
+                    f" | 会话={self.session_id}"
+                    f" | 提示：请重新登录游戏，下次 realtime 重连将自动恢复",
+                )
         if not chunk:
             return
         if from_client:
             self._process_client_bytes(chunk)
-        else:
+        elif not self.downlink_stalled:
             self._process_server_bytes(chunk)
 
     def _process_client_bytes(self, chunk: bytes) -> None:
@@ -825,6 +981,8 @@ def _select_live_interfaces(requested: str):
         label_lower = _interface_label(interface).lower()
         if not _is_relevant_capture_interface(label_lower, bool(usable_ipv4)):
             continue
+        if _interface_is_disconnected(interface):
+            continue
         candidates.append(interface)
 
     if not candidates:
@@ -866,6 +1024,22 @@ def _is_relevant_capture_interface(label: str, has_usable_ipv4: bool) -> bool:
             return False
         return False
     return True
+
+
+def _interface_is_disconnected(interface) -> bool:
+    """Return True for physical adapters in a disconnected state.
+
+    Scapy exposes the Windows adapter state via the ``flags`` field (e.g.
+    ``UP+RUNNING+DISCONNECTED``).  A disconnected adapter can still carry a
+    stale non-link-local IPv4 address, which would otherwise make the generic
+    IPv4 filter treat it as a usable capture interface and waste a capture
+    thread on a link with no game traffic.
+    """
+    flags = getattr(interface, "flags", None)
+    if flags is None:
+        return False
+    text = str(flags)
+    return "DISCONNECTED" in text
 
 
 def _interface_label(interface) -> str:
@@ -1232,6 +1406,9 @@ def run_capture(args, *, default_port: int = 0) -> int:
             int(getattr(conf, "bufsize", 0) or 0),
             int(args.capture_buffer_mb) * 1024 * 1024,
         )
+        # Surface kernel-side Npcap drops so real capture losses are visible.
+        _install_pcap_stats_hook()
+        PcapDropMonitor.instance().start()
 
     selected_interfaces = None
     if args.pcap_file:
