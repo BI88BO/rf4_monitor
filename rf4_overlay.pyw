@@ -333,7 +333,9 @@ class Overlay:
                 gear_slot = event.get("gear_slot") or ""
                 text = event.get("text") or ""
                 clear_after = 3000 if name in ("fish_kept", "fish_escaped", "fish_released") else 0
-                if name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
+                if name == "reset":
+                    self.root.after(0, self._reset_to_idle)
+                elif name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
                     self.root.after(0, self._show_self_event, gear_slot, text, clear_after)
                 elif name in ("fish_catch", "chat"):
                     self.root.after(0, self._show_generic, event.get("text") or "")

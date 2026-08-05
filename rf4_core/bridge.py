@@ -3183,6 +3183,15 @@ class RF4ChatBridge:
                 f"[广播]发送失败 {event_name} -> {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
             )
 
+    def broadcast_reset(self) -> None:
+        """Broadcast a session-start reset so the overlay clears stale rows.
+
+        Called once per new realtime handshake; the overlay responds by
+        dropping every gear/telemetry row so old fishing state does not
+        survive a reconnect (小退/重连).
+        """
+        self._broadcast_generic_event("reset", "")
+
     def _broadcast_generic_event(self, event_name: str, text: str) -> None:
         """广播其他事件(频道鱼获/公共聊天等)到浮窗，受显示设置勾选控制。"""
         port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)

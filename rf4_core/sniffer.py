@@ -433,6 +433,19 @@ class PassiveSession:
         elif not self.downlink_stalled:
             self._process_server_bytes(chunk)
 
+    def _print_once_reset(self) -> None:
+        seen = getattr(self, "_printed_messages", None)
+        if seen is None:
+            seen = set()
+            setattr(self, "_printed_messages", seen)
+        if "overlay-reset" in seen:
+            return
+        seen.add("overlay-reset")
+        try:
+            self.bridge.broadcast_reset()
+        except Exception:
+            pass
+
     def _process_client_bytes(self, chunk: bytes) -> None:
         session = self.protocol
         session.client_buffer.extend(chunk)
@@ -461,6 +474,7 @@ class PassiveSession:
 
         if session.handshake_complete():
             _print_line_once(self, "handshake-announced", "session", f"握手完成，开始验证加密业务流量 | 会话={self.session_id}")
+            self._print_once_reset()
             self._decode_frames(from_client=True)
             if session.server_buffer:
                 self._decode_frames(from_client=False)
@@ -479,6 +493,7 @@ class PassiveSession:
 
         if session.handshake_complete():
             _print_line_once(self, "handshake-announced", "session", f"握手完成，开始验证加密业务流量 | 会话={self.session_id}")
+            self._print_once_reset()
             self._decode_frames(from_client=False)
             if session.client_buffer:
                 self._decode_frames(from_client=True)
@@ -1528,9 +1543,11 @@ def _load_capture_config() -> dict:
     try:
         import json
 
+        from . import data_root
+
         candidates = (
-            _SCRIPT_DIR / "rf4_config.json",
-            _SCRIPT_DIR / "rf4_monitor.json",
+            data_root() / "rf4_config.json",
+            data_root() / "rf4_monitor.json",
         )
         for path in candidates:
             if path.is_file():
