@@ -680,7 +680,10 @@ class PacketObserver:
                 session.feed_tcp(from_client=from_client, seq=seq, payload=payload, syn=syn)
             if fin_or_rst:
                 self.sessions.pop(key, None)
-                _print_line("session", f"realtime 连接已关闭 | 会话={session.session_id}")
+                _print_line(
+                    "session",
+                    f"realtime 连接已关闭 | {self._describe_tcp_close(flags, from_client)} | 会话={session.session_id}",
+                )
         except (BufferError, UnicodeDecodeError, ValueError) as exc:
             if "session" in locals():
                 session.failed = True
@@ -733,7 +736,8 @@ class PacketObserver:
                 syn=syn,
             )
             if fin_or_rst:
-                self._remove_auto_session(key, session)
+                from_client = source == client_endpoint
+                self._remove_auto_session(key, session, flags=flags, from_client=from_client)
             return
 
         if syn and not ack:
@@ -817,7 +821,13 @@ class PacketObserver:
         if client_data:
             session._process_client_bytes(client_data)
 
-    def _remove_auto_session(self, key: FlowKey, session: PassiveSession) -> None:
+    def _remove_auto_session(
+        self,
+        key: FlowKey,
+        session: PassiveSession,
+        flags: Optional[int] = None,
+        from_client: Optional[bool] = None,
+    ) -> None:
         active = self._auto_sessions.pop(key, None)
         client_endpoint = active[1] if active is not None else None
         server_endpoint = None
@@ -837,7 +847,10 @@ class PacketObserver:
             if not host_still_active and server_host in self._known_realtime_hosts:
                 self._closed_realtime_hosts.add(server_host)
                 self._reconnect_notified_hosts.discard(server_host)
-        _print_line("session", f"realtime 连接已关闭 | 会话={session.session_id}")
+        close_detail = ""
+        if flags is not None and from_client is not None:
+            close_detail = f" | {self._describe_tcp_close(flags, from_client)}"
+        _print_line("session", f"realtime 连接已关闭{close_detail} | 会话={session.session_id}")
 
     def _expire_candidates(self) -> None:
         cutoff = time.monotonic() - DISCOVERY_TIMEOUT_SECONDS
@@ -851,6 +864,24 @@ class PacketObserver:
             return
         oldest_key = min(self._candidates, key=lambda key: self._candidates[key].updated_at)
         self._candidates.pop(oldest_key, None)
+
+    @staticmethod
+    def _describe_tcp_close(flags: int, from_client: bool) -> str:
+        """把 TCP 关闭包标志描述为可读文本，便于区分正常挥手(FIN)与异常复位(RST)。
+
+        在关闭会话时打印，用于定位频繁断线到底是哪一方在复位连接。
+        from_client=True 表示关闭包由游戏客户端发出，False 表示由服务器发出。
+        """
+        kinds = []
+        if flags & 0x01:
+            kinds.append("FIN")
+        if flags & 0x04:
+            kinds.append("RST")
+        if flags & 0x10:
+            kinds.append("ACK")
+        kind_text = "+".join(kinds) if kinds else "未知"
+        who = "客户端" if from_client else "服务器"
+        return f"由{who}发起 flags=0x{int(flags):02x} ({kind_text})"
 
     @staticmethod
     def _flow_key(first: Endpoint, second: Endpoint) -> FlowKey:
