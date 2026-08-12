@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rf4_core import sniffer
 from rf4_core.bridge import RF4ChatBridge
-from rf4_core.protocol import RC4Stream, build_frame
+from rf4_core.protocol import RC4Stream, build_frame, build_request_envelope
 from rf4_core.sniffer import PassiveSession, TcpStreamReassembler
 
 
@@ -86,7 +86,8 @@ def _make_ready_session() -> PassiveSession:
 
 
 class PassiveSessionGapRecoveryTests(unittest.TestCase):
-    def test_recover_tcp_gap_advances_rc4_and_clears_buffer(self) -> None:
+    def test_refuses_recovery_when_no_verifiable_frame(self) -> None:
+        # 缺口后只有裸字节（无帧结构），信封校验无法确认同步点 → 拒绝恢复。
         session = _make_ready_session()
         session.server_tcp.next_seq = 100
         session.feed_tcp(from_client=False, seq=106, payload=b"world", syn=False)
@@ -95,19 +96,18 @@ class PassiveSessionGapRecoveryTests(unittest.TestCase):
         gap_bytes, chunk = session._recover_tcp_gap(
             session.server_tcp, from_client=False, direction="服务器下行"
         )
-        self.assertEqual(gap_bytes, 6)
-        self.assertEqual(chunk, b"world")
-        self.assertEqual(session.protocol.server_buffer, bytearray())
-
+        self.assertEqual(gap_bytes, 0)
+        self.assertEqual(chunk, b"")
+        # 拒绝恢复时不清空既有 buffer，也不推进 RC4。
+        self.assertEqual(session.protocol.server_buffer, bytearray(b"half-frame"))
         reference = RC4Stream(session.protocol.token.encode())
-        reference.keystream(6)
         marker = b"hello"
         self.assertEqual(
             session.protocol.server_read_rc4.crypt(marker),
             reference.crypt(marker),
         )
 
-    def test_feed_tcp_recovers_gap_after_timeout(self) -> None:
+    def test_feed_tcp_refuses_recovery_without_verifiable_frame(self) -> None:
         session = _make_ready_session()
         session.server_tcp.next_seq = 100
         session.feed_tcp(from_client=False, seq=106, payload=b"world", syn=False)
@@ -116,8 +116,9 @@ class PassiveSessionGapRecoveryTests(unittest.TestCase):
         session.server_tcp.gap_started_at = 0.0
         session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
 
-        self.assertEqual(session.server_tcp.next_seq, 111)
-        self.assertEqual(session.server_tcp.pending_bytes, 0)
+        # 无有效帧可校验 → 恢复被拒绝，next_seq 停留在缺口起点。
+        self.assertEqual(session.server_tcp.next_seq, 100)
+        self.assertGreater(session.server_tcp.pending_bytes, 0)
 
     def test_handshake_complete_required_before_recovery(self) -> None:
         session = _make_ready_session()
@@ -130,3 +131,63 @@ class PassiveSessionGapRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(gap_bytes, 0)
         self.assertEqual(session.server_tcp.next_seq, 100)
+
+
+class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
+    """缺口内混有明文帧头时，恢复必须只跳过缺口内的密文字节，
+    并通过信封校验重新同步 RC4，否则后续帧解密全部错位。"""
+
+    def _build_stream(self) -> tuple[PassiveSession, list[bytes]]:
+        """Return (session, received_plains) where ref mirrors server RC4,
+        and frame 2 (a whole frame incl. its 13-byte header) is dropped in the middle.
+        The bridge handler records every decrypted server frame plaintext."""
+        session = _make_ready_session()
+        received: list[bytes] = []
+        session.bridge._handle_server_frame = lambda _session, plain: received.append(plain)
+        # 独立参考流模拟服务器端加密（与 session.server_read_rc4 同 key 同起点）。
+        ref = RC4Stream(session.protocol.token.encode())
+        # 帧1：正常传输（先到，无缺口）。
+        plain1 = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        raw1 = build_frame(0, 101, ref.crypt(plain1))
+        # 帧2：完整一帧在缺口内丢失（13 字节帧头 + payload 全丢）。
+        plain2 = build_request_envelope(call_id=2, main_cmd=14, sub_cmd=4, payload=b"y")
+        raw2 = build_frame(0, 102, ref.crypt(plain2))
+        # 帧3：缺口后到达的帧，必须能正确解密。
+        plain3 = build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z")
+        raw3 = build_frame(0, 103, ref.crypt(plain3))
+
+        seq = 1000
+        session.feed_tcp(from_client=False, seq=seq, payload=raw1, syn=False)
+        seq += len(raw1)
+        # 帧2 从未到达（模拟丢包）：seq 直接跳到 raw2 之后。
+        seq += len(raw2)
+        # 帧3 到达。
+        session.feed_tcp(from_client=False, seq=seq, payload=raw3, syn=False)
+        return session, [plain1, plain3]
+
+    def test_resync_skips_only_ciphertext_not_headers(self) -> None:
+        session, _received = self._build_stream()
+        pending_seq = session.server_tcp.first_pending_seq()
+        gap_bytes = pending_seq - session.server_tcp.next_seq
+        self.assertEqual(gap_bytes, 25)
+        pending_data = session.server_tcp.fragments[pending_seq]
+        result = PassiveSession._resync_gap_cipher(
+            session.protocol.server_read_rc4, pending_data, gap_bytes
+        )
+        self.assertIsNotNone(result)
+        lost, fpos = result
+        # 缺口 25 字节里只有 12 字节是密文 payload（帧头 13 字节不进 RC4）。
+        self.assertEqual(lost, 12)
+        self.assertEqual(fpos, 0)
+
+    def test_recovers_when_gap_contains_full_frame_with_header(self) -> None:
+        session, received = self._build_stream()
+        session.server_tcp.gap_started_at = 0.0
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+
+        # 恢复后 next_seq 跳过整个缺口。
+        self.assertEqual(session.server_tcp.pending_bytes, 0)
+        self.assertEqual(session.server_tcp.next_seq, 1000 + 25 + 25 + 25)
+        # 缺口后的帧3 被正确解密送达 handler。
+        self.assertEqual(len(received), 2)
+        self.assertEqual(received[1], build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z"))

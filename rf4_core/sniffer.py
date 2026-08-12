@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ipaddress
 import os
 import queue
@@ -23,6 +24,7 @@ from .protocol import (
     try_parse_auth_packet,
     try_parse_first_frame,
     try_parse_uuid_packet,
+    u32,
 )
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -502,10 +504,60 @@ class PassiveSession:
         cipher = session.client_read_rc4 if from_client else session.server_read_rc4
         if cipher is None:
             return 0, b""
-        cipher.keystream(gap_bytes)
+        # 信封验证重同步：缺口内混有明文帧头时，盲目 keystream(gap_bytes)
+        # 会高估密文字节数导致后续全部错位。改为在缺口后数据里找帧边界，
+        # 对候选密文跳过量逐一校验 parse_envelope，命中才同步。
+        pending_seq = reassembler.first_pending_seq()
+        if pending_seq is None:
+            return 0, b""
+        pending_data = reassembler.fragments.get(pending_seq, b"")
+        if not pending_data:
+            return 0, b""
+        resync = self._resync_gap_cipher(cipher, pending_data, gap_bytes)
+        if resync is None:
+            _print_line(
+                "warning",
+                f"{direction} TCP 缺口 {gap_bytes} 字节无法通过信封校验重同步，放弃恢复 | 会话={self.session_id}",
+            )
+            return 0, b""
+        lost, fpos = resync
+        cipher.keystream(lost + fpos)
         buffer = session.client_buffer if from_client else session.server_buffer
         buffer.clear()
-        return reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
+        gap_bytes, chunk = reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
+        return gap_bytes, chunk[fpos:]
+
+    @staticmethod
+    def _resync_gap_cipher(
+        cipher: object,
+        pending_data: bytes,
+        gap_bytes: int,
+    ) -> Optional[tuple[int, int]]:
+        """在缺口后数据里找第一个完整帧边界，对候选密文跳过量逐一信封校验。
+
+        返回 (缺口内密文字节数, 帧边界前的残留密文字节数)，找不到可验证帧返回 None。
+        """
+        candidates: list[int] = []
+        for fpos in range(len(pending_data)):
+            if fpos + 4 > len(pending_data):
+                break
+            body_len = u32(pending_data, fpos)
+            if body_len == 1 or body_len < 9:
+                continue
+            if fpos + 4 + body_len > len(pending_data):
+                continue
+            candidates.append(fpos)
+        if not candidates:
+            return None
+        for fpos in candidates:
+            body_len = u32(pending_data, fpos)
+            payload = pending_data[fpos + 13 : fpos + 13 + body_len - 9]
+            for lost in range(gap_bytes + 1):
+                probe = copy.deepcopy(cipher)
+                probe.keystream(lost + fpos)
+                if parse_envelope(probe.crypt(payload)) is not None:
+                    return lost, fpos
+        return None
 
     def _print_once_reset(self) -> None:
         seen = getattr(self, "_printed_messages", None)
