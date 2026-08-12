@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict
 
 
@@ -36,6 +36,9 @@ class RF4ProtocolProfile:
     room_message_line_type_catch: int
     arg_list_code: bytes = b"507"
     detail_list_code: bytes = b"135"
+    # 快捷键槽位类型 → 竿号。对照 GameAssembly.dll 验证：1/2/3 为前 3 竿，
+    # 20/21/22/23 对应 4..7 竿。slot_type==4(当前活动位) 不在表中，避免误显"4号杆"。
+    shortcut_slot_numbers: Dict[int, int] = field(default_factory=dict)
 
 
 RF4_4_0_24799 = RF4ProtocolProfile(
@@ -67,6 +70,7 @@ RF4_4_0_24799 = RF4ProtocolProfile(
     room_detail_item_type_id=400,
     room_ack_profile_type_id=2002,
     room_message_line_type_catch=3,
+    shortcut_slot_numbers={1: 1, 2: 2, 3: 3, 20: 4, 21: 5, 22: 6, 23: 7},
 )
 
 

@@ -2979,10 +2979,19 @@ class RF4ChatBridge:
             return ""
         # 竿号只来自 11/1 请求当前装备槽位的完整快捷键映射(slot_items 1/2/3...)。
         # 注意：11/2 切换槽位响应的 slot_type 恒为 4(当前活动位)，不是快捷键编号，
-        # 不能用它反查竿号，否则会错误显示"4号杆"。
+        # 不经映射直接显示会错误输出"4号杆"。slot_type 经 profile.shortcut_slot_numbers
+        # 翻译成竿号；未收录的类型不显示竿号，并记 verbose 日志便于补全映射。
         for slot_type, item_guid in session.slot_items.items():
             if item_guid == fishing_gear_id:
-                return f"{slot_type}号杆"
+                rod_number = session.profile.shortcut_slot_numbers.get(slot_type)
+                if rod_number is None:
+                    if ctx.options.rf4_verbose_logging:
+                        self._log(
+                            f"未收录槽位类型 slot_type={slot_type} "
+                            f"gear={self._short_id(fishing_gear_id)}"
+                        )
+                    return ""
+                return f"{rod_number}号杆"
         return ""
 
     def _build_synthetic_broadcast(
