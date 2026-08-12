@@ -5,6 +5,7 @@
 """
 import json
 import math
+import queue
 import socket
 import sys
 import threading
@@ -145,8 +146,16 @@ class Overlay:
             return
 
         self.sock.settimeout(0.2)
+        self.sock.setblocking(True)
+        self._display_queue = queue.Queue()
+        self._receiver_thread = threading.Thread(
+            target=self._receive_loop,
+            name="rf4-overlay-udp",
+            daemon=True,
+        )
+        self._receiver_thread.start()
         self._refresh_display()
-        self.root.after(100, self._poll)
+        self.root.after(30, self._poll)
         self.root.after(800, self._poll_config)
 
     def load_config(self):
@@ -316,37 +325,50 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self.visible = True
 
+    def _receive_loop(self):
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+            except (socket.timeout, OSError):
+                continue
+            self._display_queue.put(data)
+
     def _poll(self):
+        # 接收由后台线程完成，主线程只做轻量队列轮询并在事件到来时立即刷新，
+        # 避免阻塞型 recvfrom 拖后显示（修复"来鱼弹窗慢半拍"）。
         try:
             while True:
                 try:
-                    data, _ = self.sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-                except OSError:
+                    data = self._display_queue.get_nowait()
+                except queue.Empty:
                     break
                 try:
-                    event = json.loads(data.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
-                    continue
-                name = event.get("event")
-                gear_slot = event.get("gear_slot") or ""
-                text = event.get("text") or ""
-                clear_after = 3000 if name in ("fish_kept", "fish_escaped", "fish_released") else 0
-                if name == "reset":
-                    self.root.after(0, self._reset_to_idle)
-                elif name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
-                    self.root.after(0, self._show_self_event, gear_slot, text, clear_after)
-                elif name in ("fish_catch", "chat"):
-                    self.root.after(0, self._show_generic, event.get("text") or "")
-                elif name == "telemetry":
-                    text = event.get("text") or ""
-                    if text:
-                        self.root.after(0, self._show_generic, text)
-                elif name == "anticheat":
-                    self.root.after(0, self._show_anticheat, event.get("text") or "")
+                    self._handle_datagram(data)
+                except Exception:
+                    pass
         finally:
-            self.root.after(100, self._poll)
+            self.root.after(30, self._poll)
+
+    def _handle_datagram(self, data):
+        try:
+            event = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        name = event.get("event")
+        gear_slot = event.get("gear_slot") or ""
+        text = event.get("text") or ""
+        clear_after = 3000 if name in ("fish_kept", "fish_escaped", "fish_released") else 0
+        if name == "reset":
+            self._reset_to_idle()
+        elif name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
+            self._show_self_event(gear_slot, text, clear_after)
+        elif name in ("fish_catch", "chat"):
+            self._show_generic(text)
+        elif name == "telemetry":
+            if text:
+                self._show_generic(text)
+        elif name == "anticheat":
+            self._show_anticheat(text)
 
 
 def main():
