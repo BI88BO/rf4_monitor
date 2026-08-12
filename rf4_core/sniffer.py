@@ -50,6 +50,8 @@ DISCOVERY_MAX_STREAM_BYTES = 256 * 1024
 DISCOVERY_MAX_CANDIDATES = 2048
 DYNAMIC_INTERFACE_SCAN_SECONDS = 1.0
 TCP_GAP_WARNING_SECONDS = 2.0
+TCP_GAP_RECOVERY_SECONDS = 4.0
+MAX_RECOVERABLE_TCP_GAP_BYTES = 4096
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
 TCP_GAP_STALL_SECONDS = 30.0
@@ -361,6 +363,39 @@ class TcpStreamReassembler:
     def first_pending_seq(self) -> Optional[int]:
         return min(self.fragments) if self.fragments else None
 
+    def recover_gap(self, *, max_gap_bytes: int) -> tuple[int, bytes]:
+        if self.next_seq is None or not self.fragments:
+            return 0, b""
+        pending_seq = self.first_pending_seq()
+        if pending_seq is None or pending_seq <= self.next_seq:
+            return 0, b""
+        gap_bytes = pending_seq - self.next_seq
+        if gap_bytes <= 0 or gap_bytes > max_gap_bytes:
+            return 0, b""
+        pending = self.fragments.pop(pending_seq)
+        self.pending_bytes -= len(pending)
+        self.next_seq = pending_seq + len(pending)
+        self.gap_started_at = None
+
+        out = bytearray(pending)
+        while self.fragments:
+            usable_starts = [start for start in self.fragments if start <= self.next_seq]
+            if not usable_starts:
+                break
+            start = min(usable_starts)
+            fragment = self.fragments.pop(start)
+            self.pending_bytes -= len(fragment)
+            fragment_end = start + len(fragment)
+            if fragment_end <= self.next_seq:
+                continue
+            offset = self.next_seq - start
+            fresh = fragment[offset:]
+            out.extend(fresh)
+            self.next_seq += len(fresh)
+        if not self.fragments:
+            self.gap_started_at = None
+        return gap_bytes, bytes(out)
+
 
 @dataclass
 class PassiveSession:
@@ -409,6 +444,16 @@ class PassiveSession:
                 f" 缓存={reassembler.pending_bytes}字节"
                 f" | 会话={self.session_id}",
             )
+        if not chunk and reassembler.gap_age() >= TCP_GAP_RECOVERY_SECONDS:
+            gap_bytes, chunk = self._recover_tcp_gap(
+                reassembler, from_client=from_client, direction=direction
+            )
+            if gap_bytes:
+                _print_line(
+                    "warning",
+                    f"{direction} 已跳过 {gap_bytes} 字节 TCP 缺口，丢弃当前不完整业务帧后继续尝试解析"
+                    f" | 会话={self.session_id}",
+                )
         if not from_client and not self.downlink_stalled:
             # 下行序号缺口持续超阈值仍未填补 = 真丢包（非乱序），RC4 流不可恢复。
             # 冻结该会话下行解析，避免来鱼推送被静默吞掉；等下次 realtime 重连自动恢复。
@@ -432,6 +477,35 @@ class PassiveSession:
             self._process_client_bytes(chunk)
         elif not self.downlink_stalled:
             self._process_server_bytes(chunk)
+
+    def _recover_tcp_gap(
+        self,
+        reassembler: TcpStreamReassembler,
+        *,
+        from_client: bool,
+        direction: str,
+    ) -> tuple[int, bytes]:
+        session = self.protocol
+        if not session.handshake_complete():
+            return 0, b""
+        pending_seq = reassembler.first_pending_seq()
+        if reassembler.next_seq is None or pending_seq is None:
+            return 0, b""
+        gap_bytes = pending_seq - reassembler.next_seq
+        if gap_bytes <= 0 or gap_bytes > MAX_RECOVERABLE_TCP_GAP_BYTES:
+            if gap_bytes > MAX_RECOVERABLE_TCP_GAP_BYTES:
+                _print_line(
+                    "warning",
+                    f"{direction} TCP 缺口 {gap_bytes} 字节过大，放弃实验性恢复 | 会话={self.session_id}",
+                )
+            return 0, b""
+        cipher = session.client_read_rc4 if from_client else session.server_read_rc4
+        if cipher is None:
+            return 0, b""
+        cipher.keystream(gap_bytes)
+        buffer = session.client_buffer if from_client else session.server_buffer
+        buffer.clear()
+        return reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
 
     def _print_once_reset(self) -> None:
         seen = getattr(self, "_printed_messages", None)
