@@ -2836,12 +2836,13 @@ class RF4ChatBridge:
                     extra = " 浮动组=" + ", ".join(
                         f"{value:.4f}" for value in fish_setup.extra_floats
                     )
+                flag = " 体力标记=" + ("true" if fish_setup.stamina_flag else "false") if fish_setup.stamina_flag is not None else ""
                 self._log(
                     f"fish_setup_push 钓组={self._short_id(fish_setup.fishing_gear_id)} "
                     f"鱼编号={self._short_id(fish_setup.fish_setup_id)} "
                     f"鱼名key={fish_setup.fish_key} setup_enum={fish_setup.setup_enum} "
                     f"长度={fish_setup.length_hint} 重量raw={fish_setup.weight_hint_raw}"
-                    f"{extra}"
+                    f"{extra}{flag}"
                     f" hex={self._hex_preview(envelope.payload, limit=160)}"
                 )
             if (
