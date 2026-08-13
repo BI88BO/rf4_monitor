@@ -29,8 +29,13 @@ def _build_setup_payload(
     post_flag_floats: tuple[float, ...] = (),
     include_flag: bool = True,
     flag_value: int = 1,
+    trailing: bytes = b"",
 ) -> bytes:
-    """构造钓组上报载荷（0x34/0x38 float → 0x3C bool → 0x40.. float）。"""
+    """Build a fish_setup_push payload.
+
+    Layout after weight (0x30): 0x34 float, 0x38 float, 0x3C bool,
+    then 0x40..0x70 floats (mirrors the disassembled gkfghccolil layout).
+    """
     flag_byte = bytes([flag_value]) if include_flag else b""
     return (
         pack_arg_header(b"507", 1)
@@ -44,6 +49,7 @@ def _build_setup_payload(
         + struct.pack("<" + "f" * len(pre_flag_floats), *pre_flag_floats)
         + flag_byte
         + struct.pack("<" + "f" * len(post_flag_floats), *post_flag_floats)
+        + trailing
     )
 
 
@@ -78,14 +84,14 @@ class ParseFishSetupPushTests(unittest.TestCase):
         setup = self._parse(_build_setup_payload())
         self.assertIsNotNone(setup)
         assert setup is not None
-        self.assertTrue(setup.stamina_flag)
+        self.assertTrue(setup.flag_byte)
 
     def test_flag_zero_reads_as_false(self) -> None:
         payload = _build_setup_payload(flag_value=0)
         setup = self._parse(payload)
         self.assertIsNotNone(setup)
         assert setup is not None
-        self.assertFalse(setup.stamina_flag)
+        self.assertFalse(setup.flag_byte)
 
     def test_float_group_after_flag(self) -> None:
         floats = (0.5, 1.0, 2.0)
@@ -93,7 +99,6 @@ class ParseFishSetupPushTests(unittest.TestCase):
         setup = self._parse(payload)
         self.assertIsNotNone(setup)
         assert setup is not None
-        # extra_floats 合并了 flag 前后的 float。
         self.assertEqual(
             tuple(round(v, 4) for v in setup.extra_floats), (10.0, 20.0, 0.5, 1.0, 2.0)
         )
@@ -103,7 +108,7 @@ class ParseFishSetupPushTests(unittest.TestCase):
         setup = self._parse(payload)
         self.assertIsNotNone(setup)
         assert setup is not None
-        self.assertTrue(setup.stamina_flag)
+        self.assertTrue(setup.flag_byte)
         self.assertEqual(tuple(round(v, 4) for v in setup.extra_floats), (10.0, 20.0))
 
     def test_no_extra_bytes_yields_empty_group(self) -> None:
@@ -111,7 +116,7 @@ class ParseFishSetupPushTests(unittest.TestCase):
         self.assertIsNotNone(setup)
         assert setup is not None
         self.assertEqual(setup.extra_floats, ())
-        self.assertTrue(setup.stamina_flag)
+        self.assertTrue(setup.flag_byte)
 
     def test_truncated_float_ignored(self) -> None:
         payload = _build_setup_payload(pre_flag_floats=(1.0,))[:-2]
@@ -121,13 +126,22 @@ class ParseFishSetupPushTests(unittest.TestCase):
         self.assertEqual(setup.extra_floats, ())
 
     def test_missing_flag_byte(self) -> None:
-        # 无 flag 字节时（载荷在 weight 后直接结束或直接 float），flag 保持 None。
         payload = _build_setup_payload(include_flag=False)
         setup = self._parse(payload)
         self.assertIsNotNone(setup)
         assert setup is not None
-        self.assertIsNone(setup.stamina_flag)
+        self.assertIsNone(setup.flag_byte)
         self.assertEqual(setup.extra_floats, ())
+
+    def test_trailing_bytes_not_parsed_as_floats(self) -> None:
+        # Array (0x78) and later composite fields follow; parser must NOT
+        # keep reading floats past the fixed 13-float group.
+        trailing = bytes(range(0x30))  # 48 bytes of arbitrary composite data
+        payload = _build_setup_payload(post_flag_floats=tuple(range(13)), trailing=trailing)
+        setup = self._parse(payload)
+        self.assertIsNotNone(setup)
+        assert setup is not None
+        self.assertEqual(len(setup.extra_floats), 15)
 
 
 if __name__ == "__main__":

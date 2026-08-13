@@ -865,7 +865,7 @@ class FishSetupMeta:
     weight_hint_raw: Optional[int] = None
     length_hint: Optional[float] = None
     extra_floats: Tuple[float, ...] = ()
-    stamina_flag: Optional[bool] = None
+    flag_byte: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -1219,19 +1219,21 @@ def parse_fish_setup_push(envelope: RpcEnvelope, profile: RF4ProtocolProfile) ->
         # 鱼设置类 gkfghccolil 的精确网络布局（dump.cs + GameAssembly.dll 反汇编
         # cmjcbaheigb）：0x2C float 长度 / 0x30 int 重量 / 之后
         # 0x34 float, 0x38 float, 0x3C bool, 0x40..0x70 float×13。
+        # 0x78 起为 jiefmbnjlcp[] 数组等复合字段，不在此解析。
         extra_floats_before: List[float] = []
-        stamina_flag: Optional[bool] = None
+        flag_byte: Optional[bool] = None
         extra_floats_after: List[float] = []
         for _ in range(2):
             if pos + 4 <= len(envelope.payload):
                 extra_floats_before.append(struct.unpack_from("<f", envelope.payload, pos)[0])
                 pos += 4
         if pos < len(envelope.payload):
-            stamina_flag = envelope.payload[pos] != 0
+            flag_byte = envelope.payload[pos] != 0
             pos += 1
-        while pos + 4 <= len(envelope.payload):
-            extra_floats_after.append(struct.unpack_from("<f", envelope.payload, pos)[0])
-            pos += 4
+        for _ in range(13):
+            if pos + 4 <= len(envelope.payload):
+                extra_floats_after.append(struct.unpack_from("<f", envelope.payload, pos)[0])
+                pos += 4
     except (ValueError, IndexError):
         return None
     if not fish_key:
@@ -1244,7 +1246,7 @@ def parse_fish_setup_push(envelope: RpcEnvelope, profile: RF4ProtocolProfile) ->
         weight_hint_raw=weight_hint_raw,
         length_hint=length_hint,
         extra_floats=tuple(extra_floats_before + extra_floats_after),
-        stamina_flag=stamina_flag,
+        flag_byte=flag_byte,
     )
 
 
