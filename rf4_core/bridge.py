@@ -2321,10 +2321,13 @@ class RF4ChatBridge:
             parts.append(f"向量={self._format_float_tuple(group[:3])}")
         # 搏鱼加载采样：额外列出所有浮点组，便于对照鱼的力量/体力系数。
         groups = self._scan_float_groups(payload, limit=8)
+        stamina = self._fight_stamina(groups)
         for index, extra in enumerate(groups):
             if extra == group:
                 continue
             parts.append(f"浮点{index + 1}={self._format_float_tuple(extra)}")
+        if stamina is not None:
+            parts.append(f"体力={self._format_float(stamina)}")
         tick = self._last_u32(summary)
         if tick is not None:
             parts.append(f"序号={tick}")
@@ -2504,6 +2507,14 @@ class RF4ChatBridge:
         if len(left) != len(right):
             return False
         return all(abs(a - b) < 0.0001 for a, b in zip(left, right))
+
+    @staticmethod
+    def _fight_stamina(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
+        # 实测确认：搏鱼拉力消息中形如 (0, 0, 1, X) 的浮点组，X 随搏鱼递减到约 0 后结算。
+        for group in groups:
+            if len(group) >= 4 and abs(group[0]) < 0.001 and abs(group[1]) < 0.001 and abs(group[2] - 1.0) < 0.001:
+                return group[3]
+        return None
 
     @staticmethod
     def _format_arg_prefix(summary: BusinessPayloadSummary) -> List[str]:
