@@ -864,6 +864,7 @@ class FishSetupMeta:
     setup_enum: Optional[int] = None
     weight_hint_raw: Optional[int] = None
     length_hint: Optional[float] = None
+    extra_floats: Tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1213,6 +1214,13 @@ def parse_fish_setup_push(envelope: RpcEnvelope, profile: RF4ProtocolProfile) ->
             pos += 4
         if pos + 4 <= len(envelope.payload):
             weight_hint_raw = u32(envelope.payload, pos)
+            pos += 4
+        # 鱼设置类 gkfghccolil 在 weight(0x30) 之后还有连续的 float 字段
+        # （dump.cs 偏移 0x34..0x70），按 4 字节逐个读出，供识别体力等浮动组。
+        extra_floats: List[float] = []
+        while pos + 4 <= len(envelope.payload):
+            extra_floats.append(struct.unpack_from("<f", envelope.payload, pos)[0])
+            pos += 4
     except (ValueError, IndexError):
         return None
     if not fish_key:
@@ -1224,6 +1232,7 @@ def parse_fish_setup_push(envelope: RpcEnvelope, profile: RF4ProtocolProfile) ->
         setup_enum=setup_enum,
         weight_hint_raw=weight_hint_raw,
         length_hint=length_hint,
+        extra_floats=tuple(extra_floats),
     )
 
 

@@ -2831,11 +2831,18 @@ class RF4ChatBridge:
                 session.fish_setup_by_gear[fish_setup.fishing_gear_id] = fish_setup.fish_setup_id
             # 详细记录来鱼推送的字段，用于确认竿位编号(gear slot)的来源。
             if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                extra = ""
+                if fish_setup.extra_floats:
+                    extra = " 浮动组=" + ", ".join(
+                        f"{value:.4f}" for value in fish_setup.extra_floats
+                    )
                 self._log(
                     f"fish_setup_push 钓组={self._short_id(fish_setup.fishing_gear_id)} "
                     f"鱼编号={self._short_id(fish_setup.fish_setup_id)} "
                     f"鱼名key={fish_setup.fish_key} setup_enum={fish_setup.setup_enum} "
-                    f"hex={self._hex_preview(envelope.payload, limit=160)}"
+                    f"长度={fish_setup.length_hint} 重量raw={fish_setup.weight_hint_raw}"
+                    f"{extra}"
+                    f" hex={self._hex_preview(envelope.payload, limit=160)}"
                 )
             if (
                 fish_setup.weight_hint_raw
