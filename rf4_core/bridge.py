@@ -2296,9 +2296,14 @@ class RF4ChatBridge:
         gear = self._first_guid(summary)
         if gear:
             parts.append(f"钓组={self._short_id(gear)}")
-        group = self._first_float_group(summary, minimum=3)
-        if group and len(group) >= 3:
-            parts.append(f"钓组坐标={self._format_float_tuple(group[:3])}")
+        # 搏鱼过程采样：列出全部检测到的浮点组，观察体力/力量系数是否随过程变化。
+        groups = self._scan_float_groups(payload, limit=8)
+        for index, group in enumerate(groups):
+            label = "坐标" if index == 0 and len(group) >= 3 else f"浮点{index + 1}"
+            parts.append(f"{label}={self._format_float_tuple(group)}")
+        tick = self._last_u32(summary)
+        if tick is not None:
+            parts.append(f"序号={tick}")
         parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
         return self._join_business_parts(parts, payload)
 
@@ -2314,6 +2319,12 @@ class RF4ChatBridge:
             parts.append(f"负载={self._format_float(group[2])}")
         elif group and len(group) >= 3:
             parts.append(f"向量={self._format_float_tuple(group[:3])}")
+        # 搏鱼加载采样：额外列出所有浮点组，便于对照鱼的力量/体力系数。
+        groups = self._scan_float_groups(payload, limit=8)
+        for index, extra in enumerate(groups):
+            if extra == group:
+                continue
+            parts.append(f"浮点{index + 1}={self._format_float_tuple(extra)}")
         tick = self._last_u32(summary)
         if tick is not None:
             parts.append(f"序号={tick}")
