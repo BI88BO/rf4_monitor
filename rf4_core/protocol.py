@@ -1298,6 +1298,37 @@ def parse_contact_left(envelope: RpcEnvelope, profile: RF4ProtocolProfile) -> Op
     return parse_fishing_gear_and_setup(envelope, profile, profile.contact_left_sub_cmd)
 
 
+@dataclass(frozen=True)
+class FightPullRequest:
+    call_id: int
+    fishing_gear_id: Optional[str]
+    tick: Optional[int]
+
+
+def parse_fight_pull_request(envelope: RpcEnvelope, profile: RF4ProtocolProfile) -> Optional[FightPullRequest]:
+    if envelope.marker != -1:
+        return None
+    if envelope.main_cmd != profile.fishing_main_cmd or envelope.sub_cmd != profile.fight_pull_sub_cmd:
+        return None
+    try:
+        _, pos = read_arg_header(envelope.payload, 0)
+        fishing_gear_id = None
+        if pos < len(envelope.payload) and envelope.payload[pos] == 0x0C:
+            fishing_gear_id, pos = read_guid(envelope.payload, pos, marker=True)
+        tick = None
+        if pos + 5 <= len(envelope.payload) and envelope.payload[pos] == 0x10:
+            tick = u32(envelope.payload, pos + 1)
+    except (ValueError, IndexError):
+        return None
+    if not fishing_gear_id:
+        return None
+    return FightPullRequest(
+        call_id=envelope.call_id,
+        fishing_gear_id=fishing_gear_id,
+        tick=tick,
+    )
+
+
 def parse_release_fish_request(envelope: RpcEnvelope, profile: RF4ProtocolProfile) -> Optional[KeepFishRequest]:
     return parse_fishing_gear_and_setup(envelope, profile, profile.release_fish_sub_cmd)
 

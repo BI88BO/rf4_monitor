@@ -12,10 +12,12 @@ from rf4_core.protocol import (
     pack_arg_header,
     pack_guid_marker,
     pack_guid_raw,
+    pack_marked_u32,
     pack_object_header,
     pack_short_string,
     parse_envelope,
     parse_fish_setup_push,
+    parse_fight_pull_request,
 )
 
 
@@ -142,6 +144,98 @@ class ParseFishSetupPushTests(unittest.TestCase):
         self.assertIsNotNone(setup)
         assert setup is not None
         self.assertEqual(len(setup.extra_floats), 15)
+
+
+class ParseFightPullRequestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from rf4_core.protocol import get_profile
+
+        self.profile = get_profile("4.0.24799")
+
+    def _parse(self, payload: bytes):
+        envelope = parse_envelope(
+            build_request_envelope(
+                call_id=10,
+                main_cmd=self.profile.fishing_main_cmd,
+                sub_cmd=self.profile.fight_pull_sub_cmd,
+                payload=payload,
+            )
+        )
+        assert envelope is not None
+        return parse_fight_pull_request(envelope, self.profile)
+
+    def test_parses_gear_and_tick(self) -> None:
+        payload = (
+            pack_arg_header(b"507", 3)
+            + pack_guid_marker("5a43c383-1111-1111-1111-111111111111")
+            + pack_marked_u32(353)
+        )
+        pull = self._parse(payload)
+        self.assertIsNotNone(pull)
+        assert pull is not None
+        self.assertEqual(pull.fishing_gear_id, "5a43c383-1111-1111-1111-111111111111")
+        self.assertEqual(pull.tick, 353)
+
+    def test_missing_gear_returns_none(self) -> None:
+        payload = pack_arg_header(b"507", 3) + pack_marked_u32(353)
+        self.assertIsNone(self._parse(payload))
+
+    def test_other_sub_cmd_returns_none(self) -> None:
+        envelope = parse_envelope(
+            build_request_envelope(
+                call_id=10,
+                main_cmd=self.profile.fishing_main_cmd,
+                sub_cmd=self.profile.fight_load_sub_cmd,
+                payload=pack_arg_header(b"507", 3),
+            )
+        )
+        assert envelope is not None
+        self.assertIsNone(parse_fight_pull_request(envelope, self.profile))
+
+
+class FightPullAssociationTests(unittest.TestCase):
+    def test_association_text(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+        from rf4_core.protocol import FishSetupMeta, get_profile
+
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+            rf4_event_bridge_port=0,
+        )
+        prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        try:
+            bridge = RF4ChatBridge()
+            session = FlowSession(profile=get_profile("4.0.24799"))
+            setup_id = "72121a20-1111-1111-1111-111111111111"
+            gear_id = "5a43c383-1111-1111-1111-111111111111"
+            session.fish_setup_cache[setup_id] = FishSetupMeta(
+                fish_setup_id=setup_id,
+                fish_key="piksha",
+                weight_hint_raw=4585,
+            )
+            session.fish_setup_by_gear[gear_id] = setup_id
+            session.fight_fish_by_gear[gear_id] = setup_id
+            session.fight_stamina_by_gear[gear_id] = 30.9
+            payload = (
+                pack_arg_header(b"507", 3)
+                + pack_guid_marker(gear_id)
+                + pack_marked_u32(353)
+            )
+            text = bridge._format_fight_pull_payload(session, payload)
+            self.assertIn("钓组=5a43c383", text)
+            self.assertIn("鱼编号=72121a20", text)
+            self.assertIn("鱼=黑线鳕", text)
+            self.assertIn("重量=4.585 公斤", text)
+            self.assertIn("体力=30.9", text)
+            self.assertIn("序号=353", text)
+        finally:
+            bridge_mod.ctx = prev_ctx
 
 
 if __name__ == "__main__":

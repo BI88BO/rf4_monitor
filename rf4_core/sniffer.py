@@ -695,6 +695,11 @@ class PassiveSession:
                     f"{self.bridge._describe_plain_body(plain_body)}"
                 )
             if from_client:
+                try:
+                    self.bridge._track_rpc_request_command(session, plain_body)
+                    self.bridge._track_building_rpc_request(session, plain_body)
+                except Exception:
+                    pass
                 self.bridge._handle_client_frame(session, plain_body)
             else:
                 self.bridge._handle_server_frame(session, plain_body)

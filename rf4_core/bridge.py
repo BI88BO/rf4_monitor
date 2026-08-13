@@ -155,6 +155,8 @@ class FlowSession:
     server_write_rc4: Optional[RC4Stream] = None
     fish_setup_cache: Dict[str, FishSetupMeta] = field(default_factory=lambda: BoundedDict(1024))
     fish_setup_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
+    fight_fish_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
+    fight_stamina_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
     fishing_end_requests: Dict[int, FishingEndRequest] = field(default_factory=lambda: BoundedDict(128))
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
@@ -474,6 +476,7 @@ class RF4ChatBridge:
         except Exception:
             pass
         self._gear_config_by_id: Dict[int, dict] = {}
+        self._gear_config_hashes: List[str] = []
         try:
             self._load_gear_config_from_cache()
         except Exception:
@@ -504,16 +507,25 @@ class RF4ChatBridge:
             if key and not key.startswith("card_")
         }
         best: list = []
-        for path in cache_paths:
-            try:
-                records = extract_gear_config_records_from_cache(
-                    path=path,
-                    known_system_ids=known_system_ids,
-                )
-            except Exception:
-                records = []
-            if len(records) > len(best):
-                best = records
+        best_hash = ""
+        # 优先用运行时捕获的 configs_version hash 解密缓存(否则缓存是加密的)；
+        # 找不到 hash 时再退回到未解密数据(仅对未加密的旧缓存有效)。
+        hashes = list(self._gear_config_hashes or ())
+        if not hashes:
+            hashes = [""]
+        for cache_hash in hashes:
+            for path in cache_paths:
+                try:
+                    records = extract_gear_config_records_from_cache(
+                        path=path,
+                        known_system_ids=None if cache_hash else known_system_ids,
+                        cache_hash=cache_hash or None,
+                    )
+                except Exception:
+                    records = []
+                if len(records) > len(best):
+                    best = records
+                    best_hash = cache_hash
         by_id: Dict[int, dict] = {}
         for record in best:
             attributes = dict(record.attributes)
@@ -528,6 +540,7 @@ class RF4ChatBridge:
         if self._gear_config_by_id:
             self._log(
                 f"已从游戏本地缓存读取真实装备部件目录：{len(self._gear_config_by_id)} 件"
+                + (f" (hash={best_hash[:8]}...)" if best_hash else "")
             )
 
     def _load_item_catalog_index(self) -> None:
@@ -1541,7 +1554,9 @@ class RF4ChatBridge:
         if sub_cmd == profile.fight_step_sub_cmd:
             details = self._format_fish_move_payload(envelope.payload)
         elif sub_cmd == profile.fight_load_sub_cmd:
-            details = self._format_fight_load_payload(envelope.payload)
+            details = self._format_fight_load_payload(session, envelope.payload)
+        elif sub_cmd == profile.fight_pull_sub_cmd:
+            details = self._format_fight_pull_payload(session, envelope.payload)
         elif sub_cmd == profile.fight_stage_sub_cmd:
             details = self._format_fight_stage_payload(envelope.payload)
         elif sub_cmd == profile.contact_left_sub_cmd:
@@ -1684,6 +1699,25 @@ class RF4ChatBridge:
         game_name = str(self._fish_labels_zh.get(key) or "").strip()
         if game_name and game_name != key:
             return f"{self._quote_text(self._clean_text(game_name), limit=60)}({key})"
+        # 物品实例 system_id 常带变体后缀(如 tele_10175_5_9 / spin_6115_g)，
+        # 基础 model 名(tele_10175_5 / spin_6115)在目录表里。逐段去掉尾部后缀再查。
+        trimmed = key
+        while "_" in trimmed:
+            trimmed, _, _ = trimmed.rpartition("_")
+            base_name = str(self._fish_labels_zh.get(trimmed) or "").strip()
+            if base_name and base_name != trimmed:
+                return f"{self._quote_text(self._clean_text(base_name), limit=60)}({trimmed} 变体)"
+            prefix = trimmed + "_"
+            family = sorted(
+                name for name, label in self._fish_labels_zh.items()
+                if name.startswith(prefix) and str(label or "").strip() and label != name
+            )
+            if family:
+                family_name = str(self._fish_labels_zh.get(family[0]) or "").strip()
+                return (
+                    f"{self._quote_text(self._clean_text(family_name), limit=60)}"
+                    f"({trimmed} 变体)"
+                )
         return key
 
     def _format_guid_sequence(self, values: Sequence[str], limit: int = 8) -> str:
@@ -1942,9 +1976,13 @@ class RF4ChatBridge:
         if config:
             system_id = str(config.get("system_id") or "")
             catalog_name = ""
-            entry = self._catalog_key_lookup.get(system_id)
-            if entry:
-                catalog_name = entry.name
+            game_name = str(self._fish_labels_zh.get(system_id) or "").strip()
+            if game_name and game_name != system_id:
+                catalog_name = game_name
+            else:
+                entry = self._catalog_key_lookup.get(system_id)
+                if entry:
+                    catalog_name = entry.name
             config = dict(config)
             config["catalog_name"] = catalog_name
             return config
@@ -2119,11 +2157,33 @@ class RF4ChatBridge:
                     continue
                 session.item_guid_to_id[component.component_guid] = (component.item_id, 152)
 
+    def _remember_config_version_hashes(self, session: FlowSession, payload: bytes) -> None:
+        try:
+            from .game_catalog import decode_config_version_hashes
+        except Exception:
+            return
+        try:
+            hashes = decode_config_version_hashes(payload)
+        except (ValueError, IndexError) as exc:
+            if ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"game/configs 1/5 响应无法解析为 hash 列表：{exc} "
+                    f"前16字节={payload[:16].hex()} 长度={len(payload)}"
+                )
+            return
+        if not hashes:
+            return
+        self._gear_config_hashes = list(dict.fromkeys(hashes))
+        if ctx.options.rf4_verbose_logging:
+            self._log(f"已捕获 game/configs 1/5 配置版本 hash={self._gear_config_hashes}")
+        if not self._gear_config_by_id:
+            self._load_gear_config_from_cache()
+
     def _format_item_state_payload(self, payload: bytes) -> str:
         summary = parse_item_state_summary(payload)
         parts: List[str] = []
         for rig in summary.rig_definitions[:3]:
-            rig_parts = [f"类型={rig.rig_key}"]
+            rig_parts = [f"类型={self._format_system_item_name(rig.rig_key)}"]
             if rig.line_type is not None:
                 rig_parts.append(f"lineType={rig.line_type}")
             if rig.components:
@@ -2275,6 +2335,15 @@ class RF4ChatBridge:
         return None
 
     @staticmethod
+    def _fish_meta_for_gear(session: FlowSession, fishing_gear_id: Optional[str]) -> Optional[FishSetupMeta]:
+        if not fishing_gear_id:
+            return None
+        setup_id = session.fish_setup_by_gear.get(fishing_gear_id)
+        if not setup_id:
+            return None
+        return session.fish_setup_cache.get(setup_id)
+
+    @staticmethod
     def _format_business_line(label: str, details: str) -> str:
         if not details:
             return label
@@ -2307,12 +2376,18 @@ class RF4ChatBridge:
         parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
         return self._join_business_parts(parts, payload)
 
-    def _format_fight_load_payload(self, payload: bytes) -> str:
+    def _format_fight_load_payload(self, session: FlowSession, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
         parts: List[str] = []
         gear = self._first_guid(summary)
         if gear:
             parts.append(f"钓组={self._short_id(gear)}")
+            meta = self._fish_meta_for_gear(session, gear)
+            if meta:
+                parts.append(f"鱼编号={self._short_id(meta.fish_setup_id)}")
+                fish_name = self._format_fish_name(meta.fish_key or "")
+                weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
+                parts.append(f"鱼={fish_name} 重量={weight}")
         group = self._first_float_group(summary, minimum=4)
         if group and len(group) >= 4:
             parts.append(f"拉力方向={self._format_float_tuple((group[0], group[1], group[3]))}")
@@ -2328,6 +2403,28 @@ class RF4ChatBridge:
             parts.append(f"浮点{index + 1}={self._format_float_tuple(extra)}")
         if stamina is not None:
             parts.append(f"体力={self._format_float(stamina)}")
+        tick = self._last_u32(summary)
+        if tick is not None:
+            parts.append(f"序号={tick}")
+        parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
+        return self._join_business_parts(parts, payload)
+
+    def _format_fight_pull_payload(self, session: FlowSession, payload: bytes) -> str:
+        summary = self._summarize_business_payload(payload)
+        parts: List[str] = []
+        gear = self._first_guid(summary)
+        if gear:
+            parts.append(f"钓组={self._short_id(gear)}")
+            setup_id = session.fight_fish_by_gear.get(gear) or session.fish_setup_by_gear.get(gear)
+            meta = session.fish_setup_cache.get(setup_id) if setup_id else None
+            if meta:
+                parts.append(f"鱼编号={self._short_id(meta.fish_setup_id)}")
+                fish_name = self._format_fish_name(meta.fish_key or "")
+                weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
+                parts.append(f"鱼={fish_name} 重量={weight}")
+            stamina = session.fight_stamina_by_gear.get(gear)
+            if stamina is not None:
+                parts.append(f"体力={self._format_float(stamina)}")
         tick = self._last_u32(summary)
         if tick is not None:
             parts.append(f"序号={tick}")
@@ -2731,10 +2828,27 @@ class RF4ChatBridge:
                         f"sub={envelope.sub_cmd}"
                     )
 
+        # 搏鱼拉力(14/8)：记录该钓组当前鱼体力，供拉线动作/搏鱼关联展示。
+        fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
+        if fight_load and fight_load.fishing_gear_id:
+            groups = self._scan_float_groups(envelope.payload, limit=8)
+            stamina = self._fight_stamina(groups)
+            if stamina is not None:
+                session.fight_stamina_by_gear[fight_load.fishing_gear_id] = stamina
+            if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
+                self._log(
+                    f"fight_load 钓组={self._short_id(fight_load.fishing_gear_id)} "
+                    f"体力={self._format_float(stamina) if stamina is not None else '?'} "
+                    f"hex={self._hex_preview(envelope.payload, limit=160)}"
+                )
+            return plain_body, []
+
         # 进入搏鱼阶段(14/11)：客户端确认鱼已挂牢咬钩，触发"确认咬钩"事件。
         fight_stage = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_stage_sub_cmd)
         if fight_stage and fight_stage.fish_setup_id:
             meta = session.fish_setup_cache.get(fight_stage.fish_setup_id)
+            if fight_stage.fishing_gear_id:
+                session.fight_fish_by_gear[fight_stage.fishing_gear_id] = fight_stage.fish_setup_id
             if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
                 self._log(
                     f"fight_stage 钓组={self._short_id(fight_stage.fishing_gear_id)} "
@@ -2840,7 +2954,25 @@ class RF4ChatBridge:
             except Exception:
                 pass
 
+        # game/configs 1/5：客户端启动时请求的配置版本 hash 列表，用于解密本地配置缓存
+        # (c0001.dat) 得到 configId→systemId 映射，从而把 4/22 的 itemId 翻译成装备中文名。
+        if (
+            envelope.marker == -1
+            and envelope.main_cmd == session.profile.session_main_cmd
+            and envelope.sub_cmd == 5
+        ):
+            try:
+                self._remember_config_version_hashes(session, envelope.payload)
+            except Exception:
+                pass
+
         if envelope.marker == -2:
+            tracked = session.rpc_request_commands.get(envelope.call_id)
+            if tracked and tracked[0] == session.profile.session_main_cmd and tracked[1] == 5:
+                try:
+                    self._remember_config_version_hashes(session, envelope.payload)
+                except Exception:
+                    pass
             session.building_request_calls.pop(envelope.call_id, None)
             session.rpc_request_commands.pop(envelope.call_id, None)
             session.slot_request_calls.pop(envelope.call_id, None)
