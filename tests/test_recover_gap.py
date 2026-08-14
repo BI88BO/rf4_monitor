@@ -180,6 +180,38 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
         self.assertEqual(lost, 12)
         self.assertEqual(fpos, 0)
 
+    def test_recovers_when_gap_inside_frame_header_and_payload(self) -> None:
+        """缺口吃掉了帧头(13字节)+部分payload，帧2的残留密文会混在缺口后数据里。
+        恢复必须正确找到帧3边界并跳过残留，不产生错位解析。"""
+        session = _make_ready_session()
+        received: list[object] = []
+        session.bridge._handle_server_frame = lambda _session, plain: received.append(
+            __import__("rf4_core.protocol", fromlist=["parse_envelope"]).parse_envelope(plain)
+        )
+        ref = RC4Stream(session.protocol.token.encode())
+        plain1 = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        raw1 = build_frame(0, 101, ref.crypt(plain1))
+        plain2 = build_request_envelope(call_id=2, main_cmd=14, sub_cmd=4, payload=bytes([0x59]) * 10)
+        raw2 = build_frame(0, 102, ref.crypt(plain2))
+        plain3 = build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z")
+        raw3 = build_frame(0, 103, ref.crypt(plain3))
+
+        seq = 1000
+        session.feed_tcp(from_client=False, seq=seq, payload=raw1, syn=False)
+        seq += len(raw1)
+        # 缺口 = 帧2的 13 字节帧头 + 5 字节 payload；缺口后 = 帧2剩余密文 + 帧3。
+        gap_inside = 18
+        seq += gap_inside
+        remaining = raw2[gap_inside:] + raw3
+        session.feed_tcp(from_client=False, seq=seq, payload=remaining, syn=False)
+        session.server_tcp.gap_started_at = 0.0
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+
+        # 帧1 与帧3 正确到达，帧2 被跳过，不 stall。
+        ids = [env.call_id for env in received if env is not None]
+        self.assertEqual(ids, [1, 3])
+        self.assertFalse(session.downlink_stalled)
+
     def test_recovers_when_gap_contains_full_frame_with_header(self) -> None:
         session, received = self._build_stream()
         session.server_tcp.gap_started_at = 0.0
