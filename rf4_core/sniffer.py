@@ -52,11 +52,13 @@ DISCOVERY_MAX_STREAM_BYTES = 256 * 1024
 DISCOVERY_MAX_CANDIDATES = 2048
 DYNAMIC_INTERFACE_SCAN_SECONDS = 1.0
 TCP_GAP_WARNING_SECONDS = 2.0
-TCP_GAP_RECOVERY_SECONDS = 4.0
+# 缺口出现后优先等待 TCP 重传补齐（游戏客户端会一直等数据包重新到位），
+# 超过该阈值才跳过缺口继续解析；重传慢时缺口内帧内容可能丢失。
+TCP_GAP_RECOVERY_SECONDS = 15.0
 MAX_RECOVERABLE_TCP_GAP_BYTES = 4096
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
-TCP_GAP_STALL_SECONDS = 30.0
+TCP_GAP_STALL_SECONDS = 45.0
 VIRTUAL_INTERFACE_HINTS = (
     "accelerator",
     "clash",

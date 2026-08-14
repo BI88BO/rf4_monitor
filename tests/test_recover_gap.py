@@ -223,3 +223,43 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
         # 缺口后的帧3 被正确解密送达 handler。
         self.assertEqual(len(received), 2)
         self.assertEqual(received[1], build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z"))
+
+    def test_waits_for_tcp_retransmission_before_recovery(self) -> None:
+        """游戏端会等数据包重新到位：缺口出现后若 TCP 重传在恢复阈值内补齐，
+        帧2 必须无缝续上且不被跳过，缺口内帧内容不丢。"""
+        session, _received = self._build_stream()
+        # 缺口存在但 age 未到恢复阈值（模拟刚发生乱序，等重传补齐）。
+        self.assertGreater(session.server_tcp.pending_bytes, 0)
+        self.assertLess(session.server_tcp.gap_age(), sniffer.TCP_GAP_RECOVERY_SECONDS)
+
+        # 帧2 的密文以乱序包到达（TCP 重传/乱序），落在缺口位置。
+        ref = RC4Stream(session.protocol.token.encode())
+        plain1 = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        ref.crypt(plain1)
+        plain2 = build_request_envelope(call_id=2, main_cmd=14, sub_cmd=4, payload=b"y")
+        raw2 = build_frame(0, 102, ref.crypt(plain2))
+
+        from rf4_core.sniffer import PassiveSession
+
+        called = {"recovery": False}
+        original = PassiveSession._recover_tcp_gap
+
+        def patched(self, *args, **kwargs):
+            called["recovery"] = True
+            return original(self, *args, **kwargs)
+
+        PassiveSession._recover_tcp_gap = patched
+        try:
+            # 缺口起点 = 帧2 的位置，帧2 乱序到达补齐缺口。
+            gap_start = session.server_tcp.next_seq
+            session.feed_tcp(from_client=False, seq=gap_start, payload=raw2, syn=False)
+        finally:
+            PassiveSession._recover_tcp_gap = original
+
+        # 缺口被补齐，未触发跳过恢复。
+        self.assertFalse(called["recovery"])
+        self.assertEqual(session.server_tcp.pending_bytes, 0)
+        self.assertEqual(
+            session.server_tcp.next_seq,
+            1000 + 25 + 25 + 25,
+        )
