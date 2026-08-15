@@ -18,6 +18,7 @@ from rf4_core.protocol import (
     parse_envelope,
     parse_fish_setup_push,
     parse_fight_pull_request,
+    get_profile,
 )
 
 
@@ -271,6 +272,68 @@ class FightStaminaHelpersTests(unittest.TestCase):
         self.assertEqual(self.bridge._sanitize_distance(12.3, 26.2), 12.3)
         self.assertEqual(self.bridge._sanitize_distance(None, 26.2), 26.2)
         self.assertIsNone(self.bridge._sanitize_distance(-1.0, None))
+
+
+class FightLoadSlimLineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+
+        self.pack_arg_header = pack_arg_header
+        self.pack_guid_marker = pack_guid_marker
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+            rf4_event_bridge_port=0,
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        # 钓组挂到 1 号杆槽位
+        self.session.slot_items[1] = "5a43c383-1111-1111-1111-111111111111"
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _payload(self, distance: float, stamina: float = 1.0) -> bytes:
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        return (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(gear)
+            + struct.pack("<4f", 2.0, 2.0, 0.444, 9.221)
+            + struct.pack("<4f", stamina, 69.09, 0.07, 5.1)
+            + struct.pack("<4f", 0.04, 7.1, 3.9, 0.0)
+            + struct.pack("<4f", 0.0, 0.0, 1.0, distance)
+            + struct.pack("<4f", 0.0, 12.5, 2.0, 555.0)
+        )
+
+    def test_slim_line_with_stamina_and_distance(self) -> None:
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertIn("1号杆", text)
+        self.assertIn("体力 100%", text)
+        self.assertIn("出线 26.2米", text)
+        # 精简：不包含冗余字段
+        self.assertNotIn("浮点", text)
+        self.assertNotIn("拉力方向", text)
+        self.assertNotIn("负载", text)
+        self.assertNotIn("序号", text)
+
+    def test_glitch_distance_keeps_last_value(self) -> None:
+        self.session.fight_distance_by_gear["5a43c383-1111-1111-1111-111111111111"] = 26.2
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(-10.7))
+        self.assertIn("出线 26.2米", text)
+
+    def test_handheld_gear_produces_empty_line(self) -> None:
+        # 不挂槽位 -> _gear_slot_text 返回 "" -> 行空（手持不显示）
+        self.session.slot_items.clear()
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertEqual(text, "")
 
 
 if __name__ == "__main__":

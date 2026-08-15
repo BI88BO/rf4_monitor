@@ -1554,7 +1554,10 @@ class RF4ChatBridge:
         if sub_cmd == profile.fight_step_sub_cmd:
             details = self._format_fish_move_payload(envelope.payload)
         elif sub_cmd == profile.fight_load_sub_cmd:
-            details = self._format_fight_load_payload(session, envelope.payload)
+            slim = self._format_fight_load_payload(session, envelope.payload)
+            if slim:
+                return "fish", slim
+            return None
         elif sub_cmd == profile.fight_pull_sub_cmd:
             details = self._format_fight_pull_payload(session, envelope.payload)
         elif sub_cmd == profile.fight_stage_sub_cmd:
@@ -2378,36 +2381,25 @@ class RF4ChatBridge:
 
     def _format_fight_load_payload(self, session: FlowSession, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
-        parts: List[str] = []
         gear = self._first_guid(summary)
-        if gear:
-            parts.append(f"钓组={self._short_id(gear)}")
-            meta = self._fish_meta_for_gear(session, gear)
-            if meta:
-                parts.append(f"鱼编号={self._short_id(meta.fish_setup_id)}")
-                fish_name = self._format_fish_name(meta.fish_key or "")
-                weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
-                parts.append(f"鱼={fish_name} 重量={weight}")
-        group = self._first_float_group(summary, minimum=4)
-        if group and len(group) >= 4:
-            parts.append(f"拉力方向={self._format_float_tuple((group[0], group[1], group[3]))}")
-            parts.append(f"负载={self._format_float(group[2])}")
-        elif group and len(group) >= 3:
-            parts.append(f"向量={self._format_float_tuple(group[:3])}")
-        # 搏鱼加载采样：额外列出所有浮点组，便于对照鱼的力量/体力系数。
+        if not gear:
+            return ""
+        gear_slot = self._gear_slot_text(session, gear)
+        if not gear_slot:
+            # 手持装备(不在快捷键槽位)不显示搏鱼状态。
+            return ""
         groups = self._scan_float_groups(payload, limit=8)
-        distance = self._fight_distance(groups)
-        for index, extra in enumerate(groups):
-            if extra == group:
-                continue
-            parts.append(f"浮点{index + 1}={self._format_float_tuple(extra)}")
+        stamina = self._fight_stamina(groups)
+        distance = self._sanitize_distance(
+            self._fight_distance(groups),
+            session.fight_distance_by_gear.get(gear),
+        )
+        parts = [gear_slot]
+        if stamina is not None:
+            parts.append(f"体力 {stamina}%")
         if distance is not None:
-            parts.append(f"出线={self._format_float(distance)}米")
-        tick = self._last_u32(summary)
-        if tick is not None:
-            parts.append(f"序号={tick}")
-        parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
-        return self._join_business_parts(parts, payload)
+            parts.append(f"出线 {self._format_float(distance)}米")
+        return " | ".join(parts)
 
     def _format_fight_pull_payload(self, session: FlowSession, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
