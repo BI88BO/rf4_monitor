@@ -49,6 +49,8 @@ RF4 Monitor 已确认搏鱼拉力消息(14/8)中：
 
 作为 fish 遥测输出，走 `_broadcast_telemetry(category="fish")`。
 
+**手持装备不显示**：竿号标识依赖 `_gear_slot_text(session, fishing_gear_id)`，该函数只识别快捷键槽位（1-7号杆）中的钓组，返回空串即手持装备。搏鱼行仅在 `gear_slot_text` 非空时广播，手持装备直接跳过。
+
 ### 4. rf4_overlay.pyw：搏鱼行就地刷新
 
 - `telemetry` 事件（category=fish）每 2 秒一条精简行
@@ -67,6 +69,7 @@ RF4 Monitor 已确认搏鱼拉力消息(14/8)中：
 - bridge 测试：fight_load 帧 → 精简行不含浮点组/拉力方向，含 体力/出线
 - bridge 测试：出线负值/超限帧被过滤，保持上一帧值
 - bridge 测试：fight_stage 帧 → 输出初始体力行（100%），含鱼名/重量
+- bridge 测试：手持装备（gear_slot_text 为空）→ 不广播搏鱼行
 - overlay 测试：投递含竿号的 telemetry 行 → 按竿号就地更新而非追加
 - overlay 测试：多竿行按 1、2、3 竿号顺序输出
 - 回归：现有 42 个测试保持通过
