@@ -336,5 +336,66 @@ class FightLoadSlimLineTests(unittest.TestCase):
         self.assertEqual(text, "")
 
 
+class FightLoadRecordDistanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+
+        self.pack_arg_header = pack_arg_header
+        self.pack_guid_marker = pack_guid_marker
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+            rf4_event_bridge_port=0,
+            rf4_show_fish=True,
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.session.slot_items[1] = self.gear
+        # 阻止遥测重复 emit，专注距离记录
+        self.bridge._log_telemetry = lambda cat, text: None
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _frame(self, distance: float) -> bytes:
+        payload = (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + struct.pack("<4f", 2.0, 2.0, 0.444, 9.221)
+            + struct.pack("<4f", 1.0, 69.09, 0.07, 5.1)
+            + struct.pack("<4f", 0.04, 7.1, 3.9, 0.0)
+            + struct.pack("<4f", 0.0, 0.0, 1.0, distance)
+            + struct.pack("<4f", 0.0, 12.5, 2.0, 555.0)
+        )
+        return build_request_envelope(
+            call_id=10,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=self.session.profile.fight_load_sub_cmd,
+            payload=payload,
+        )
+
+    def test_glitch_distance_not_recorded(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._frame(-10.7))
+        self.assertIsNone(self.session.fight_distance_by_gear.get(self.gear))
+
+    def test_valid_distance_recorded(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._frame(26.2))
+        self.assertAlmostEqual(self.session.fight_distance_by_gear.get(self.gear), 26.2, places=1)
+
+    def test_glitch_keeps_last_valid(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._frame(26.2))
+        self.bridge._handle_client_frame(self.session, self._frame(-10.7))
+        self.assertAlmostEqual(self.session.fight_distance_by_gear.get(self.gear), 26.2, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

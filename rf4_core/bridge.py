@@ -2844,11 +2844,14 @@ class RF4ChatBridge:
                         f"sub={envelope.sub_cmd}"
                     )
 
-        # 搏鱼拉力(14/8)：记录该钓组当前出线距离，供拉线动作/搏鱼关联展示。
+        # 搏鱼拉力(14/8)：记录该钓组当前出线距离(过滤瞬时负值/超限)，供拉线动作/搏鱼关联展示。
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
         if fight_load and fight_load.fishing_gear_id:
             groups = self._scan_float_groups(envelope.payload, limit=8)
-            distance = self._fight_distance(groups)
+            distance = self._sanitize_distance(
+                self._fight_distance(groups),
+                session.fight_distance_by_gear.get(fight_load.fishing_gear_id),
+            )
             if distance is not None:
                 session.fight_distance_by_gear[fight_load.fishing_gear_id] = distance
             if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
