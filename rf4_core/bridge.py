@@ -1561,7 +1561,10 @@ class RF4ChatBridge:
         elif sub_cmd == profile.fight_pull_sub_cmd:
             details = self._format_fight_pull_payload(session, envelope.payload)
         elif sub_cmd == profile.fight_stage_sub_cmd:
-            details = self._format_fight_stage_payload(envelope.payload)
+            slim = self._format_fight_stage_initial_line(session, envelope)
+            if slim:
+                return "fish", slim
+            return None
         elif sub_cmd == profile.contact_left_sub_cmd:
             details = self._format_contact_left_payload(envelope.payload)
         else:
@@ -2423,22 +2426,6 @@ class RF4ChatBridge:
         parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
         return self._join_business_parts(parts, payload)
 
-    def _format_fight_stage_payload(self, payload: bytes) -> str:
-        summary = self._summarize_business_payload(payload)
-        parts: List[str] = []
-        if len(summary.guids) >= 1:
-            parts.append(f"钓组={self._short_id(summary.guids[0])}")
-        if len(summary.guids) >= 2:
-            parts.append(f"鱼编号={self._short_id(summary.guids[1])}")
-        group = self._first_float_group(summary, minimum=3)
-        if group and len(group) >= 3:
-            parts.append(f"状态值={self._format_float_tuple(group[:4])}")
-        tick = self._last_u32(summary)
-        if tick is not None:
-            parts.append(f"序号={tick}")
-        parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
-        return self._join_business_parts(parts, payload)
-
     def _format_contact_left_payload(self, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
         parts: List[str] = []
@@ -2453,6 +2440,34 @@ class RF4ChatBridge:
             parts.append(f"状态值={self._format_float_tuple(group[:4])}")
         parts.extend(self._format_summary_tail(summary, include_guids=False, include_u32=False, include_float_groups=False))
         return self._join_business_parts(parts, payload)
+
+    def _format_fight_stage_initial_line(self, session: FlowSession, envelope: RpcEnvelope) -> Optional[str]:
+        """进入搏鱼阶段(14/11)的初始浮窗行：竿号 + 鱼名/重量 + 体力 100% + 初始出线。"""
+        fight_stage = parse_fishing_gear_and_setup(
+            envelope, session.profile, session.profile.fight_stage_sub_cmd
+        )
+        if not fight_stage or not fight_stage.fishing_gear_id:
+            return None
+        gear_slot = self._gear_slot_text(session, fight_stage.fishing_gear_id)
+        if not gear_slot:
+            return None
+        meta = session.fish_setup_cache.get(fight_stage.fish_setup_id or "") if fight_stage.fish_setup_id else None
+        fish_name = self._format_fish_name(meta.fish_key or "") if meta else ""
+        weight = self._format_chat_weight(meta.weight_hint_raw) if meta and meta.weight_hint_raw else ""
+        initial_distance = None
+        for group in self._scan_float_groups(envelope.payload, limit=8):
+            if group and self._is_valid_distance(group[0]):
+                initial_distance = group[0]
+                break
+        parts = [gear_slot]
+        if fish_name:
+            parts.append(f"鱼={fish_name}")
+        if weight:
+            parts.append(f"重量={weight}")
+        parts.append("体力 100%")
+        if initial_distance is not None:
+            parts.append(f"出线 {self._format_float(initial_distance)}米")
+        return " | ".join(parts)
 
     def _format_generic_business_payload(self, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)

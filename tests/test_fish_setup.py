@@ -397,5 +397,72 @@ class FightLoadRecordDistanceTests(unittest.TestCase):
         self.assertAlmostEqual(self.session.fight_distance_by_gear.get(self.gear), 26.2, places=1)
 
 
+class FightStageInitialLineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+        from rf4_core.protocol import FishSetupMeta
+
+        self.pack_arg_header = pack_arg_header
+        self.pack_guid_marker = pack_guid_marker
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+        self.setup_id = "72121a20-1111-1111-1111-111111111111"
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+            rf4_event_bridge_port=0,
+            rf4_show_fish=True,
+            rf4_avatar_url="",
+            rf4_sender_level=1,
+            rf4_sender_region="",
+            rf4_sender_class="",
+            rf4_sender_badge="",
+            rf4_show_bitten=True,
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.session.slot_items[1] = self.gear
+        self.session.fish_setup_cache[self.setup_id] = FishSetupMeta(
+            fish_setup_id=self.setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+        )
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _frame(self) -> bytes:
+        payload = (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + self.pack_guid_marker(self.setup_id)
+            + struct.pack("<4f", 34.16, 34.16, 0.195, 553.0)
+        )
+        return build_request_envelope(
+            call_id=10,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=self.session.profile.fight_stage_sub_cmd,
+            payload=payload,
+        )
+
+    def test_fight_stage_emits_initial_line_with_fish(self) -> None:
+        frame = self._frame()
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fish")
+        self.assertIn("1号杆", text)
+        self.assertIn("鱼=黑线鳕", text)
+        self.assertIn("重量=444 克", text)
+        self.assertIn("体力 100%", text)
+
+
 if __name__ == "__main__":
     unittest.main()
