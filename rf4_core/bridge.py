@@ -2402,7 +2402,9 @@ class RF4ChatBridge:
             parts.append(f"体力 {stamina}%")
         if distance is not None:
             parts.append(f"出线 {self._format_float(distance)}米")
-        return " | ".join(parts)
+        if len(parts) == 1:
+            return parts[0]
+        return parts[0] + " | " + " ".join(parts[1:])
 
     def _format_fight_pull_payload(self, session: FlowSession, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
@@ -2467,7 +2469,9 @@ class RF4ChatBridge:
         parts.append("体力 100%")
         if initial_distance is not None:
             parts.append(f"出线 {self._format_float(initial_distance)}米")
-        return " | ".join(parts)
+        if len(parts) == 1:
+            return parts[0]
+        return parts[0] + " | " + " ".join(parts[1:])
 
     def _format_generic_business_payload(self, payload: bytes) -> str:
         summary = self._summarize_business_payload(payload)
