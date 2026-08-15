@@ -238,5 +238,40 @@ class FightPullAssociationTests(unittest.TestCase):
             bridge_mod.ctx = prev_ctx
 
 
+class FightStaminaHelpersTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.bridge = RF4ChatBridge.__new__(RF4ChatBridge)
+
+    def test_stamina_percent_from_second_group(self) -> None:
+        groups = ((2.0, 2.0, 0.444, 9.221), (1.0, 69.09, 0.07, 5.1), (0.0, 0.0, 1.0, 26.2))
+        self.assertEqual(self.bridge._fight_stamina(groups), 100)
+
+    def test_stamina_percent_half(self) -> None:
+        groups = ((0.0, 0.0, 0.0, 0.0), (0.55, 0.0, 0.0, 0.0))
+        self.assertEqual(self.bridge._fight_stamina(groups), 50)
+
+    def test_stamina_out_of_range_returns_none(self) -> None:
+        groups = ((0.0, 0.0, 0.0, 0.0), (2.0, 0.0, 0.0, 0.0))
+        self.assertIsNone(self.bridge._fight_stamina(groups))
+
+    def test_stamina_missing_second_group_returns_none(self) -> None:
+        self.assertIsNone(self.bridge._fight_stamina((((2.0, 2.0),),)))
+
+    def test_distance_validation(self) -> None:
+        self.assertTrue(self.bridge._is_valid_distance(26.2))
+        self.assertTrue(self.bridge._is_valid_distance(88.0))
+        self.assertFalse(self.bridge._is_valid_distance(0.0))
+        self.assertFalse(self.bridge._is_valid_distance(-10.7))
+        self.assertFalse(self.bridge._is_valid_distance(float("nan")))
+
+    def test_sanitize_distance_falls_back_to_last(self) -> None:
+        self.assertEqual(self.bridge._sanitize_distance(-10.7, 26.2), 26.2)
+        self.assertEqual(self.bridge._sanitize_distance(12.3, 26.2), 12.3)
+        self.assertEqual(self.bridge._sanitize_distance(None, 26.2), 26.2)
+        self.assertIsNone(self.bridge._sanitize_distance(-1.0, None))
+
+
 if __name__ == "__main__":
     unittest.main()

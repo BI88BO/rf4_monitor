@@ -2608,11 +2608,34 @@ class RF4ChatBridge:
     @staticmethod
     def _fight_distance(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
         # 推断：搏鱼拉力消息中形如 (0, 0, 1, X) 的浮点组，X 为鱼到玩家的出线距离（米）。
-        # 实测 67 条鱼 520 个采样，X 从未超过 40（出线上限），收竿时收敛到 ~2 米，故判定为距离而非体力。
+        # 实测 67 条鱼 520 个采样，X 收竿时收敛到 ~2 米，故判定为距离而非体力。出线无上限。
         for group in groups:
             if len(group) >= 4 and abs(group[0]) < 0.001 and abs(group[1]) < 0.001 and abs(group[2] - 1.0) < 0.001:
                 return group[3]
         return None
+
+    @staticmethod
+    def _fight_stamina(groups: Tuple[Tuple[float, ...], ...]) -> Optional[int]:
+        # 实测确认：搏鱼拉力帧浮点组第 2 组首位为鱼体力(1.0 满, 0.1 力竭)。
+        # 转百分比 (v-0.1)/0.9*100 并钳制 0~100；越界(非体力)返回 None。
+        if len(groups) < 2 or not groups[1]:
+            return None
+        stamina = groups[1][0]
+        if not (0.05 <= stamina <= 1.05):
+            return None
+        percent = (stamina - 0.1) / 0.9 * 100
+        return int(max(0, min(100, round(percent))))
+
+    @staticmethod
+    def _is_valid_distance(value: float) -> bool:
+        # 出线无上限；0/负值为搏鱼起始阶段的瞬时抖动，NaN 为解析失败，应过滤。
+        return not (value != value) and value > 0
+
+    @staticmethod
+    def _sanitize_distance(value: Optional[float], last: Optional[float]) -> Optional[float]:
+        if value is not None and RF4ChatBridge._is_valid_distance(value):
+            return value
+        return last
 
     @staticmethod
     def _format_arg_prefix(summary: BusinessPayloadSummary) -> List[str]:
