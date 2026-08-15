@@ -156,7 +156,7 @@ class FlowSession:
     fish_setup_cache: Dict[str, FishSetupMeta] = field(default_factory=lambda: BoundedDict(1024))
     fish_setup_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
     fight_fish_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
-    fight_stamina_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
+    fight_distance_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
     fishing_end_requests: Dict[int, FishingEndRequest] = field(default_factory=lambda: BoundedDict(128))
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
@@ -2396,13 +2396,13 @@ class RF4ChatBridge:
             parts.append(f"向量={self._format_float_tuple(group[:3])}")
         # 搏鱼加载采样：额外列出所有浮点组，便于对照鱼的力量/体力系数。
         groups = self._scan_float_groups(payload, limit=8)
-        stamina = self._fight_stamina(groups)
+        distance = self._fight_distance(groups)
         for index, extra in enumerate(groups):
             if extra == group:
                 continue
             parts.append(f"浮点{index + 1}={self._format_float_tuple(extra)}")
-        if stamina is not None:
-            parts.append(f"体力={self._format_float(stamina)}")
+        if distance is not None:
+            parts.append(f"出线={self._format_float(distance)}米")
         tick = self._last_u32(summary)
         if tick is not None:
             parts.append(f"序号={tick}")
@@ -2422,9 +2422,9 @@ class RF4ChatBridge:
                 fish_name = self._format_fish_name(meta.fish_key or "")
                 weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
                 parts.append(f"鱼={fish_name} 重量={weight}")
-            stamina = session.fight_stamina_by_gear.get(gear)
-            if stamina is not None:
-                parts.append(f"体力={self._format_float(stamina)}")
+            distance = session.fight_distance_by_gear.get(gear)
+            if distance is not None:
+                parts.append(f"出线={self._format_float(distance)}米")
         tick = self._last_u32(summary)
         if tick is not None:
             parts.append(f"序号={tick}")
@@ -2606,8 +2606,9 @@ class RF4ChatBridge:
         return all(abs(a - b) < 0.0001 for a, b in zip(left, right))
 
     @staticmethod
-    def _fight_stamina(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
-        # 实测确认：搏鱼拉力消息中形如 (0, 0, 1, X) 的浮点组，X 随搏鱼递减到约 0 后结算。
+    def _fight_distance(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
+        # 推断：搏鱼拉力消息中形如 (0, 0, 1, X) 的浮点组，X 为鱼到玩家的出线距离（米）。
+        # 实测 67 条鱼 520 个采样，X 从未超过 40（出线上限），收竿时收敛到 ~2 米，故判定为距离而非体力。
         for group in groups:
             if len(group) >= 4 and abs(group[0]) < 0.001 and abs(group[1]) < 0.001 and abs(group[2] - 1.0) < 0.001:
                 return group[3]
@@ -2828,17 +2829,17 @@ class RF4ChatBridge:
                         f"sub={envelope.sub_cmd}"
                     )
 
-        # 搏鱼拉力(14/8)：记录该钓组当前鱼体力，供拉线动作/搏鱼关联展示。
+        # 搏鱼拉力(14/8)：记录该钓组当前出线距离，供拉线动作/搏鱼关联展示。
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
         if fight_load and fight_load.fishing_gear_id:
             groups = self._scan_float_groups(envelope.payload, limit=8)
-            stamina = self._fight_stamina(groups)
-            if stamina is not None:
-                session.fight_stamina_by_gear[fight_load.fishing_gear_id] = stamina
+            distance = self._fight_distance(groups)
+            if distance is not None:
+                session.fight_distance_by_gear[fight_load.fishing_gear_id] = distance
             if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
                 self._log(
                     f"fight_load 钓组={self._short_id(fight_load.fishing_gear_id)} "
-                    f"体力={self._format_float(stamina) if stamina is not None else '?'} "
+                    f"出线={self._format_float(distance) if distance is not None else '?'}米 "
                     f"hex={self._hex_preview(envelope.payload, limit=160)}"
                 )
             return plain_body, []

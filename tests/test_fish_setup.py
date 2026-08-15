@@ -221,7 +221,7 @@ class FightPullAssociationTests(unittest.TestCase):
             )
             session.fish_setup_by_gear[gear_id] = setup_id
             session.fight_fish_by_gear[gear_id] = setup_id
-            session.fight_stamina_by_gear[gear_id] = 30.9
+            session.fight_distance_by_gear[gear_id] = 30.9
             payload = (
                 pack_arg_header(b"507", 3)
                 + pack_guid_marker(gear_id)
@@ -232,7 +232,7 @@ class FightPullAssociationTests(unittest.TestCase):
             self.assertIn("鱼编号=72121a20", text)
             self.assertIn("鱼=黑线鳕", text)
             self.assertIn("重量=4.585 公斤", text)
-            self.assertIn("体力=30.9", text)
+            self.assertIn("出线=30.9米", text)
             self.assertIn("序号=353", text)
         finally:
             bridge_mod.ctx = prev_ctx
