@@ -124,5 +124,17 @@ class OverlayFightStatusTests(unittest.TestCase):
         self.assertEqual(keys, ["1号杆", "2号杆", "3号杆"])
 
 
+class OverlayFightColorTests(unittest.TestCase):
+    def test_exhausted_fight_row_is_red(self) -> None:
+        ov = object.__new__(Overlay)
+        row = "1号杆 | 体力 0% 出线 2.1米"
+        self.assertEqual(Overlay._fight_row_color(row, "#ffd166"), "#ff5252")
+
+    def test_active_fight_row_uses_default_color(self) -> None:
+        ov = object.__new__(Overlay)
+        row = "1号杆 | 体力 78% 出线 12.3米"
+        self.assertEqual(Overlay._fight_row_color(row, "#ffd166"), "#ffd166")
+
+
 if __name__ == "__main__":
     unittest.main()

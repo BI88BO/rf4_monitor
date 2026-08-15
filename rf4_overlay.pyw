@@ -254,6 +254,14 @@ class Overlay:
             return (0, int(match.group(1)))
         return (1, 0)
 
+    @staticmethod
+    def _fight_row_color(text: str, default: str) -> str:
+        # 体力 ≤ 0 表示鱼已力竭，行文字变红；其余用默认前景色。
+        match = re.search(r"体力\s*(\d+)%", text)
+        if match and int(match.group(1)) <= 0:
+            return "#ff5252"
+        return default
+
     def _show_telemetry(self, text):
         # 遥测信息独立成区：新消息追加，不覆盖旧的；超限时丢弃最旧。
         self._telemetry_seq += 1
@@ -279,6 +287,14 @@ class Overlay:
             lines = ["RF4 来鱼提醒 · 待机中"]
         display = "\n".join(lines)
         self.label.config(text=display)
+        # 体力 ≤ 0(鱼力竭)时整窗变红提示，与 _show_anticheat 同模式。
+        exhausted = any(
+            Overlay._fight_row_color(text, self._STYLE_PARAMS[self.style]["fg"]) == "#ff5252"
+            for text in lines
+        )
+        self.label.config(
+            fg="#ff5252" if exhausted else self._STYLE_PARAMS[self.style]["fg"]
+        )
         # 按内容实际需求高度调整窗口，避免多杆/换行时内容被裁切
         need_h = self._content_height(lines)
         x = self.root.winfo_x()
