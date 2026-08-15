@@ -6,6 +6,7 @@
 import json
 import math
 import queue
+import re
 import socket
 import sys
 import threading
@@ -245,6 +246,14 @@ class Overlay:
                 self._rows.pop("", None)
             self._refresh_display()
 
+    @staticmethod
+    def _rod_sort_key(slot: str) -> tuple:
+        # 竿号按数字排序(1号杆→2号杆→3号杆)；非竿号行排最后。
+        match = re.match(r"^(\d+)号杆$", slot or "")
+        if match:
+            return (0, int(match.group(1)))
+        return (1, 0)
+
     def _show_telemetry(self, text):
         # 遥测信息独立成区：新消息追加，不覆盖旧的；超限时丢弃最旧。
         self._telemetry_seq += 1
@@ -263,7 +272,7 @@ class Overlay:
 
     def _refresh_display(self):
         # 简单分行：所有行(鱼事件按竿号 + 遥测/频道/聊天)按序拼接；无内容回待机。
-        lines = list(self._rows.values())
+        lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         for seq, text in self._telemetry_rows.items():
             lines.append(text)
         if not lines:
@@ -365,7 +374,12 @@ class Overlay:
         elif name in ("fish_catch", "chat"):
             self._show_generic(text)
         elif name == "telemetry":
-            if text:
+            if not text:
+                return
+            match = re.match(r"^(\d+)号杆 ", text)
+            if match:
+                self._update_row(f"{match.group(1)}号杆", text)
+            else:
                 self._show_generic(text)
         elif name == "anticheat":
             self._show_anticheat(text)

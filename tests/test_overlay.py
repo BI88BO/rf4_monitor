@@ -91,5 +91,38 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
         self.assertEqual(ov.calls, [])
 
 
+class OverlayFightStatusTests(unittest.TestCase):
+    def _overlay(self) -> Overlay:
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._telemetry_seq = 0
+        ov._update_row = Overlay._update_row.__get__(ov)
+        ov._refresh_display = lambda: None
+        return ov
+
+    def test_rod_prefixed_telemetry_updates_row_in_place(self) -> None:
+        ov = self._overlay()
+        payload = json.dumps(
+            {"event": "telemetry", "category": "fish", "text": "3号杆 | 体力 78% 出线 12.3米"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("3号杆"), "3号杆 | 体力 78% 出线 12.3米")
+
+    def test_plain_telemetry_goes_to_generic(self) -> None:
+        ov = self._overlay()
+        ov._show_generic = lambda text: ov._rows.__setitem__("generic", text)
+        ov._handle_datagram(b'{"event":"telemetry","category":"player","text":"x=1"}')
+        self.assertEqual(ov._rows.get("generic"), "x=1")
+        self.assertNotIn("3号杆", ov._rows)
+
+    def test_rod_sort_order(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._rows = {"3号杆": "c", "1号杆": "a", "2号杆": "b"}
+        keys = sorted(ov._rows, key=Overlay._rod_sort_key)
+        self.assertEqual(keys, ["1号杆", "2号杆", "3号杆"])
+
+
 if __name__ == "__main__":
     unittest.main()
