@@ -4,6 +4,8 @@ import copy
 import ipaddress
 import os
 import queue
+import socket
+import struct
 import sys
 import threading
 import time
@@ -95,6 +97,83 @@ class CapturedTcpPacket:
     seq: int
     payload: bytes
     flags: int
+
+
+def _parse_raw_eth_tcp_packet(raw: bytes) -> Optional[CapturedTcpPacket]:
+    """Parse an Ethernet-framed IPv4/IPv6 TCP packet without Scapy overhead.
+
+    Npcap delivers raw Ethernet frames; Scapy's ``sniff`` wraps every frame in
+    full Packet objects which are slow to construct at high packet rates.  This
+    lightweight parser extracts exactly the fields ``PacketObserver`` needs and
+    mirrors ``_windivert_packet_to_capture`` so the capture path stays fast.
+    """
+    if len(raw) < 14:
+        return None
+    ethertype = (raw[12] << 8) | raw[13]
+    if ethertype == 0x0800:
+        return _parse_ipv4_tcp_packet(raw[14:])
+    if ethertype == 0x86DD:
+        return _parse_ipv6_tcp_packet(raw[14:])
+    return None
+
+
+def _parse_ipv4_tcp_packet(data: bytes) -> Optional[CapturedTcpPacket]:
+    if len(data) < 20:
+        return None
+    ihl = (data[0] & 0x0F) * 4
+    if ihl < 20 or len(data) < ihl + 20:
+        return None
+    protocol = data[9]
+    if protocol != 6:
+        return None
+    src = socket.inet_ntoa(data[12:16])
+    dst = socket.inet_ntoa(data[16:20])
+    tcp = data[ihl:]
+    if len(tcp) < 20:
+        return None
+    sport, dport, seq = struct.unpack("!HHI", tcp[:8])
+    offset = ((tcp[12] >> 4) & 0x0F) * 4
+    if offset < 20 or len(tcp) < offset:
+        return None
+    flags = tcp[13]
+    payload = tcp[offset:]
+    return CapturedTcpPacket(
+        src=src,
+        sport=sport,
+        dst=dst,
+        dport=dport,
+        seq=seq,
+        payload=payload,
+        flags=flags,
+    )
+
+
+def _parse_ipv6_tcp_packet(data: bytes) -> Optional[CapturedTcpPacket]:
+    if len(data) < 40:
+        return None
+    next_header = data[6]
+    if next_header != 6:
+        return None
+    src = socket.inet_ntop(socket.AF_INET6, data[8:24])
+    dst = socket.inet_ntop(socket.AF_INET6, data[24:40])
+    tcp = data[40:]
+    if len(tcp) < 20:
+        return None
+    sport, dport, seq = struct.unpack("!HHI", tcp[:8])
+    offset = ((tcp[12] >> 4) & 0x0F) * 4
+    if offset < 20 or len(tcp) < offset:
+        return None
+    flags = tcp[13]
+    payload = tcp[offset:]
+    return CapturedTcpPacket(
+        src=src,
+        sport=sport,
+        dst=dst,
+        dport=dport,
+        seq=seq,
+        payload=payload,
+        flags=flags,
+    )
 
 
 def _print_line(category: str, text: str) -> None:
@@ -275,6 +354,132 @@ class _PcapStat(ctypes.Structure):
         ("ps_drop", ctypes.c_uint),
         ("ps_ifdrop", ctypes.c_uint),
     ]
+
+
+class NpcapRawCaptor:
+    """Low-overhead Npcap reader bypassing Scapy's full Packet construction.
+
+    Scapy 2.7.0's ``_PcapWrapper_libpcap`` sets snaplen/promisc/timeout but
+    never calls ``pcap_set_buffer_size``, so ``conf.bufsize`` (our advertised
+    64MB) never reaches the kernel and the default small NPF buffer overflows
+    during traffic bursts, dropping the game's downlink segments.  This captor
+    drives the WinPcap/Npcap C API directly: a real kernel buffer plus raw
+    Ethernet frames parsed by ``_parse_raw_eth_tcp_packet`` instead of Scapy
+    Packet objects.
+    """
+
+    def __init__(self, *, buffer_mb: int = 64, snaplen: int = 262144) -> None:
+        self.buffer_mb = buffer_mb
+        self.snaplen = snaplen
+        self._handle = None
+
+    def open(self, device_name: str, *, packet_filter: str = "tcp") -> None:
+        from scapy.libs.winpcapy import (
+            pcap_activate,
+            pcap_create,
+            pcap_set_buffer_size,
+            pcap_set_promisc,
+            pcap_set_snaplen,
+            pcap_set_timeout,
+        )
+
+        errbuf = ctypes.create_string_buffer(256)
+        handle = pcap_create(device_name.encode("utf8"), errbuf)
+        if not handle:
+            raise OSError(self._err_text(errbuf))
+
+        def _set(fn, value):
+            rc = int(fn(handle, value))
+            if rc != 0:
+                raise OSError(f"{fn.__name__} rc={rc}")
+
+        _set(pcap_set_snaplen, self.snaplen)
+        _set(pcap_set_promisc, 0)
+        _set(pcap_set_timeout, 100)
+        if self.buffer_mb > 0:
+            _set(pcap_set_buffer_size, self.buffer_mb * 1024 * 1024)
+        status = int(pcap_activate(handle))
+        if status < 0:
+            raise OSError(f"pcap_activate rc={status}")
+        if packet_filter:
+            self._apply_filter(handle, packet_filter)
+        self._handle = handle
+        PcapDropMonitor.instance().register(handle)
+        from scapy.libs.winpcapy import pcap_setmintocopy
+
+        try:
+            pcap_setmintocopy(handle, 0)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _call(fn, *args) -> int:
+        return int(fn(*args))
+
+    @staticmethod
+    def _err_text(errbuf) -> str:
+        try:
+            return bytes(errbuf).split(b"\x00")[0].decode("utf8", errors="replace")
+        except Exception:
+            return "unknown error"
+
+    def _apply_filter(self, handle, packet_filter: str) -> None:
+        from scapy.libs.winpcapy import bpf_program, pcap_compile, pcap_setfilter
+
+        netmask = 0xFFFFFFFF
+        program = bpf_program()
+        rc = pcap_compile(handle, program, packet_filter.encode("utf8"), 1, netmask)
+        if rc != 0:
+            raise OSError("pcap_compile failed: filter not supported")
+        try:
+            rc = pcap_setfilter(handle, ctypes.byref(program))
+        finally:
+            self._free_bpf(program)
+        if rc != 0:
+            raise OSError("pcap_setfilter failed")
+
+    @staticmethod
+    def _free_bpf(program) -> None:
+        from scapy.libs.winpcapy import pcap_freecode
+
+        try:
+            pcap_freecode(ctypes.byref(program))
+        except Exception:
+            pass
+
+    def recv_loop(self, handler) -> None:
+        from scapy.libs.winpcapy import pcap_next_ex, pcap_pkthdr
+
+        pkt_header = ctypes.POINTER(pcap_pkthdr)()
+        pkt_data = ctypes.POINTER(ctypes.c_ubyte)()
+        while self._handle is not None:
+            rc = pcap_next_ex(
+                self._handle,
+                ctypes.byref(pkt_header),
+                ctypes.byref(pkt_data),
+            )
+            if rc == 1:
+                size = int(pkt_header.contents.caplen)
+                if size:
+                    raw = ctypes.string_at(pkt_data, size)
+                    packet = _parse_raw_eth_tcp_packet(raw)
+                    if packet is not None:
+                        handler(packet)
+            elif rc == 0:
+                time.sleep(0.0005)
+            else:
+                return
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        from scapy.libs.winpcapy import pcap_close
+
+        try:
+            pcap_close(handle)
+        except Exception:
+            pass
 
 
 def _install_pcap_stats_hook() -> None:
@@ -1349,6 +1554,77 @@ def _run_dynamic_windows_capture(
         return 0
 
 
+def _run_npcap_raw_capture(
+    *,
+    observer: PacketObserver,
+    initial_interfaces,
+    packet_filter: str,
+    queue_size: int,
+    buffer_mb: int,
+) -> int:
+    """Capture Npcap traffic via the low-overhead raw reader.
+
+    Scapy's ``sniff`` constructs a full Packet per frame; on a busy WLAN the
+    per-packet cost plus Scapy's failure to set a real kernel buffer
+    (``pcap_set_buffer_size`` is never called by Scapy 2.7.0) lets the NPF
+    buffer overflow and drops the game's downlink.  This path opens each
+    interface with a real kernel buffer and parses raw Ethernet frames.
+    """
+    dispatcher = PacketDispatcher(observer, queue_size)
+
+    def start_captor(interface, *, label: str) -> None:
+        device_name = str(getattr(interface, "network_name", None) or interface)
+        captor = NpcapRawCaptor(buffer_mb=buffer_mb)
+        try:
+            captor.open(device_name, packet_filter=packet_filter)
+        except Exception as exc:
+            _print_line(
+                "error",
+                f"接口抓包已停止 | 接口={label} | 原因={exc}",
+            )
+            return
+        captor.recv_loop(dispatcher.submit)
+        captor.close()
+
+    initial_keys = {_interface_identity(item) for item in _interface_list(initial_interfaces)}
+    workers: dict[str, threading.Thread] = {}
+
+    def spawn(interface) -> None:
+        identity = _interface_identity(interface)
+        if identity in workers and workers[identity].is_alive():
+            return
+        label = _interface_label(interface)
+        worker = threading.Thread(
+            target=start_captor,
+            args=(interface,),
+            kwargs={"label": label},
+            name=f"rf4-capture-{len(workers) + 1}",
+            daemon=True,
+        )
+        workers[identity] = worker
+        worker.start()
+        if identity not in initial_keys:
+            _print_line("status", f"自动加入新抓包接口 | 接口={label}")
+
+    for interface in _interface_list(initial_interfaces):
+        spawn(interface)
+
+    try:
+        while True:
+            try:
+                interfaces, _ = _select_live_interfaces("")
+            except Exception as exc:
+                _print_line("warning", f"刷新抓包接口失败，稍后自动重试 | 原因={exc}")
+                time.sleep(DYNAMIC_INTERFACE_SCAN_SECONDS)
+                continue
+            for interface in _interface_list(interfaces):
+                spawn(interface)
+            time.sleep(DYNAMIC_INTERFACE_SCAN_SECONDS)
+    except KeyboardInterrupt:
+        _print_line("status", "抓包已停止")
+        return 0
+
+
 def _windivert_filter(realtime_host: str, realtime_port: int) -> str:
     conditions = [
         "tcp",
@@ -1669,17 +1945,23 @@ def run_capture(args, *, default_port: int = 0) -> int:
     if (
         not args.pcap_file
         and sys.platform == "win32"
-        and not args.capture_interface
     ):
-        return _run_dynamic_windows_capture(
-            sniff=sniff,
-            observer=observer,
-            initial_interfaces=selected_interfaces,
-            packet_filter=packet_filter,
-            queue_size=args.capture_queue_size,
-            promiscuous=args.capture_promiscuous,
-            buffer_mb=args.capture_buffer_mb,
-        )
+        # 使用原生 Npcap 读取路径（真实内核缓冲 + 原始以太网帧解析），避免
+        # Scapy sniff 的整包构造开销和无效的 conf.bufsize。若 Npcap 初始化
+        # 失败则回退 Scapy sniff（兼容 Npcap 未启用 WinPcap API 的情况）。
+        try:
+            return _run_npcap_raw_capture(
+                observer=observer,
+                initial_interfaces=selected_interfaces,
+                packet_filter=packet_filter,
+                queue_size=args.capture_queue_size,
+                buffer_mb=args.capture_buffer_mb,
+            )
+        except Exception as exc:
+            _print_line(
+                "warning",
+                f"Npcap 原生抓包不可用，回退 Scapy sniff | 原因={exc}",
+            )
 
     dispatcher = None
     packet_handler = observer.handle_packet
