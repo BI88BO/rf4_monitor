@@ -110,6 +110,27 @@ class OverlayFightStatusTests(unittest.TestCase):
         ov._handle_datagram(payload.encode("utf-8"))
         self.assertEqual(ov._rows.get("3号杆"), "3号杆 | 体力 78% 出线 12.3米")
 
+    def test_fight_status_category_updates_rod_row(self) -> None:
+        # 三档拆分后搏鱼状态行走 fight_status 类别，仍按号杆前缀就地更新。
+        ov = self._overlay()
+        payload = json.dumps(
+            {"event": "telemetry", "category": "fight_status", "text": "1号杆 | 体力 100% 出线 33.486米"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("1号杆"), "1号杆 | 体力 100% 出线 33.486米")
+
+    def test_fight_details_goes_to_generic(self) -> None:
+        # fight_details 无号杆前缀，进遥测区通用显示。
+        ov = self._overlay()
+        ov._show_generic = lambda text: ov._rows.__setitem__("generic", text)
+        payload = json.dumps(
+            {"event": "telemetry", "category": "fight_details", "text": "钓鱼过程位置上报 | 钓组=abc123"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("generic"), "钓鱼过程位置上报 | 钓组=abc123")
+
     def test_plain_telemetry_goes_to_generic(self) -> None:
         ov = self._overlay()
         ov._show_generic = lambda text: ov._rows.__setitem__("generic", text)

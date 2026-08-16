@@ -672,6 +672,8 @@ class RF4ChatBridge:
         loader.add_option("rf4_show_escaped", bool, True, "Show self fish escaped events (脱钩).")
         loader.add_option("rf4_show_released", bool, True, "Show self fish released events (放生).")
         loader.add_option("rf4_show_fish", bool, True, "Show fish telemetry logs (搏鱼/来鱼过程).")
+        loader.add_option("rf4_show_fight_status", bool, True, "Show fight status line broadcast (搏鱼状态行).")
+        loader.add_option("rf4_show_fight_details", bool, True, "Show fight process detail telemetry (位置上报/拉线/脱钩).")
         loader.add_option("rf4_show_player", bool, True, "Show player telemetry logs (坐标/状态).")
         loader.add_option("rf4_show_feed", bool, True, "Show feed telemetry logs (打窝/投喂).")
         loader.add_option("rf4_show_chat", bool, True, "Show chat telemetry logs (公共聊天/频道鱼获).")
@@ -740,6 +742,8 @@ class RF4ChatBridge:
             "rf4_show_catch_broadcast": "catch_broadcast",
             "rf4_show_chat_broadcast": "chat_broadcast",
             "rf4_show_fish": "telemetry_fish",
+            "rf4_show_fight_status": "fight_status",
+            "rf4_show_fight_details": "fight_details",
             "rf4_show_player": "telemetry_player",
             "rf4_show_feed": "telemetry_feed",
             "rf4_show_chat": "telemetry_chat",
@@ -963,6 +967,8 @@ class RF4ChatBridge:
     def _telemetry_show_option(category: str) -> str:
         return {
             "fish": "rf4_show_fish",
+            "fight_status": "rf4_show_fight_status",
+            "fight_details": "rf4_show_fight_details",
             "player": "rf4_show_player",
             "feed": "rf4_show_feed",
             "chat": "rf4_show_chat",
@@ -1553,20 +1559,23 @@ class RF4ChatBridge:
             return None
         if sub_cmd == profile.fight_step_sub_cmd:
             details = self._format_fish_move_payload(envelope.payload)
+            return "fight_details", self._format_business_line(label, details)
         elif sub_cmd == profile.fight_load_sub_cmd:
             slim = self._format_fight_load_payload(session, envelope.payload)
             if slim:
-                return "fish", slim
+                return "fight_status", slim
             return None
         elif sub_cmd == profile.fight_pull_sub_cmd:
             details = self._format_fight_pull_payload(session, envelope.payload)
+            return "fight_details", self._format_business_line(label, details)
         elif sub_cmd == profile.fight_stage_sub_cmd:
             slim = self._format_fight_stage_initial_line(session, envelope)
             if slim:
-                return "fish", slim
+                return "fight_status", slim
             return None
         elif sub_cmd == profile.contact_left_sub_cmd:
             details = self._format_contact_left_payload(envelope.payload)
+            return "fight_details", self._format_business_line(label, details)
         else:
             details = self._format_generic_business_payload(envelope.payload)
         return "fish", self._format_business_line(label, details)

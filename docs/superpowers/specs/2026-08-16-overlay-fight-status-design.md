@@ -62,7 +62,9 @@ RF4 Monitor 已确认搏鱼拉力消息(14/8)中：
 
 ### 5. 开关与默认
 
-- 不新增配置项。跟随现有 `rf4_show_fish`（"遥测·钓鱼过程"）勾选。
+- 搏鱼状态行独立开关：`rf4_show_fight_status`（托盘短键 `fight_status`），默认开。
+- 走独立 `fight_status` 遥测类别，不再与 `rf4_show_fish`（"遥测·钓鱼过程"）捆绑。
+- 三档拆分详见 `2026-08-16-fight-telemetry-three-tier-display.md`。
 
 ## 测试
 

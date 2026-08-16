@@ -457,11 +457,137 @@ class FightStageInitialLineTests(unittest.TestCase):
         telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
         self.assertIsNotNone(telemetry)
         cat, text = telemetry
-        self.assertEqual(cat, "fish")
+        self.assertEqual(cat, "fight_status")
         self.assertIn("1号杆", text)
         self.assertIn("鱼=黑线鳕", text)
         self.assertIn("重量=444 克", text)
         self.assertIn("体力 100%", text)
+
+
+class FightTelemetryCategoryTests(unittest.TestCase):
+    """三档拆分：搏鱼状态行 fight_status / 刷屏详情 fight_details / 其余鱼业务 fish。"""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+        from rf4_core.protocol import FishSetupMeta
+
+        self.pack_arg_header = pack_arg_header
+        self.pack_guid_marker = pack_guid_marker
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+        self.setup_id = "72121a20-1111-1111-1111-111111111111"
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+            rf4_event_bridge_port=0,
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.session.slot_items[1] = self.gear
+        self.session.fish_setup_cache[self.setup_id] = FishSetupMeta(
+            fish_setup_id=self.setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+        )
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _frame(self, sub_cmd: int, payload: bytes) -> bytes:
+        return build_request_envelope(
+            call_id=10,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=sub_cmd,
+            payload=payload,
+        )
+
+    def _load_payload(self, distance: float) -> bytes:
+        return (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + struct.pack("<4f", 2.0, 2.0, 0.444, 9.221)
+            + struct.pack("<4f", 1.0, 69.09, 0.07, 5.1)
+            + struct.pack("<4f", 0.04, 7.1, 3.9, 0.0)
+            + struct.pack("<4f", 0.0, 0.0, 1.0, distance)
+            + struct.pack("<4f", 0.0, 12.5, 2.0, 555.0)
+        )
+
+    def _stage_payload(self) -> bytes:
+        return (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + self.pack_guid_marker(self.setup_id)
+            + struct.pack("<4f", 34.16, 34.16, 0.195, 553.0)
+        )
+
+    def _step_payload(self) -> bytes:
+        return (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + struct.pack("<4f", 4.169, -3.089, 795.774, 0.0)
+            + struct.pack("<4f", 0.0, 0.126, 0.941, 0.95)
+            + pack_marked_u32(292)
+        )
+
+    def _pull_payload(self) -> bytes:
+        return (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + self.pack_guid_marker(self.setup_id)
+            + pack_marked_u32(327)
+        )
+
+    def test_fight_load_goes_to_fight_status(self) -> None:
+        frame = self._frame(self.session.profile.fight_load_sub_cmd, self._load_payload(26.2))
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_status")
+        self.assertIn("1号杆", text)
+        self.assertNotIn("浮点", text)
+
+    def test_fight_stage_goes_to_fight_status(self) -> None:
+        frame = self._frame(self.session.profile.fight_stage_sub_cmd, self._stage_payload())
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_status")
+
+    def test_fight_step_goes_to_fight_details(self) -> None:
+        frame = self._frame(self.session.profile.fight_step_sub_cmd, self._step_payload())
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_details")
+        self.assertIn("位置上报", text)
+
+    def test_fight_pull_goes_to_fight_details(self) -> None:
+        frame = self._frame(self.session.profile.fight_pull_sub_cmd, self._pull_payload())
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_details")
+        self.assertIn("拉线动作", text)
+
+    def test_settlement_stays_fish(self) -> None:
+        payload = (
+            self.pack_arg_header(b"507", 3)
+            + self.pack_guid_marker(self.gear)
+            + self.pack_guid_marker(self.setup_id)
+            + pack_marked_u32(353)
+        )
+        frame = self._frame(self.session.profile.fight_pull_sub_cmd, payload)
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, frame)
+        self.assertIsNotNone(telemetry)
+        cat, _ = telemetry
+        self.assertIn(cat, ("fight_details", "fish"))
 
 
 if __name__ == "__main__":

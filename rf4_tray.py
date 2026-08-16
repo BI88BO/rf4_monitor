@@ -102,6 +102,8 @@ SHOW_ITEMS = [
     ("catch_broadcast", "频道鱼获（其他玩家）", "rf4_show_catch_broadcast"),
     ("chat_broadcast", "公共聊天", "rf4_show_chat_broadcast"),
     ("telemetry_fish", "遥测·钓鱼过程", "rf4_show_fish"),
+    ("fight_status", "搏鱼状态行", "rf4_show_fight_status"),
+    ("fight_details", "遥测·搏鱼过程(位置/拉线)", "rf4_show_fight_details"),
     ("telemetry_player", "遥测·玩家坐标/状态", "rf4_show_player"),
     ("telemetry_feed", "遥测·打窝/投喂", "rf4_show_feed"),
     ("telemetry_chat", "遥测·公共聊天", "rf4_show_chat"),

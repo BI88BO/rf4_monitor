@@ -182,5 +182,25 @@ class ConfigCacheDecryptTests(unittest.TestCase):
         return Path(tempfile.mkdtemp(prefix="rf4_test_"))
 
 
+class FightTelemetryOptionMappingTests(unittest.TestCase):
+    def test_fight_status_maps_to_dedicated_switch(self) -> None:
+        self.assertEqual(
+            RF4ChatBridge._telemetry_show_option("fight_status"), "rf4_show_fight_status"
+        )
+
+    def test_fight_details_maps_to_dedicated_switch(self) -> None:
+        self.assertEqual(
+            RF4ChatBridge._telemetry_show_option("fight_details"), "rf4_show_fight_details"
+        )
+
+    def test_fish_still_maps_to_fish_switch(self) -> None:
+        self.assertEqual(RF4ChatBridge._telemetry_show_option("fish"), "rf4_show_fish")
+
+    def test_option_name_to_key_mapping(self) -> None:
+        bridge = RF4ChatBridge()
+        self.assertEqual(bridge._option_name_to_key("rf4_show_fight_status"), "fight_status")
+        self.assertEqual(bridge._option_name_to_key("rf4_show_fight_details"), "fight_details")
+
+
 if __name__ == "__main__":
     unittest.main()
