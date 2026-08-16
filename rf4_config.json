@@ -3,7 +3,7 @@
   "profile": "4.0.24799",
   "capture": {
     "mode": "passive",
-    "backend": "windivert",
+    "backend": "auto",
     "host": "91.132.228.133;185.71.66.225;5.35.7.132;91.194.110.5",
     "port": 9341,
     "auto_detect_dynamic_port": true

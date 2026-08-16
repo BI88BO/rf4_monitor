@@ -2410,6 +2410,9 @@ class RF4ChatBridge:
         setup_id = session.fight_fish_by_gear.get(gear) or session.fish_setup_by_gear.get(gear)
         meta = session.fish_setup_cache.get(setup_id) if setup_id else None
         if meta:
+            grade = self._format_grade_enum(meta.setup_enum)
+            if grade:
+                parts.append(f"[{grade}]")
             fish_name = self._format_fish_name(meta.fish_key or "")
             weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
             if fish_name:
@@ -2480,6 +2483,9 @@ class RF4ChatBridge:
                 initial_distance = group[0]
                 break
         parts = [gear_slot]
+        grade = self._format_grade_enum(meta.setup_enum) if meta else None
+        if grade:
+            parts.append(f"[{grade}]")
         if fish_name:
             parts.append(f"鱼={fish_name}")
         if weight:

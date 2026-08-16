@@ -339,6 +339,53 @@ class FightLoadSlimLineTests(unittest.TestCase):
         self.assertIn("鱼=黑线鳕", text)
         self.assertIn("重量=444 克", text)
 
+    def test_slim_line_shows_grade_when_known(self) -> None:
+        from rf4_core.protocol import FishSetupMeta
+
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        setup_id = "72121a20-1111-1111-1111-111111111111"
+        self.session.fight_fish_by_gear[gear] = setup_id
+        self.session.fish_setup_cache[setup_id] = FishSetupMeta(
+            fish_setup_id=setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+            setup_enum=2,
+        )
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertIn("[达标]", text)
+        self.assertIn("鱼=黑线鳕", text)
+
+    def test_slim_line_omits_grade_when_unknown(self) -> None:
+        from rf4_core.protocol import FishSetupMeta
+
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        setup_id = "72121a20-1111-1111-1111-111111111111"
+        self.session.fight_fish_by_gear[gear] = setup_id
+        self.session.fish_setup_cache[setup_id] = FishSetupMeta(
+            fish_setup_id=setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+        )
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertNotIn("[达标]", text)
+        self.assertNotIn("[不达标]", text)
+
+    def test_slim_line_shows_rare_grades(self) -> None:
+        from rf4_core.protocol import FishSetupMeta
+
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        setup_id = "72121a20-1111-1111-1111-111111111111"
+        self.session.fight_fish_by_gear[gear] = setup_id
+        for enum, label in ((3, "稀有★"), (4, "超级稀有◆")):
+            self.session.fish_setup_cache[setup_id] = FishSetupMeta(
+                fish_setup_id=setup_id,
+                fish_key="piksha",
+                weight_hint_raw=444,
+                setup_enum=enum,
+            )
+            text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+            self.assertIn(f"[{label}]", text)
+
     def test_slim_line_omits_fish_when_unknown(self) -> None:
         text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
         self.assertNotIn("鱼=", text)
@@ -481,6 +528,22 @@ class FightStageInitialLineTests(unittest.TestCase):
         self.assertIn("鱼=黑线鳕", text)
         self.assertIn("重量=444 克", text)
         self.assertIn("体力 100%", text)
+
+    def test_fight_stage_initial_line_shows_grade(self) -> None:
+        from rf4_core.protocol import FishSetupMeta
+
+        self.session.fish_setup_cache[self.setup_id] = FishSetupMeta(
+            fish_setup_id=self.setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+            setup_enum=2,
+        )
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, self._frame())
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_status")
+        self.assertIn("[达标]", text)
+        self.assertIn("鱼=黑线鳕", text)
 
 
 class FightTelemetryCategoryTests(unittest.TestCase):
