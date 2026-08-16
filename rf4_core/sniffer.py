@@ -677,11 +677,12 @@ class PassiveSession:
             self.warned_tcp_gaps.add(direction)
             _print_line(
                 "warning",
-                f"{direction} TCP 抓包存在序号缺口，后续 RC4 无法继续解析"
+                f"{direction} TCP 抓包存在序号缺口，等待自动重同步恢复"
                 f" | 等待序号={reassembler.next_seq}"
                 f" 已见后续序号={reassembler.first_pending_seq()}"
                 f" 缓存={reassembler.pending_bytes}字节"
-                f" | 会话={self.session_id}",
+                f" | 会话={self.session_id}"
+                f" | 说明：小缺口将自动跳过并重同步 RC4，无需重连；若持续 45 秒未恢复才需重新登录",
             )
         if not chunk and reassembler.gap_age() >= TCP_GAP_RECOVERY_SECONDS:
             gap_bytes, chunk = self._recover_tcp_gap(
