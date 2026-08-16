@@ -2407,6 +2407,15 @@ class RF4ChatBridge:
             session.fight_distance_by_gear.get(gear),
         )
         parts = [gear_slot]
+        setup_id = session.fight_fish_by_gear.get(gear) or session.fish_setup_by_gear.get(gear)
+        meta = session.fish_setup_cache.get(setup_id) if setup_id else None
+        if meta:
+            fish_name = self._format_fish_name(meta.fish_key or "")
+            weight = self._format_chat_weight(meta.weight_hint_raw) if meta.weight_hint_raw else "unknown"
+            if fish_name:
+                parts.append(f"鱼={fish_name}")
+            if weight != "unknown":
+                parts.append(f"重量={weight}")
         if stamina is not None:
             parts.append(f"体力 {stamina}%")
         if distance is not None:

@@ -324,6 +324,25 @@ class FightLoadSlimLineTests(unittest.TestCase):
         self.assertNotIn("负载", text)
         self.assertNotIn("序号", text)
 
+    def test_slim_line_includes_fish_info(self) -> None:
+        from rf4_core.protocol import FishSetupMeta
+
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        setup_id = "72121a20-1111-1111-1111-111111111111"
+        self.session.fight_fish_by_gear[gear] = setup_id
+        self.session.fish_setup_cache[setup_id] = FishSetupMeta(
+            fish_setup_id=setup_id,
+            fish_key="piksha",
+            weight_hint_raw=444,
+        )
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertIn("鱼=黑线鳕", text)
+        self.assertIn("重量=444 克", text)
+
+    def test_slim_line_omits_fish_when_unknown(self) -> None:
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertNotIn("鱼=", text)
+
     def test_glitch_distance_keeps_last_value(self) -> None:
         self.session.fight_distance_by_gear["5a43c383-1111-1111-1111-111111111111"] = 26.2
         text = self.bridge._format_fight_load_payload(self.session, self._payload(-10.7))
