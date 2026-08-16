@@ -224,6 +224,39 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
         self.assertEqual(len(received), 2)
         self.assertEqual(received[1], build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z"))
 
+    def test_recovers_when_frame_boundary_in_later_fragment(self) -> None:
+        """缺口吃掉整帧2后，帧3被拆成两个 TCP 段乱序到达：第一个段只有帧3的
+        部分字节（不包含完整帧边界）。恢复必须把所有连续片段拼接起来找边界，
+        而不是只看第一个片段，否则重同步失败导致下行永久失步。"""
+        session = _make_ready_session()
+        received: list[bytes] = []
+        session.bridge._handle_server_frame = lambda _session, plain: received.append(plain)
+        ref = RC4Stream(session.protocol.token.encode())
+        plain1 = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        raw1 = build_frame(0, 101, ref.crypt(plain1))
+        plain2 = build_request_envelope(call_id=2, main_cmd=14, sub_cmd=4, payload=b"y")
+        raw2 = build_frame(0, 102, ref.crypt(plain2))
+        plain3 = build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z")
+        raw3 = build_frame(0, 103, ref.crypt(plain3))
+
+        seq = 1000
+        session.feed_tcp(from_client=False, seq=seq, payload=raw1, syn=False)
+        seq += len(raw1)
+        # 帧2 整个丢失：seq 直接跳到 raw3 起点。
+        seq += len(raw2)
+        # 帧3 拆成两个 TCP 段乱序到达：先到前 10 字节（无完整帧边界）。
+        session.feed_tcp(from_client=False, seq=seq, payload=raw3[:10], syn=False)
+        seq += 10
+        session.feed_tcp(from_client=False, seq=seq, payload=raw3[10:], syn=False)
+        session.server_tcp.gap_started_at = 0.0
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+
+        # 帧1 与帧3 正确到达，帧2 被跳过，不 stall。
+        self.assertEqual(len(received), 2)
+        self.assertEqual(received[1], build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z"))
+        self.assertFalse(session.downlink_stalled)
+        self.assertEqual(session.server_tcp.pending_bytes, 0)
+
     def test_waits_for_tcp_retransmission_before_recovery(self) -> None:
         """游戏端会等数据包重新到位：缺口出现后若 TCP 重传在恢复阈值内补齐，
         帧2 必须无缝续上且不被跳过，缺口内帧内容不丢。"""

@@ -400,6 +400,36 @@ class TcpStreamReassembler:
             self.gap_started_at = None
         return gap_bytes, bytes(out)
 
+    def chain_pending_data(self, *, max_bytes: int) -> bytes:
+        """Return the contiguous run of buffered fragments starting at the gap,
+        without consuming them. Mirrors ``recover_gap`` chaining so a resync scan
+        can find a frame boundary even when it lives in a later TCP segment."""
+        if self.next_seq is None or not self.fragments:
+            return b""
+        pending_seq = self.first_pending_seq()
+        if pending_seq is None or pending_seq <= self.next_seq:
+            return b""
+        out = bytearray()
+        cursor = pending_seq
+        consumed: set[int] = set()
+        while len(out) < max_bytes:
+            usable_starts = [
+                start for start in self.fragments if start <= cursor and start not in consumed
+            ]
+            if not usable_starts:
+                break
+            start = min(usable_starts)
+            fragment = self.fragments[start]
+            fragment_end = start + len(fragment)
+            consumed.add(start)
+            if fragment_end <= cursor:
+                continue
+            offset = cursor - start
+            fresh = fragment[offset:]
+            out.extend(fresh)
+            cursor += len(fresh)
+        return bytes(out)
+
 
 @dataclass
 class PassiveSession:
@@ -509,10 +539,14 @@ class PassiveSession:
         # 信封验证重同步：缺口内混有明文帧头时，盲目 keystream(gap_bytes)
         # 会高估密文字节数导致后续全部错位。改为在缺口后数据里找帧边界，
         # 对候选密文跳过量逐一校验 parse_envelope，命中才同步。
+        # 缺口后数据可能被拆成多个 TCP 段，帧边界可能落在后续片段里，
+        # 因此必须把所有连续片段拼接起来扫描，而不能只看第一个片段。
         pending_seq = reassembler.first_pending_seq()
         if pending_seq is None:
             return 0, b""
-        pending_data = reassembler.fragments.get(pending_seq, b"")
+        pending_data = reassembler.chain_pending_data(
+            max_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES * 4
+        )
         if not pending_data:
             return 0, b""
         resync = self._resync_gap_cipher(cipher, pending_data, gap_bytes)
