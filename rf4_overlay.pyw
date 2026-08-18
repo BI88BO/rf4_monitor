@@ -91,6 +91,37 @@ class Overlay:
             pass
         return "Microsoft YaHei UI"
 
+    def _ensure_canvas(self):
+        if self.canvas is None:
+            canvas = tk.Canvas(
+                self.root,
+                highlightthickness=0,
+                bg=self.TRANSPARENT_KEY,
+            )
+            canvas.pack(fill="both", expand=True)
+            self.canvas = canvas
+        return self.canvas
+
+    @staticmethod
+    def _round_rect(canvas, x1, y1, x2, y2, r, **kwargs):
+        r = min(r, (x2 - x1) // 2, (y2 - y1) // 2)
+        pts = [
+            x1 + r, y1,
+            x2 - r, y1,
+            x2, y1,
+            x2, y1 + r,
+            x2, y2 - r,
+            x2, y2,
+            x2 - r, y2,
+            x1 + r, y2,
+            x1, y2,
+            x1, y2 - r,
+            x1, y1 + r,
+            x1, y1,
+        ]
+        kwargs.setdefault("smooth", True)
+        return canvas.create_polygon(pts, **kwargs)
+
     def __init__(self, root, host, port):
         self.root = root
         self.host = host

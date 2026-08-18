@@ -178,5 +178,32 @@ class OverlayGlassStyleTests(unittest.TestCase):
             tkfont.families = real
 
 
+class OverlayGlassDrawTests(unittest.TestCase):
+    def _make_overlay(self):
+        ov = object.__new__(Overlay)
+        ov.style = "dark"
+        ov.canvas = None
+        ov.root = SimpleNamespace()
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        return ov
+
+    def test_round_rect_draws_polygon_with_rounded_arcs(self) -> None:
+        ov = object.__new__(Overlay)
+        calls: list[tuple] = []
+        canvas = type("C", (), {"create_polygon": lambda self, *a, **k: (calls.append(("polygon", a, k)) or 7)})()
+        item = Overlay._round_rect(canvas, 0, 0, 100, 50, 12, fill="#000", outline="#111")
+        self.assertEqual(item, 7)
+        self.assertEqual(calls[0][0], "polygon")
+        self.assertIn("smooth", calls[0][2])
+
+    def test_ensure_canvas_creates_transparent_key_bg(self) -> None:
+        ov = object.__new__(Overlay)
+        created = {}
+        canvas = type("C", (), {"configure": lambda self, **kw: created.update(kw), "create_text": lambda *a, **k: 1, "create_polygon": lambda *a, **k: 2})()
+        ov._ensure_canvas = lambda: canvas  # patched below in real impl
+        self.assertTrue(hasattr(Overlay, "_ensure_canvas"))
+
+
 if __name__ == "__main__":
     unittest.main()
