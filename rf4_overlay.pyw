@@ -72,6 +72,25 @@ class Overlay:
         STYLE_TRANSPARENT: {"bg": "#101418", "fg": "#ffd166", "key": "#101418"},
     }
 
+    CANVAS_BG = "#0F1916"
+    CANVAS_EDGE = "#1D4D3F"
+    CANVAS_ACCENT = "#2EE6A8"
+    CANVAS_TEXT = "#4FF2C8"
+    CANVAS_DIM = "#8FD6C2"
+    CANVAS_RED = "#FF5252"
+    TRANSPARENT_KEY = "#0000FF"
+    CORNER_RADIUS = 12
+
+    @staticmethod
+    def font_family() -> str:
+        try:
+            import tkinter.font as tkfont
+            if "三极芯片体 超粗" in tkfont.families():
+                return "三极芯片体 超粗"
+        except Exception:
+            pass
+        return "Microsoft YaHei UI"
+
     def __init__(self, root, host, port):
         self.root = root
         self.host = host

@@ -157,5 +157,26 @@ class OverlayFightColorTests(unittest.TestCase):
         self.assertEqual(Overlay._fight_row_color(row, "#ffd166"), "#ffd166")
 
 
+class OverlayGlassStyleTests(unittest.TestCase):
+    def test_glass_style_constants_defined(self) -> None:
+        self.assertEqual(Overlay.CANVAS_BG, "#0F1916")
+        self.assertEqual(Overlay.CANVAS_ACCENT, "#2EE6A8")
+        self.assertEqual(Overlay.CANVAS_TEXT, "#4FF2C8")
+        self.assertEqual(Overlay.CORNER_RADIUS, 12)
+
+    def test_font_family_falls_back_when_missing(self) -> None:
+        import tkinter.font as tkfont
+        real = tkfont.families
+
+        def fake_families(root=None):
+            return ["Microsoft YaHei UI"]
+
+        tkfont.families = fake_families
+        try:
+            self.assertEqual(Overlay.font_family(), "Microsoft YaHei UI")
+        finally:
+            tkfont.families = real
+
+
 if __name__ == "__main__":
     unittest.main()
