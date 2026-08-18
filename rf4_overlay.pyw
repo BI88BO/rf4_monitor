@@ -74,10 +74,8 @@ class Overlay:
     }
 
     CANVAS_BG = "#0F1916"
-    CANVAS_EDGE = "#1D4D3F"
-    CANVAS_ACCENT = "#2EE6A8"
-    CANVAS_TEXT = "#4FF2C8"
-    CANVAS_DIM = "#8FD6C2"
+    CANVAS_TEXT = "#ffd166"
+    CANVAS_DIM = "#b39a5a"
     CANVAS_RED = "#FF5252"
     TRANSPARENT_KEY = "#0000FF"
     CORNER_RADIUS = 12
@@ -375,12 +373,7 @@ class Overlay:
         if not self._is_transparent():
             r = self.CORNER_RADIUS
             Overlay._round_rect(canvas, 1, 1, width - 2, height - 2, r,
-                                fill=self.CANVAS_BG, outline=self.CANVAS_EDGE, width=1)
-            # 顶部 HUD 装饰线
-            canvas.create_line(
-                1, 3, width - 3, 3,
-                fill=self.CANVAS_ACCENT, width=2,
-            )
+                                fill=self.CANVAS_BG)
         # 第一块：竿号/搏鱼行(按竿号排序，主色)；第二块：遥测/待机行(降暗色)。
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())

@@ -180,8 +180,8 @@ class OverlayFightColorTests(unittest.TestCase):
 class OverlayGlassStyleTests(unittest.TestCase):
     def test_glass_style_constants_defined(self) -> None:
         self.assertEqual(Overlay.CANVAS_BG, "#0F1916")
-        self.assertEqual(Overlay.CANVAS_ACCENT, "#2EE6A8")
-        self.assertEqual(Overlay.CANVAS_TEXT, "#4FF2C8")
+        self.assertEqual(Overlay.CANVAS_TEXT, "#ffd166")
+        self.assertEqual(Overlay.CANVAS_DIM, "#b39a5a")
         self.assertEqual(Overlay.CORNER_RADIUS, 12)
 
     def test_font_family_falls_back_when_missing(self) -> None:
@@ -279,15 +279,16 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         ov.root = SimpleNamespace()
         return ov
 
-    def test_draw_renders_background_edge_accent_and_text(self) -> None:
+    def test_draw_renders_filled_rounded_card_and_text(self) -> None:
         ov = self._overlay()
         ov._draw(width=320, height=60)
         kinds = [c[0] for c in ov.created]
-        self.assertIn("polygon", kinds)  # 背景 + 描边
-        self.assertIn("line", kinds)     # 装饰线
+        self.assertIn("polygon", kinds)  # 圆角卡片背景
+        self.assertNotIn("line", kinds)  # 无描边/装饰线
         self.assertIn("text", kinds)     # 文本
         bg = [k for k in ov.created if k[0] == "polygon"]
         self.assertTrue(all(k[1].get("fill") == "#0F1916" for k in bg))
+        self.assertTrue(all("outline" not in k[1] for k in bg))
 
     def test_exhausted_row_uses_red_text(self) -> None:
         ov = self._overlay()
