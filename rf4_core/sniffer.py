@@ -87,6 +87,18 @@ IGNORED_INTERFACE_HINTS = (
 Endpoint = tuple[str, int]
 FlowKey = tuple[Endpoint, Endpoint]
 
+# 内存 RC4 handoff：游戏 realtime 自动切服（负载均衡/会话迁移）时新连接直接
+# 续传已加密业务流、不重新 auth 握手。旧会话关闭前保存的 RC4 快照按 token
+# 索引，切服新连接用同一 token 重建 RC4 后搜索真实帧边界继续解析。
+RC4_HANDOFF_MAX_AGE_SECONDS = 24 * 60 * 60
+RC4_HANDOFF_MAX_ENTRIES = 16
+# 无 auth 切服恢复时搜索帧边界的最大密文字节数（0..上限）。
+CACHED_TOKEN_RESYNC_SKIP_BYTES = 64 * 1024
+CACHED_TOKEN_RESYNC_MAX_BYTES = 1024 * 1024
+CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES = 11
+# 每个方向独立搜索帧边界；同时限制单个包处理内的扫描工作量。
+CACHED_TOKEN_RESYNC_WORK_BUDGET = 1024
+
 
 @dataclass(frozen=True)
 class CapturedTcpPacket:
@@ -964,6 +976,25 @@ def _print_line_once(owner: object, name: str, category: str, text: str) -> None
 
 
 @dataclass
+class Rc4Handoff:
+    token: str
+    client_read_rc4: object
+    server_read_rc4: object
+    saved_at: float
+
+    @classmethod
+    def capture(cls, protocol: FlowSession) -> Optional["Rc4Handoff"]:
+        if not protocol.token or protocol.client_read_rc4 is None or protocol.server_read_rc4 is None:
+            return None
+        return cls(
+            token=protocol.token,
+            client_read_rc4=protocol.client_read_rc4.clone(),
+            server_read_rc4=protocol.server_read_rc4.clone(),
+            saved_at=time.monotonic(),
+        )
+
+
+@dataclass
 class DiscoveryCandidate:
     endpoints: FlowKey
     created_at: float
@@ -1015,6 +1046,7 @@ class PacketObserver:
         self._known_realtime_hosts: set[str] = set()
         self._closed_realtime_hosts: set[str] = set()
         self._reconnect_notified_hosts: set[str] = set()
+        self._rc4_handoffs: dict[str, Rc4Handoff] = {}
         self._packets_since_cleanup = 0
         self.total_packets = 0
 
@@ -1153,6 +1185,9 @@ class PacketObserver:
         if client_endpoint is not None:
             self._promote_candidate(key, candidate, client_endpoint)
             return
+        # 无 auth 握手时尝试用最近保存的 RC4 handoff 恢复切服连接。
+        if self._try_handoff_bootstrap(key, candidate):
+            return
         if fin_or_rst:
             self._candidates.pop(key, None)
 
@@ -1202,6 +1237,8 @@ class PacketObserver:
         from_client: Optional[bool] = None,
     ) -> None:
         active = self._auto_sessions.pop(key, None)
+        if session.valid_business_frames > 0:
+            self._remember_rc4_handoff(session)
         client_endpoint = active[1] if active is not None else None
         server_endpoint = None
         if client_endpoint is not None:
@@ -1237,6 +1274,182 @@ class PacketObserver:
             return
         oldest_key = min(self._candidates, key=lambda key: self._candidates[key].updated_at)
         self._candidates.pop(oldest_key, None)
+
+    def _remember_rc4_handoff(self, session: PassiveSession) -> None:
+        if session.valid_business_frames <= 0:
+            return
+        handoff = Rc4Handoff.capture(session.protocol)
+        if handoff is None:
+            return
+        self._rc4_handoffs[handoff.token] = handoff
+        if len(self._rc4_handoffs) > RC4_HANDOFF_MAX_ENTRIES:
+            oldest_key = min(
+                self._rc4_handoffs,
+                key=lambda key: self._rc4_handoffs[key].saved_at,
+            )
+            self._rc4_handoffs.pop(oldest_key, None)
+
+    def _take_rc4_handoff(self, token: str) -> Optional[Rc4Handoff]:
+        handoff = self._rc4_handoffs.get(token)
+        if handoff is None:
+            return None
+        if time.monotonic() - handoff.saved_at > RC4_HANDOFF_MAX_AGE_SECONDS:
+            self._rc4_handoffs.pop(token, None)
+            return None
+        return handoff
+
+    def _bootstrap_handoff_session(
+        self,
+        key: FlowKey,
+        source: Endpoint,
+        destination: Endpoint,
+        handoff: Rc4Handoff,
+    ) -> Optional[PassiveSession]:
+        """切服无 auth 时用内存 RC4 handoff 直接建立会话并返回；返回 None 表示
+        handoff 会话已存在或无法确认边界，调用方保持 candidate 状态即可。"""
+        active = self._auto_sessions.get(key)
+        if active is not None:
+            return None
+        oriented_key = (
+            source[0],
+            source[1],
+            destination[0],
+            destination[1],
+        )
+        session_id = (
+            f"{source[0]}:{source[1]} -> {destination[0]}:{destination[1]}"
+        )
+        session = PassiveSession.create(session_id, self.bridge)
+        session.protocol.token = handoff.token
+        session.protocol.auth_seen = True
+        session.protocol.uuid_seen = True
+        session.protocol.hermes_seen = True
+        # 切服后新连接的 RC4 由同一 token 独立派生、从位置 0 开始（与登录时
+        # 一致），并非延续旧连接的位置；旧连接的密文位置只用于跨服务器的
+        # 会话身份关联。这里用重建的 RC4 流，后续由帧边界搜索对齐。
+        session.protocol.ensure_rc4()
+        self.sessions[oriented_key] = session
+        self._auto_sessions[key] = (session, source)
+        self._known_realtime_hosts.add(destination[0])
+        self._closed_realtime_hosts.discard(destination[0])
+        _print_line(
+            "session",
+            "realtime 切服已识别（token 重建 RC4，等待帧边界对齐）"
+            f" | 服务器={destination[0]}:{destination[1]} | 会话={session_id}",
+        )
+        return session
+
+    @staticmethod
+    def _align_handoff_cipher(
+        cipher: object,
+        data: bytes,
+        *,
+        budget: int = CACHED_TOKEN_RESYNC_WORK_BUDGET,
+    ) -> Optional[int]:
+        """在无 auth 切服的新连接密文流里搜索第一个可验证业务帧的起点。
+
+        从数据流中尝试所有满足 RF4 帧头形状（body_len 合法、非 ACK/控制帧、
+        长度足够信封校验）的偏移，对每个偏移用已重建的 RC4（位置 0）从该
+        偏移开始解密并校验信封。返回命中的密文帧起点（相对 data 的字节偏移），
+        找不到返回 None。
+
+        流开头的 ACK/控制帧（frame_type==1、body_len<=5）是明文，不参与 RC4，
+        先按帧结构跳过，再在后续业务帧上校验。
+        """
+        attempts = 0
+        offset = 0
+        while offset + 4 <= len(data) and attempts < budget:
+            body_len = u32(data, offset)
+            if body_len == 0:
+                offset += 1
+                attempts += 1
+                continue
+            if body_len == 1:
+                # ACK/控制帧：明文 5 字节（body_len=1 + frame_type），跳过。
+                offset += 5
+                attempts += 1
+                continue
+            if body_len < 9 or body_len > len(data) - offset - 4:
+                offset += 1
+                attempts += 1
+                continue
+            frame_type = data[offset + 4]
+            if frame_type == 1:
+                offset += 4 + body_len
+                attempts += 1
+                continue
+            payload = data[offset + 13 : offset + 13 + body_len - 9]
+            if len(payload) < CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES:
+                offset += 1
+                attempts += 1
+                continue
+            probe = cipher.clone()
+            if parse_envelope(probe.crypt(payload)) is not None:
+                return offset
+            offset += 1
+            attempts += 1
+        return None
+
+    def _try_handoff_bootstrap(
+        self,
+        key: FlowKey,
+        candidate: DiscoveryCandidate,
+    ) -> bool:
+        """尝试用最近保存的 RC4 handoff 把无 auth 的 candidate 提升为会话。
+
+        成功返回 True（candidate 已转正，调用方无需再走 auth 提升路径）。
+        仅当候选缓冲已积累足够数据且存在未过期 handoff 时尝试。
+        """
+        if not self._rc4_handoffs:
+            return False
+        server_endpoint = candidate.suspected_server
+        if server_endpoint is None:
+            return False
+        client_endpoint = key[0]
+        server_data = bytes(candidate.buffers.get(server_endpoint, b""))
+        client_data = bytes(candidate.buffers.get(client_endpoint, b""))
+        if not server_data and not client_data:
+            return False
+        # 服务器下行通常更密集地携带业务帧，优先用它确认 RC4。切服后 RC4 由
+        # 同一 token 重建（位置 0），因此用 token 重建的探针校验，而不是旧
+        # 连接的密文位置。
+        for handoff in list(self._rc4_handoffs.values()):
+            probe_protocol = FlowSession(profile=self.bridge._profile)
+            probe_protocol.token = handoff.token
+            probe_protocol.ensure_rc4()
+            probe_server = probe_protocol.server_read_rc4
+            frame_offset = self._align_handoff_cipher(probe_server, server_data)
+            if frame_offset is None:
+                continue
+            session = self._bootstrap_handoff_session(
+                key,
+                source=client_endpoint,
+                destination=server_endpoint,
+                handoff=handoff,
+            )
+            if session is None:
+                return False
+            # 客户端上行同样可能存在明文前置，用重建的 client RC4 对齐。
+            client_offset = self._align_handoff_cipher(
+                probe_protocol.client_read_rc4, client_data
+            )
+            # 把候选缓冲喂给新会话（含对齐的帧偏移，丢弃对齐前的明文前置）。
+            session.client_tcp = candidate.streams.setdefault(
+                client_endpoint, TcpStreamReassembler()
+            )
+            session.server_tcp = candidate.streams.setdefault(
+                server_endpoint, TcpStreamReassembler()
+            )
+            self._candidates.pop(key, None)
+            server_chunk = server_data[frame_offset:]
+            if server_chunk:
+                session._process_server_bytes(server_chunk)
+            if client_data:
+                client_chunk = client_data[client_offset:] if client_offset is not None else client_data
+                if client_chunk:
+                    session._process_client_bytes(client_chunk)
+            return True
+        return False
 
     @staticmethod
     def _describe_tcp_close(flags: int, from_client: bool) -> str:

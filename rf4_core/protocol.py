@@ -1074,6 +1074,13 @@ class RC4Stream:
     def crypt(self, data: bytes) -> bytes:
         return xor_bytes(data, self.keystream(len(data)))
 
+    def clone(self) -> "RC4Stream":
+        clone = object.__new__(RC4Stream)
+        clone._s = self._s.copy()
+        clone._i = self._i
+        clone._j = self._j
+        return clone
+
 
 def try_parse_auth_packet(data: bytes) -> Optional[Tuple[str, int]]:
     # 打开钓鱼站等场景下游戏重连 realtime 时，auth 包开头可能是 \x01\x00 或 \x01\x01，
