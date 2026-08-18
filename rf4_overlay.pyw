@@ -25,6 +25,9 @@ DEFAULT_PORT = 25000
 WINDOW_WIDTH = 320
 WINDOW_HEIGHT = 70
 
+# 字体族解析缓存：首次真实查询后复用，避免每次重绘都调 tkfont.families()
+_FONT_FAMILY_CACHE = None
+
 
 def load_config():
     try:
@@ -80,16 +83,29 @@ class Overlay:
     CORNER_RADIUS = 12
     # 反外挂警告红字状态：object.__new__ 构造(测试)时默认为 False
     _anticheat_red = False
+    # 反外挂红字恢复定时器：同一时刻至多一个，新事件会先取消旧的
+    _anticheat_timer_id = None
 
     @staticmethod
     def font_family() -> str:
-        try:
-            import tkinter.font as tkfont
-            if "三极芯片体 超粗" in tkfont.families():
-                return "三极芯片体 超粗"
-        except Exception:
-            pass
-        return "Microsoft YaHei UI"
+        """解析首选字体，仅首次真实查询，之后复用缓存。"""
+        global _FONT_FAMILY_CACHE
+        if _FONT_FAMILY_CACHE is None:
+            try:
+                import tkinter.font as tkfont
+                if "三极芯片体 超粗" in tkfont.families():
+                    _FONT_FAMILY_CACHE = "三极芯片体 超粗"
+                else:
+                    _FONT_FAMILY_CACHE = "Microsoft YaHei UI"
+            except Exception:
+                _FONT_FAMILY_CACHE = "Microsoft YaHei UI"
+        return _FONT_FAMILY_CACHE
+
+    @staticmethod
+    def _reset_font_family_cache():
+        """清空字体缓存，仅供测试重新探测 families() 两条路径。"""
+        global _FONT_FAMILY_CACHE
+        _FONT_FAMILY_CACHE = None
 
     def _ensure_canvas(self):
         if self.canvas is None:
@@ -137,6 +153,7 @@ class Overlay:
         self._idle_visible = False
         self.canvas = None
         self._anticheat_red = False
+        self._anticheat_timer_id = None
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -336,35 +353,64 @@ class Overlay:
             for text in lines
         )
 
+    def _is_transparent(self) -> bool:
+        """透明模式：只画文字、不画玻璃卡；画布背景即透明键 #0000FF。"""
+        return self.style == self.STYLE_TRANSPARENT
+
+    def _row_height(self) -> int:
+        """单行文本高度(像素)：用与渲染一致的 bold 字体度量。"""
+        try:
+            import tkinter.font as tkfont
+
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13, weight="bold")
+            return f.metrics("linespace") + 4
+        except Exception:
+            return 28
+
     def _draw(self, *, width, height):
         canvas = self._ensure_canvas()
         canvas.delete("all")
-        r = self.CORNER_RADIUS
-        pad = 2
-        # 圆角背景 + 内侧描边
-        Overlay._round_rect(canvas, 1, 1, width - 2, height - 2, r,
-                            fill=self.CANVAS_BG, outline=self.CANVAS_EDGE, width=1)
-        # 顶部 HUD 装饰线
-        canvas.create_line(
-            1, 3, width - 3, 3,
-            fill=self.CANVAS_ACCENT, width=2,
-        )
-        lines = self._lines_for_display()
-        exhausted = self._any_exhausted(lines)
+        # 非透明模式画玻璃卡(圆角背景+内侧描边+HUD 装饰线)；透明模式跳过，
+        # 画布背景是透明键 #0000FF，只有文字浮于桌面。
+        if not self._is_transparent():
+            r = self.CORNER_RADIUS
+            Overlay._round_rect(canvas, 1, 1, width - 2, height - 2, r,
+                                fill=self.CANVAS_BG, outline=self.CANVAS_EDGE, width=1)
+            # 顶部 HUD 装饰线
+            canvas.create_line(
+                1, 3, width - 3, 3,
+                fill=self.CANVAS_ACCENT, width=2,
+            )
+        # 第一块：竿号/搏鱼行(按竿号排序，主色)；第二块：遥测/待机行(降暗色)。
+        rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
+        dim_lines = list(self._telemetry_rows.values())
+        if not rod_lines and not dim_lines:
+            dim_lines = ["RF4 来鱼提醒 · 待机中"]
+        # 反外挂红字优先：直接整块红字，跳过力竭判断(避免无效计算)
         if self._anticheat_red:
-            text_color = self.CANVAS_RED
+            rod_color = self.CANVAS_RED
         else:
-            text_color = self.CANVAS_RED if exhausted else self.CANVAS_TEXT
-        # 文本区：先所有行，再按遥测/待机降暗
-        canvas.create_text(
-            16, 14,
-            text="\n".join(lines),
-            anchor="nw",
-            font=(Overlay.font_family(), 13, "bold"),
-            fill=text_color,
-            width=width - 32,
-            justify="left",
-        )
+            rod_color = self.CANVAS_RED if self._any_exhausted(rod_lines) else self.CANVAS_TEXT
+        if rod_lines:
+            canvas.create_text(
+                x=16, y=14,
+                text="\n".join(rod_lines),
+                anchor="nw",
+                font=(Overlay.font_family(), 13, "bold"),
+                fill=rod_color,
+                width=width - 32,
+                justify="left",
+            )
+        if dim_lines:
+            canvas.create_text(
+                x=16, y=14 + len(rod_lines) * self._row_height(),
+                text="\n".join(dim_lines),
+                anchor="nw",
+                font=(Overlay.font_family(), 13, "bold"),
+                fill=self.CANVAS_DIM,
+                width=width - 32,
+                justify="left",
+            )
 
     def _content_height(self, lines):
         """按换行数估算需求高度：长消息按实际换行行数计算，避免被裁切。"""
@@ -372,7 +418,7 @@ class Overlay:
             import tkinter.font as tkfont
 
             wrap_px = WINDOW_WIDTH - 32
-            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13)
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13, weight="bold")
             row_h = f.metrics("linespace") + 4
             total = 0
             for line in lines:
@@ -395,11 +441,18 @@ class Overlay:
 
     def _show_anticheat(self, text):
         # 反外挂警告：整窗红字显示 8 秒后恢复默认配色（原 Label 变色迁移到 canvas 文本色）。
+        # 连续事件先取消上一个恢复定时器，避免旧计时提前清掉新警告的红字。
         self._anticheat_red = True
         self._show_telemetry(text)
-        self.root.after(8000, lambda: self._clear_anticheat_red())
+        if self._anticheat_timer_id is not None:
+            try:
+                self.root.after_cancel(self._anticheat_timer_id)
+            except Exception:
+                pass
+        self._anticheat_timer_id = self.root.after(8000, lambda: self._clear_anticheat_red())
 
     def _clear_anticheat_red(self):
+        self._anticheat_timer_id = None
         if self._anticheat_red:
             self._anticheat_red = False
             self._refresh_display()

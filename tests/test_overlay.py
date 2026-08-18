@@ -192,22 +192,30 @@ class OverlayGlassStyleTests(unittest.TestCase):
             return ["Microsoft YaHei UI"]
 
         tkfont.families = fake_families
+        Overlay._reset_font_family_cache()
         try:
             self.assertEqual(Overlay.font_family(), "Microsoft YaHei UI")
         finally:
             tkfont.families = real
+            Overlay._reset_font_family_cache()
+
+    def test_font_family_prefers_installed_chinese_font(self) -> None:
+        import tkinter.font as tkfont
+        real = tkfont.families
+
+        def fake_families(root=None):
+            return ["Arial", "三极芯片体 超粗"]
+
+        tkfont.families = fake_families
+        Overlay._reset_font_family_cache()
+        try:
+            self.assertEqual(Overlay.font_family(), "三极芯片体 超粗")
+        finally:
+            tkfont.families = real
+            Overlay._reset_font_family_cache()
 
 
 class OverlayGlassDrawTests(unittest.TestCase):
-    def _make_overlay(self):
-        ov = object.__new__(Overlay)
-        ov.style = "dark"
-        ov.canvas = None
-        ov.root = SimpleNamespace()
-        ov._rows = {}
-        ov._telemetry_rows = {}
-        return ov
-
     def test_round_rect_draws_polygon_with_rounded_arcs(self) -> None:
         ov = object.__new__(Overlay)
         calls: list[tuple] = []
@@ -217,12 +225,37 @@ class OverlayGlassDrawTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "polygon")
         self.assertIn("smooth", calls[0][2])
 
-    def test_ensure_canvas_creates_transparent_key_bg(self) -> None:
+    def test_ensure_canvas_builds_canvas_with_transparent_key_bg(self) -> None:
+        # 真实 _ensure_canvas：canvas 背景必须用透明键 #0000FF，且只创建一次并缓存复用。
         ov = object.__new__(Overlay)
-        created = {}
-        canvas = type("C", (), {"configure": lambda self, **kw: created.update(kw), "create_text": lambda *a, **k: 1, "create_polygon": lambda *a, **k: 2})()
-        ov._ensure_canvas = lambda: canvas  # patched below in real impl
-        self.assertTrue(hasattr(Overlay, "_ensure_canvas"))
+        ov.canvas = None
+        ov.root = SimpleNamespace()
+        created: dict = {}
+        canvas = type("C", (), {
+            "pack": lambda self, **kw: (created.update(pack=kw) or None),
+            "delete": lambda self, tag: None,
+            "create_text": lambda *a, **k: 1,
+            "create_polygon": lambda *a, **k: 2,
+            "create_line": lambda *a, **k: 3,
+        })()
+        real_canvas = overlay_mod.tk.Canvas
+
+        def fake_canvas(root, **kw):
+            created["count"] = created.get("count", 0) + 1
+            created["opts"] = kw
+            return canvas
+
+        overlay_mod.tk.Canvas = fake_canvas
+        try:
+            got = ov._ensure_canvas()
+            again = ov._ensure_canvas()
+        finally:
+            overlay_mod.tk.Canvas = real_canvas
+        self.assertIs(got, canvas)
+        self.assertIs(again, canvas)
+        self.assertEqual(created["count"], 1)
+        self.assertEqual(created["opts"]["bg"], Overlay.TRANSPARENT_KEY)
+        self.assertEqual(created["opts"]["highlightthickness"], 0)
 
 
 class OverlayGlassDrawFullTests(unittest.TestCase):
@@ -241,7 +274,6 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         ov.canvas = canvas
         ov._ensure_canvas = lambda: canvas
         ov._content_height = lambda lines: 60
-        ov._fight_row_color = staticmethod(lambda text, default: default)
         ov._show = lambda: None
         ov.created = created
         ov.root = SimpleNamespace()
@@ -260,10 +292,91 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
     def test_exhausted_row_uses_red_text(self) -> None:
         ov = self._overlay()
         ov._rows = {"1号杆": "1号杆 | 体力 0% 出线 2.1米"}
-        ov._fight_row_color = Overlay._fight_row_color.__get__(ov)
         ov._draw(width=320, height=60)
         texts = [k for k in ov.created if k[0] == "text"]
         self.assertEqual(texts[0][1]["fill"], "#FF5252")
+
+    def test_telemetry_rows_use_dim_color_and_follow_rod_block(self) -> None:
+        ov = self._overlay()
+        ov._rows = {"1号杆": "1号杆 | 体力 78% 出线 12.3米"}
+        ov._telemetry_rows = {1: "商店折扣", 2: "装备已修复"}
+        ov._draw(width=320, height=60)
+        texts = [k for k in ov.created if k[0] == "text"]
+        self.assertEqual(len(texts), 2)
+        self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_TEXT)
+        self.assertEqual(texts[0][1]["text"], "1号杆 | 体力 78% 出线 12.3米")
+        self.assertEqual(texts[1][1]["fill"], Overlay.CANVAS_DIM)
+        self.assertEqual(texts[1][1]["text"], "商店折扣\n装备已修复")
+        # 第二块 y = 14 + 竿行数 × 行高(测试环境无 Tk，行高回退 28)
+        self.assertEqual(texts[1][1]["y"], 14 + 1 * 28)
+
+    def test_idle_fallback_line_is_dim(self) -> None:
+        ov = self._overlay()
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._draw(width=320, height=60)
+        texts = [k for k in ov.created if k[0] == "text"]
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_DIM)
+        self.assertEqual(texts[0][1]["text"], "RF4 来鱼提醒 · 待机中")
+
+    def test_transparent_mode_skips_glass_and_draws_text_only(self) -> None:
+        ov = self._overlay()
+        ov.style = Overlay.STYLE_TRANSPARENT
+        ov._rows = {"1号杆": "1号杆 | 体力 78% 出线 12.3米"}
+        ov._draw(width=320, height=60)
+        kinds = [c[0] for c in ov.created]
+        self.assertNotIn("polygon", kinds)
+        self.assertNotIn("line", kinds)
+        self.assertEqual([c[0] for c in ov.created if c[0] == "text"], ["text"])
+
+    def test_anticheat_red_wins_over_normal_row_color(self) -> None:
+        ov = self._overlay()
+        ov._anticheat_red = True
+        ov._rows = {"1号杆": "1号杆 | 体力 100% 出线 12.3米"}
+        ov._draw(width=320, height=60)
+        texts = [k for k in ov.created if k[0] == "text"]
+        self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_RED)
+
+
+class OverlayAnticheatTimerTests(unittest.TestCase):
+    def test_second_anticheat_cancels_previous_clear_timer(self) -> None:
+        ov = object.__new__(Overlay)
+        after_calls: list[tuple] = []
+        cancelled: list[int] = []
+        ov.root = SimpleNamespace(
+            after=lambda delay, fn: (after_calls.append((delay, fn)) or 7),
+            after_cancel=lambda timer_id: cancelled.append(timer_id),
+        )
+        ov._anticheat_red = False
+        ov._anticheat_timer_id = None
+        ov._telemetry_rows = {}
+        ov._telemetry_seq = 0
+        ov._refresh_display = lambda: None
+        ov._show_telemetry = lambda text: None
+        ov._show_anticheat("first")
+        ov._show_anticheat("second")
+        self.assertEqual(len(after_calls), 2)
+        self.assertEqual(cancelled, [7])
+
+    def test_clear_anticheat_resets_timer_id(self) -> None:
+        ov = object.__new__(Overlay)
+        after_calls: list[tuple] = []
+        ov.root = SimpleNamespace(
+            after=lambda delay, fn: (after_calls.append((delay, fn)) or 7),
+            after_cancel=lambda timer_id: None,
+        )
+        ov._anticheat_red = True
+        ov._anticheat_timer_id = 7
+        ov._telemetry_rows = {}
+        ov._telemetry_seq = 0
+        ov._refresh_display = lambda: None
+        ov._show_telemetry = lambda text: None
+        ov._show_anticheat("ac")
+        self.assertEqual(ov._anticheat_timer_id, 7)
+        after_calls[-1][1]()
+        self.assertIsNone(ov._anticheat_timer_id)
+        self.assertFalse(ov._anticheat_red)
 
 
 if __name__ == "__main__":
