@@ -84,6 +84,26 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
         ov._handle_datagram(b'{"event": "anticheat", "text": "ac"}')
         self.assertEqual(ov.calls, [("anticheat", "ac")])
 
+    def test_real_show_anticheat_reroutes_without_label(self) -> None:
+        # 真实 _show_anticheat 不再引用 self.label，改为 canvas 红字 8 秒后恢复。
+        calls: list[tuple] = []
+        after_calls: list[tuple] = []
+        ov = object.__new__(Overlay)
+        ov._anticheat_red = False
+        ov._telemetry_rows = {}
+        ov._telemetry_seq = 0
+        ov._refresh_display = lambda: calls.append(("refresh",))
+        ov._show_telemetry = lambda text: calls.append(("telemetry", text))
+        ov.root = SimpleNamespace(after=lambda delay, fn: after_calls.append((delay, fn)))
+        ov._show_anticheat("ac")
+        self.assertFalse(hasattr(ov, "label"))
+        self.assertTrue(ov._anticheat_red)
+        self.assertEqual([c for c in calls if c[0] == "telemetry"], [("telemetry", "ac")])
+        self.assertEqual([delay for delay, _ in after_calls], [8000])
+        after_calls[0][1]()
+        self.assertFalse(ov._anticheat_red)
+        self.assertEqual(calls[-1], ("refresh",))
+
     def test_garbage_datagram_is_ignored(self) -> None:
         ov = _empty_overlay()
         ov._handle_datagram(b"not-json")

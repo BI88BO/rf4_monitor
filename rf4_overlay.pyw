@@ -80,6 +80,8 @@ class Overlay:
     CANVAS_RED = "#FF5252"
     TRANSPARENT_KEY = "#0000FF"
     CORNER_RADIUS = 12
+    # 反外挂警告红字状态：object.__new__ 构造(测试)时默认为 False
+    _anticheat_red = False
 
     @staticmethod
     def font_family() -> str:
@@ -136,6 +138,7 @@ class Overlay:
         self._telemetry_seq = 0
         self._idle_visible = False
         self.canvas = None
+        self._anticheat_red = False
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -154,19 +157,7 @@ class Overlay:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
 
-        self.label = tk.Label(
-            root,
-            text="",
-            bg=self._STYLE_PARAMS[self.style]["bg"],
-            fg=self._STYLE_PARAMS[self.style]["fg"],
-            font=("Microsoft YaHei UI", 13, "bold"),
-            padx=16,
-            pady=12,
-            wraplength=WINDOW_WIDTH - 32,
-            justify="left",
-            anchor="w",
-        )
-        self.label.pack(fill="both", expand=True)
+        self._ensure_canvas()
         # 统一应用背景样式(含透明键设置)
         self.apply_style(self.style)
 
@@ -362,7 +353,10 @@ class Overlay:
         )
         lines = self._lines_for_display()
         exhausted = self._any_exhausted(lines)
-        text_color = self.CANVAS_RED if exhausted else self.CANVAS_TEXT
+        if self._anticheat_red:
+            text_color = self.CANVAS_RED
+        else:
+            text_color = self.CANVAS_RED if exhausted else self.CANVAS_TEXT
         # 文本区：先所有行，再按遥测/待机降暗
         canvas.create_text(
             16, 14,
@@ -380,7 +374,7 @@ class Overlay:
             import tkinter.font as tkfont
 
             wrap_px = WINDOW_WIDTH - 32
-            f = tkfont.Font(self.root, font=(Overlay.font_family(), 13, "bold"))
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13)
             row_h = f.metrics("linespace") + 4
             total = 0
             for line in lines:
@@ -402,9 +396,15 @@ class Overlay:
         self._show_telemetry(text)
 
     def _show_anticheat(self, text):
-        self.label.config(fg="#ff5252")
+        # 反外挂警告：整窗红字显示 8 秒后恢复默认配色（原 Label 变色迁移到 canvas 文本色）。
+        self._anticheat_red = True
         self._show_telemetry(text)
-        self.root.after(8000, lambda: self.label.config(fg="#ffd166"))
+        self.root.after(8000, lambda: self._clear_anticheat_red())
+
+    def _clear_anticheat_red(self):
+        if self._anticheat_red:
+            self._anticheat_red = False
+            self._refresh_display()
 
     def _reset_to_idle(self):
         self._rows.clear()
