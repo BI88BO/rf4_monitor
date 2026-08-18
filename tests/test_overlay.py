@@ -269,7 +269,7 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
             "delete": lambda self, tag: None,
             "create_polygon": lambda self, *a, **k: (created.append(("polygon", k)) or 1),
             "create_line": lambda self, *a, **k: (created.append(("line", k)) or 2),
-            "create_text": lambda self, *a, **k: (created.append(("text", k)) or 3),
+            "create_text": lambda self, *a, **k: (created.append(("text", {**({"x": a[0], "y": a[1]} if len(a) >= 2 else {}), **k})) or 3),
         })()
         ov.canvas = canvas
         ov._ensure_canvas = lambda: canvas

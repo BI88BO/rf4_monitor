@@ -393,7 +393,7 @@ class Overlay:
             rod_color = self.CANVAS_RED if self._any_exhausted(rod_lines) else self.CANVAS_TEXT
         if rod_lines:
             canvas.create_text(
-                x=16, y=14,
+                16, 14,
                 text="\n".join(rod_lines),
                 anchor="nw",
                 font=(Overlay.font_family(), 13, "bold"),
@@ -403,7 +403,7 @@ class Overlay:
             )
         if dim_lines:
             canvas.create_text(
-                x=16, y=14 + len(rod_lines) * self._row_height(),
+                16, 14 + len(rod_lines) * self._row_height(),
                 text="\n".join(dim_lines),
                 anchor="nw",
                 font=(Overlay.font_family(), 13, "bold"),
