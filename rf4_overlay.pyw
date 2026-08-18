@@ -64,12 +64,10 @@ class Overlay:
     _STYLES = {STYLE_DARK, STYLE_TRANSPARENT}
     # 遥测信息区最多保留的行数
     MAX_TELEMETRY_ROWS = 4
-    # 样式参数：背景色 / 前景色 / 透明键色
-    # 透明模式：用背景色作为透明键，仅文字可见。
-    # 深色模式：透明键设为一个绝不出现的哨兵色，背景即恢复不透明。
+    # 样式参数：根窗口背景色；画布配色统一用 CANVAS_* 常量
     _STYLE_PARAMS = {
-        STYLE_DARK: {"bg": "#101418", "fg": "#ffd166", "key": "#0000FF"},
-        STYLE_TRANSPARENT: {"bg": "#101418", "fg": "#ffd166", "key": "#101418"},
+        STYLE_DARK: {"bg": "#101418"},
+        STYLE_TRANSPARENT: {"bg": "#101418"},
     }
 
     CANVAS_BG = "#0F1916"
