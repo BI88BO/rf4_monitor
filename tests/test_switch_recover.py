@@ -106,6 +106,23 @@ class Rc4HandoffCaptureTests(unittest.TestCase):
         observer._remember_rc4_handoff(session)
         self.assertNotIn(TOKEN, observer._rc4_handoffs)
 
+    def test_find_auth_endpoint_accepts_x0101_prefix(self) -> None:
+        # 切服新连接若带 \x01\x01 开头的 auth 包（游戏钓鱼站重连场景），
+        # find_auth_endpoint 必须能识别，否则会漏掉 auth 掉进 bootstrap 探测。
+        _ctx()
+        import struct
+
+        token_b = TOKEN.encode()
+        auth = b"\x01\x01" + struct.pack("<I", len(token_b)) + token_b
+        candidate = DiscoveryCandidate(
+            endpoints=("192.168.2.8", 30002, "185.71.66.225", 9443),
+            created_at=0.0,
+            updated_at=0.0,
+            suspected_server=("185.71.66.225", 9443),
+        )
+        candidate.buffers[("192.168.2.8", 30002)] = bytearray(auth)
+        self.assertEqual(candidate.find_auth_endpoint(), ("192.168.2.8", 30002))
+
 
 class HandoffBootstrapTests(unittest.TestCase):
     def test_align_handoff_cipher_finds_frame_after_preamble(self) -> None:

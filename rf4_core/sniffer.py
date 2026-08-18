@@ -98,6 +98,10 @@ CACHED_TOKEN_RESYNC_MAX_BYTES = 1024 * 1024
 CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES = 11
 # 每个方向独立搜索帧边界；同时限制单个包处理内的扫描工作量。
 CACHED_TOKEN_RESYNC_WORK_BUDGET = 1024
+# 无 auth 切服恢复失败后的重试冷却：bootstrap 探测很贵（遍历全部保存的
+# handoff × 预算次 RC4 解密），切服连接持续有流量时若每包都重试会打满 CPU。
+# 只在 candidate 生命周期内按该间隔重试，其余包直接跳过探测。
+HANDOFF_BOOTSTRAP_RETRY_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1007,8 @@ class DiscoveryCandidate:
     reconnect_attempt: bool = False
     streams: dict[Endpoint, TcpStreamReassembler] = field(default_factory=dict)
     buffers: dict[Endpoint, bytearray] = field(default_factory=dict)
+    last_bootstrap_attempt: Optional[float] = None
+    bootstrap_diag_printed: bool = False
 
     def feed(self, source: Endpoint, *, seq: int, payload: bytes, syn: bool) -> None:
         self.updated_at = time.monotonic()
@@ -1017,7 +1023,9 @@ class DiscoveryCandidate:
 
     def find_auth_endpoint(self) -> Optional[Endpoint]:
         for endpoint, buffer in self.buffers.items():
-            if len(buffer) >= 2 and buffer[:2] != b"\x01\x00":
+            # auth 包开头可能是 \x01\x00 或 \x01\x01（游戏在钓鱼站等场景重连
+            # realtime 时），与 try_parse_auth_packet 保持一致。
+            if len(buffer) >= 2 and buffer[:2] not in (b"\x01\x00", b"\x01\x01"):
                 continue
             try:
                 parsed = core.try_parse_auth_packet(bytes(buffer))
@@ -1410,6 +1418,13 @@ class PacketObserver:
         client_data = bytes(candidate.buffers.get(client_endpoint, b""))
         if not server_data and not client_data:
             return False
+        # 探测很贵且失败后不改变 candidate 状态；按冷却间隔节流，避免切服连接
+        # 持续有流量时每个数据包都全量扫描 RC4 打满 CPU。
+        now = time.monotonic()
+        last = candidate.last_bootstrap_attempt
+        if last is not None and now - last < HANDOFF_BOOTSTRAP_RETRY_SECONDS:
+            return False
+        candidate.last_bootstrap_attempt = now
         # 服务器下行通常更密集地携带业务帧，优先用它确认 RC4。切服后 RC4 由
         # 同一 token 重建（位置 0），因此用 token 重建的探针校验，而不是旧
         # 连接的密文位置。
@@ -1449,6 +1464,18 @@ class PacketObserver:
                 if client_chunk:
                     session._process_client_bytes(client_chunk)
             return True
+        # 探测失败：把诊断信息打一次，便于定位切服恢复为何未命中（token 是否
+        # 匹配、缓冲是否缺下行数据等）。冷却节流下不会每包刷屏。
+        if not candidate.bootstrap_diag_printed:
+            candidate.bootstrap_diag_printed = True
+            token_names = "/".join(core.mask_secret(h.token) for h in self._rc4_handoffs.values())
+            _print_line(
+                "session",
+                "切服恢复探测未命中 | "
+                f"服务器={server_endpoint[0]}:{server_endpoint[1]} | "
+                f"下行缓冲={len(server_data)} 字节 上行缓冲={len(client_data)} 字节 | "
+                f"已保存 handoff token: {token_names or '(无)'}",
+            )
         return False
 
     @staticmethod
