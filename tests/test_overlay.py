@@ -205,5 +205,46 @@ class OverlayGlassDrawTests(unittest.TestCase):
         self.assertTrue(hasattr(Overlay, "_ensure_canvas"))
 
 
+class OverlayGlassDrawFullTests(unittest.TestCase):
+    def _overlay(self):
+        ov = object.__new__(Overlay)
+        ov.style = "dark"
+        ov._rows = {"1号杆": "1号杆 | 体力 78% 出线 12.3米"}
+        ov._telemetry_rows = {}
+        created: list[tuple] = []
+        canvas = type("C", (), {
+            "delete": lambda self, tag: None,
+            "create_polygon": lambda self, *a, **k: (created.append(("polygon", k)) or 1),
+            "create_line": lambda self, *a, **k: (created.append(("line", k)) or 2),
+            "create_text": lambda self, *a, **k: (created.append(("text", k)) or 3),
+        })()
+        ov.canvas = canvas
+        ov._ensure_canvas = lambda: canvas
+        ov._content_height = lambda lines: 60
+        ov._fight_row_color = staticmethod(lambda text, default: default)
+        ov._show = lambda: None
+        ov.created = created
+        ov.root = SimpleNamespace()
+        return ov
+
+    def test_draw_renders_background_edge_accent_and_text(self) -> None:
+        ov = self._overlay()
+        ov._draw(width=320, height=60)
+        kinds = [c[0] for c in ov.created]
+        self.assertIn("polygon", kinds)  # 背景 + 描边
+        self.assertIn("line", kinds)     # 装饰线
+        self.assertIn("text", kinds)     # 文本
+        bg = [k for k in ov.created if k[0] == "polygon"]
+        self.assertTrue(all(k[1].get("fill") == "#0F1916" for k in bg))
+
+    def test_exhausted_row_uses_red_text(self) -> None:
+        ov = self._overlay()
+        ov._rows = {"1号杆": "1号杆 | 体力 0% 出线 2.1米"}
+        ov._fight_row_color = Overlay._fight_row_color.__get__(ov)
+        ov._draw(width=320, height=60)
+        texts = [k for k in ov.created if k[0] == "text"]
+        self.assertEqual(texts[0][1]["fill"], "#FF5252")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -135,6 +135,7 @@ class Overlay:
         self._telemetry_rows = {}
         self._telemetry_seq = 0
         self._idle_visible = False
+        self.canvas = None
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -171,7 +172,7 @@ class Overlay:
 
         self._apply_noactivate()
         self._bind_drag(self.root)
-        self._bind_drag(self.label)
+        self._bind_drag(self.canvas)
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -223,15 +224,10 @@ class Overlay:
         params = self._STYLE_PARAMS.get(style)
         if params is None:
             return
-        bg = params["bg"]
-        fg = params["fg"]
-        key = params["key"]
         self.style = style
-        self.root.configure(bg=bg)
-        self.label.configure(bg=bg, fg=fg)
+        self.root.configure(bg=params["bg"])
         try:
-            # Windows 透明键：设置对应颜色键。深色模式用哨兵色(窗口不使用)令背景恢复不透明。
-            self.root.wm_attributes("-transparentcolor", key)
+            self.root.wm_attributes("-transparentcolor", self.TRANSPARENT_KEY)
         except tk.TclError:
             pass
         self._refresh_display()
@@ -329,28 +325,54 @@ class Overlay:
             self._refresh_display()
 
     def _refresh_display(self):
-        # 简单分行：所有行(鱼事件按竿号 + 遥测/频道/聊天)按序拼接；无内容回待机。
+        lines = self._lines_for_display()
+        need_h = self._content_height(lines)
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}+{x}+{y}")
+        self._draw(width=WINDOW_WIDTH, height=need_h)
+        self._show()
+
+    def _lines_for_display(self):
         lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         for seq, text in self._telemetry_rows.items():
             lines.append(text)
         if not lines:
             lines = ["RF4 来鱼提醒 · 待机中"]
-        display = "\n".join(lines)
-        self.label.config(text=display)
-        # 体力 ≤ 0(鱼力竭)时整窗变红提示，与 _show_anticheat 同模式。
-        exhausted = any(
-            Overlay._fight_row_color(text, self._STYLE_PARAMS[self.style]["fg"]) == "#ff5252"
+        return lines
+
+    def _any_exhausted(self, lines) -> bool:
+        return any(
+            Overlay._fight_row_color(text, self.CANVAS_TEXT).lower() == self.CANVAS_RED.lower()
             for text in lines
         )
-        self.label.config(
-            fg="#ff5252" if exhausted else self._STYLE_PARAMS[self.style]["fg"]
+
+    def _draw(self, *, width, height):
+        canvas = self._ensure_canvas()
+        canvas.delete("all")
+        r = self.CORNER_RADIUS
+        pad = 2
+        # 圆角背景 + 内侧描边
+        Overlay._round_rect(canvas, 1, 1, width - 2, height - 2, r,
+                            fill=self.CANVAS_BG, outline=self.CANVAS_EDGE, width=1)
+        # 顶部 HUD 装饰线
+        canvas.create_line(
+            1, 3, width - 3, 3,
+            fill=self.CANVAS_ACCENT, width=2,
         )
-        # 按内容实际需求高度调整窗口，避免多杆/换行时内容被裁切
-        need_h = self._content_height(lines)
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
-        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}+{x}+{y}")
-        self._show()
+        lines = self._lines_for_display()
+        exhausted = self._any_exhausted(lines)
+        text_color = self.CANVAS_RED if exhausted else self.CANVAS_TEXT
+        # 文本区：先所有行，再按遥测/待机降暗
+        canvas.create_text(
+            16, 14,
+            text="\n".join(lines),
+            anchor="nw",
+            font=(Overlay.font_family(), 13, "bold"),
+            fill=text_color,
+            width=width - 32,
+            justify="left",
+        )
 
     def _content_height(self, lines):
         """按换行数估算需求高度：长消息按实际换行行数计算，避免被裁切。"""
@@ -358,7 +380,7 @@ class Overlay:
             import tkinter.font as tkfont
 
             wrap_px = WINDOW_WIDTH - 32
-            f = tkfont.Font(self.root, font=self.label.cget("font"))
+            f = tkfont.Font(self.root, font=(Overlay.font_family(), 13, "bold"))
             row_h = f.metrics("linespace") + 4
             total = 0
             for line in lines:
