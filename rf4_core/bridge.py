@@ -2398,8 +2398,9 @@ class RF4ChatBridge:
             return ""
         gear_slot = self._gear_slot_text(session, gear)
         if not gear_slot:
-            # 手持装备(不在快捷键槽位)不显示搏鱼状态。
-            return ""
+            # 手持装备(不在快捷键槽位)没有竿号，但搏鱼状态仍要显示：
+            # 用"手持竿"前缀兜底，否则体力和出线信息会整体丢失。
+            gear_slot = "手持竿"
         groups = self._scan_float_groups(payload, limit=8)
         stamina = self._fight_stamina(groups)
         distance = self._sanitize_distance(
@@ -2473,7 +2474,8 @@ class RF4ChatBridge:
             return None
         gear_slot = self._gear_slot_text(session, fight_stage.fishing_gear_id)
         if not gear_slot:
-            return None
+            # 手持装备(不在快捷键槽位)没有竿号，用"手持竿"兜底显示搏鱼初始行。
+            gear_slot = "手持竿"
         meta = session.fish_setup_cache.get(fight_stage.fish_setup_id or "") if fight_stage.fish_setup_id else None
         fish_name = self._format_fish_name(meta.fish_key or "") if meta else ""
         weight = self._format_chat_weight(meta.weight_hint_raw) if meta and meta.weight_hint_raw else ""

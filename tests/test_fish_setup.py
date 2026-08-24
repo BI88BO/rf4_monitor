@@ -395,11 +395,14 @@ class FightLoadSlimLineTests(unittest.TestCase):
         text = self.bridge._format_fight_load_payload(self.session, self._payload(-10.7))
         self.assertIn("出线 26.2米", text)
 
-    def test_handheld_gear_produces_empty_line(self) -> None:
-        # 不挂槽位 -> _gear_slot_text 返回 "" -> 行空（手持不显示）
+    def test_handheld_gear_still_shows_fight_status(self) -> None:
+        # 不挂槽位(从背包直接拿出的竿)没有竿号，但搏鱼状态不能丢：
+        # 用"手持竿"前缀兜底，体力/出线照常显示。
         self.session.slot_items.clear()
         text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
-        self.assertEqual(text, "")
+        self.assertIn("手持竿", text)
+        self.assertIn("体力 100%", text)
+        self.assertIn("出线 26.2米", text)
 
 
 class FightLoadRecordDistanceTests(unittest.TestCase):
@@ -544,6 +547,17 @@ class FightStageInitialLineTests(unittest.TestCase):
         self.assertEqual(cat, "fight_status")
         self.assertIn("[达标]", text)
         self.assertIn("鱼=黑线鳕", text)
+
+    def test_fight_stage_handheld_gear_still_emits(self) -> None:
+        # 手持竿(不在快捷键槽位)也要有搏鱼初始行，体力/鱼名不能丢。
+        self.session.slot_items.clear()
+        telemetry = self.bridge._describe_telemetry_frame(self.session, True, self._frame())
+        self.assertIsNotNone(telemetry)
+        cat, text = telemetry
+        self.assertEqual(cat, "fight_status")
+        self.assertIn("手持竿", text)
+        self.assertIn("鱼=黑线鳕", text)
+        self.assertIn("体力 100%", text)
 
 
 class FightTelemetryCategoryTests(unittest.TestCase):
