@@ -20,10 +20,10 @@ RF4 Monitor 是一个 `俄罗斯钓鱼4`游戏的网络流量监控工具，用�
 
 ```text
 rf4_monitor-main/
-  rf4_monitor.py          兼容入口（CLI launcher + mitmdump addon）
-  rf4_tray.py             系统托盘控制（一键启动/停止监控 + 浮窗）
-  rf4.bat                 双击启动托盘（自提权，后台运行无控制台）
-  rf4_overlay.pyw         来鱼浮窗提醒（UDP 事件桥监听端）
+  deskmon_engine.py       主入口（CLI launcher + mitmdump addon；进程名不含 rf4）
+  deskmon_tray.py         系统托盘控制（一键启动/停止监控 + 浮窗）
+  deskmon.bat             双击启动托盘（自提权，后台运行无控制台）
+  deskmon_overlay.pyw     来鱼浮窗提醒（UDP 事件桥监听端）
   rf4_core/               核心实现包
     launcher.py           CLI、hosts、证书、mitmdump 命令、登录改写
     protocol.py           协议编解码、数据类、协议 profile
@@ -39,6 +39,8 @@ rf4_monitor-main/
   logs/                   运行日志目录
   screenshot/             截图目录
 ```
+
+> 命名说明：入口脚本、托盘、浮窗与打包产物统一使用中性代号 **DeskMon**（进程名、互斥量、环境变量均不含 rf4 字样），浮窗窗口标题为「来鱼提示」，避免被游戏进程扫描注意到。`rf4_core/` 内部包与 `rf4_*.json` 配置为磁盘文件，保留原名不影响。
 
 证书文件：
 
@@ -106,7 +108,7 @@ certs\rf4_monitor.crt
 如果 `certs\rf4_monitor.crt` 不存在，先运行一次：
 
 ```bat
-py -3 rf4_monitor.py --prepare-only
+py -3 deskmon_engine.py --prepare-only
 ```
 
 导入方式一：图形界面导入
@@ -124,14 +126,14 @@ py -3 rf4_monitor.py --prepare-only
 certutil -addstore Root certs\rf4_monitor.crt
 ```
 
-证书导入后，再以管理员身份运行 `rf4.bat`。
+证书导入后，再以管理员身份运行 `deskmon.bat`。
 
 ## 启动
 
 ### 方式一：托盘一键启停（推荐，含浮窗，无控制台窗口）
 
 1. 关闭 RF4
-2. 右键以管理员身份运行 `rf4.bat`（或在资源管理器中双击，会自动请求提权）
+2. 右键以管理员身份运行 `deskmon.bat`（或在资源管理器中双击，会自动请求提权）
 3. 系统托盘出现 RF4 图标后，右键菜单选择 **启动监控**
 4. 等待 `logs\rf4_monitor.log` 出现监听信息（会同时启动桌面浮窗）
 5. 启动 RF4 并登录游戏
@@ -144,7 +146,7 @@ certutil -addstore Root certs\rf4_monitor.crt
 ### 方式二：命令行仅主程序
 
 ```bat
-py -3 rf4_monitor.py
+py -3 deskmon_engine.py
 ```
 
 等待控制台出现监听信息后启动 RF4 并登录游戏。
@@ -156,7 +158,7 @@ py -3 rf4_monitor.py
 
 ## 浮窗提醒
 
-`rf4_overlay.pyw` 是一个独立的桌面浮窗，通过 UDP 事件桥（默认 `127.0.0.1:25000`）接收主程序广播的自己钓鱼事件：
+`deskmon_overlay.pyw` 是一个独立的桌面浮窗，通过 UDP 事件桥（默认 `127.0.0.1:25000`）接收主程序广播的自己钓鱼事件：
 
 - **来鱼**：`【我自己】： 有太阳鱼 138克 过来了`
 - **脱钩**：`【我自己】： 太阳鱼 挣脱跑了（脱钩）`
@@ -165,7 +167,7 @@ py -3 rf4_monitor.py
 
 浮窗只显示自己的鱼获事件，其他玩家的钓到/记录消息不会弹出。浮窗为透明置顶小窗，可按住左键拖动到任意位置，位置会自动记忆在 `rf4_overlay_config.json`。
 
-浮窗可单独运行（不依赖主程序启动脚本）：双击 `rf4_overlay.pyw`。若端口被占用会提示已有实例在运行。
+浮窗可单独运行（不依赖主程序启动脚本）：双击 `deskmon_overlay.pyw`。若端口被占用会提示已有实例在运行。
 ## 截图
 
 ![RF4 Monitor 浮窗](QQ图片20260812091453.jpg)
@@ -217,19 +219,19 @@ RF4-3D 记录[底钓] 钓到了 1.384 公斤 金眼狼鲈
 关闭业务遥测，只看鱼获和自己来鱼：
 
 ```bat
-py -3 rf4_monitor.py --set rf4_log_telemetry=false
+py -3 deskmon_engine.py --set rf4_log_telemetry=false
 ```
 
 只看钓鱼相关信息：
 
 ```bat
-py -3 rf4_monitor.py --set rf4_telemetry_categories=fish
+py -3 deskmon_engine.py --set rf4_telemetry_categories=fish
 ```
 
 只更新 hosts：
 
 ```bat
-py -3 rf4_monitor.py --update-hosts-only
+py -3 deskmon_engine.py --update-hosts-only
 ```
 
 ## hosts
@@ -252,7 +254,7 @@ C:\Windows\System32\drivers\etc\hosts
 
 `Permission denied`
 
-- 请使用管理员身份运行 `rf4.bat` 或命令行 `py -3 rf4_monitor.py`
+- 请使用管理员身份运行 `deskmon.bat` 或命令行 `py -3 deskmon_engine.py`
 
 `Cannot spawn multiple servers on the same address: *:443`
 
@@ -272,7 +274,7 @@ C:\Windows\System32\drivers\etc\hosts
 - 可临时开启详细日志：
 
 ```bat
-py -3 rf4_monitor.py --set rf4_verbose_logging=true
+py -3 deskmon_engine.py --set rf4_verbose_logging=true
 ```
 
 如果游戏版本升级，需要重新确认协议字段、登录返回结构和 realtime 端口。

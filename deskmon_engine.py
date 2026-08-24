@@ -2,7 +2,7 @@
 
 本文件保留原单文件 rf4_monitor.py 的双重角色：
 
-- 作为 mitmdump addon 被加载（-s rf4_monitor.py）时，暴露 ``addons = [RF4ChatBridge()]``
+- 作为 mitmdump addon 被加载（-s deskmon_engine.py）时，暴露 ``addons = [RF4ChatBridge()]``
 - 作为独立 CLI 运行时，调用 ``main()`` 启动 launcher（hosts/证书/mitmdump）
 
 运行模式：

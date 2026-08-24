@@ -974,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
             # 打包态下：由同一个 exe 扮演 mitmdump 引擎（见打包入口 frozen_entry），
             # 用它自身吸收 --rf4-engine 标志后来到 DumpMaster 引擎分支。
             if getattr(sys, "frozen", False):
-                process_env["RF4_ENGINE_MODE"] = "1"
+                process_env["DESKMON_ENGINE_MODE"] = "1"
             process = subprocess.Popen(
                 command,
                 creationflags=creationflags,
@@ -988,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
                 log_file = None
             raise
 
-        # 若由 RF4Tray 启动，托盘退出时自动终止本进程链，避免残留 RF4Monitor/Overlay。
+        # 若由 DeskMon 启动，托盘退出时自动终止本进程链，避免残留 RF4Monitor/Overlay。
         parent_pid = _watchdog_parent_pid()
         watchdog = None
         if parent_pid is not None:
@@ -1012,7 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
         restore_hosts_on_exit(hosts_result)
 
 
-RF4_WATCHDOG_PARENT_ENV = "RF4_TRAY_PARENT_PID"
+RF4_WATCHDOG_PARENT_ENV = "DESKMON_PARENT_PID"
 
 
 def _watchdog_parent_pid() -> int | None:
@@ -1125,7 +1125,7 @@ def resolve_mitmdump_binary(raw_value: str, *, base_dir: Path = THIS_DIR) -> str
     if raw_value.strip():
         return str(Path(raw_value).expanduser())
 
-    # 打包态：同一个 exe 就是 mitmdump 引擎（frozen_entry 通过 RF4_ENGINE_MODE 区分）。
+    # 打包态：同一个 exe 就是 mitmdump 引擎（frozen_entry 通过 DESKMON_ENGINE_MODE 区分）。
     if getattr(sys, "frozen", False):
         return str(Path(sys.executable).resolve())
 
@@ -1257,7 +1257,7 @@ def build_mitmdump_command(
     realtime_upstream_host: str,
     realtime_upstream_port: int,
 ) -> list[str]:
-    script = THIS_DIR / "rf4_monitor.py"
+    script = THIS_DIR / "deskmon_engine.py"
     command: list[str] = ["mitmdump", "-s", str(script)]
     command.extend(passthrough)
     selected_reverse_targets = select_reverse_targets(reference.reverse_targets)

@@ -189,9 +189,9 @@ class Overlay:
                 root2 = tk.Tk()
                 root2.withdraw()
                 messagebox.showerror(
-                    "RF4 来鱼提醒 - 启动失败",
+                    "来鱼提示 - 启动失败",
                     f"无法监听 UDP {self.host}:{self.port}。\n\n"
-                    f"可能原因：已有 RF4 来鱼提醒实例在运行，或端口被占用。\n"
+                    f"可能原因：已有来鱼提示实例在运行，或端口被占用。\n"
                     f"错误：{exc}\n\n"
                     f"请先关闭已运行的浮窗/监控，再重新双击启动。",
                     parent=root2,
@@ -342,7 +342,7 @@ class Overlay:
         for seq, text in self._telemetry_rows.items():
             lines.append(text)
         if not lines:
-            lines = ["RF4 来鱼提醒 · 待机中"]
+            lines = ["来鱼提示 · 待机中"]
         return lines
 
     def _any_exhausted(self, lines) -> bool:
@@ -378,7 +378,7 @@ class Overlay:
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())
         if not rod_lines and not dim_lines:
-            dim_lines = ["RF4 来鱼提醒 · 待机中"]
+            dim_lines = ["来鱼提示 · 待机中"]
         # 反外挂红字优先：直接整块红字，跳过力竭判断(避免无效计算)
         if self._anticheat_red:
             rod_color = self.CANVAS_RED
@@ -522,7 +522,7 @@ def main():
     host = config.get("host", DEFAULT_HOST)
     port = config.get("port", DEFAULT_PORT)
     root = tk.Tk()
-    root.title("RF4 来鱼提醒")
+    root.title("来鱼提示")
     Overlay(root, host, port)
     root.mainloop()
 

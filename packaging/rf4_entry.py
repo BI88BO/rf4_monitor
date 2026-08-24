@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""RF4Monitor 引擎统一入口（打包专用）。
+"""DeskMon 引擎统一入口（打包专用）。
 
-- launcher 模式（默认）：执行 rf4_monitor 的 launcher main。
-- engine 模式（RF4_ENGINE_MODE=1）：以本 exe 扮演 mitmdump 引擎，加载 -s 脚本。
+- launcher 模式（默认）：执行 rf4_core.launcher 的 main。
+- engine 模式（DESKMON_ENGINE_MODE=1）：以本 exe 扮演 mitmdump 引擎，加载 -s 脚本。
 """
 import os
 import sys
@@ -22,7 +22,7 @@ def _launcher() -> int:
 
 
 if __name__ == "__main__":
-    if os.environ.get("RF4_ENGINE_MODE") == "1":
+    if os.environ.get("DESKMON_ENGINE_MODE") == "1":
         code = _engine()
     else:
         code = _launcher()

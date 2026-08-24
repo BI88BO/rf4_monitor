@@ -50,14 +50,14 @@ def _dispatch_tray(argv: list[str]) -> int:
             return 0  # 已交由新的管理员进程处理，本进程退出。
         print("[rf4-all] 需要管理员权限运行 RF4 Monitor（请允许 UAC 提示）。", file=sys.stderr)
         return 2
-    import rf4_tray
+    import deskmon_tray
 
-    rf4_tray.main()
+    deskmon_tray.main()
     return 0
 
 
 def _dispatch_overlay() -> int:
-    import rf4_overlay as overlay
+    import deskmon_overlay as overlay
 
     overlay.main()
     return 0
@@ -100,8 +100,8 @@ def _dispatch_engine(argv: list[str]) -> int:
 def _main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
-    # 兼容既有 launcher 的引擎自举：RF4_ENGINE_MODE=1 时扮演 mitmdump。
-    if os.environ.get("RF4_ENGINE_MODE") == "1":
+    # 兼容既有 launcher 的引擎自举：DESKMON_ENGINE_MODE=1 时扮演 mitmdump。
+    if os.environ.get("DESKMON_ENGINE_MODE") == "1":
         _ensure_stdio()
         from mitmproxy.tools import main as mitm_main
 

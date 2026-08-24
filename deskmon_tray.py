@@ -4,7 +4,7 @@
 （主程序 launcher + mitmdump + 来鱼浮窗），无需手动执行多个脚本。
 
 用法：
-    pythonw rf4_tray.py
+    pythonw deskmon_tray.py
 
 依赖：
     pip install pystray pillow
@@ -21,7 +21,7 @@ from pathlib import Path
 
 # 单实例互斥量名称：防止重复启动多个托盘导致多进程抢端口/多浮窗。
 # 用 Local 会话作用域（Global 需 SeCreateGlobalPrivilege，非提权下会 ACCESS_DENIED）。
-_SINGLE_INSTANCE_MUTEX = "Local\\RF4MonitorTray"
+_SINGLE_INSTANCE_MUTEX = "Local\\DeskMonTray"
 ERROR_ALREADY_EXISTS = 183
 
 
@@ -40,7 +40,7 @@ def _acquire_single_instance() -> None:
 BASE_DIR = Path(__file__).resolve().parent
 if getattr(sys, "frozen", False):
     # 打包态：脚本路径指向临时解压区(_MEIPASS)，改用 exe 所在目录，
-    # 才能找到随 exe 分发的 RF4Monitor.exe / RF4Overlay.exe 与数据文件。
+    # 才能找到随 exe 分发的 DeskMon.exe 与数据文件。
     BASE_DIR = Path(sys.executable).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 MONITOR_LOG = LOG_DIR / "rf4_monitor.log"
@@ -76,16 +76,16 @@ def _toggle_mode(icon, item) -> None:
     mode = MODE_PASSIVE if _load_mode() == MODE_PROXY else MODE_PROXY
     _save_mode(mode)
     if _state.get("running"):
-        icon.notify("切换模式需要先停止监控再重新启动。", "RF4 Monitor")
+        icon.notify("切换模式需要先停止监控再重新启动。", "来鱼提示")
     else:
         label = "被动抓包" if mode == MODE_PASSIVE else "代理"
-        icon.notify(f"已切换为{label}模式", "RF4 Monitor")
+        icon.notify(f"已切换为{label}模式", "来鱼提示")
 
 
 def _checked_mode(item) -> bool:
     return _load_mode() == MODE_PASSIVE
 
-# 浮窗背景样式配置(与 rf4_overlay.pyw 约定一致)
+# 浮窗背景样式配置(与 deskmon_overlay.pyw 约定一致)
 OVERLAY_CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
 OVERLAY_STYLE_DARK = "dark"
 OVERLAY_STYLE_TRANSPARENT = "transparent"
@@ -189,7 +189,7 @@ def _set_overlay_style(icon, item) -> None:
     _save_overlay_config({"style": style})
     if _state.get("running"):
         icon.notify(
-            f"浮窗样式已切换为 {STYLE_LABELS[style]}", "RF4 Monitor"
+            f"浮窗样式已切换为 {STYLE_LABELS[style]}", "来鱼提示"
         )
 
 
@@ -321,14 +321,14 @@ def start_monitor() -> str:
         pythonw = _pythonw()
         launcher_cmd = [
             pythonw,
-            str(BASE_DIR / "rf4_monitor.py"),
+            str(BASE_DIR / "deskmon_engine.py"),
             *mode_args,
             "--set",
             f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
             "--set",
             f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
-        overlay_cmd = [pythonw, str(BASE_DIR / "rf4_overlay.pyw")]
+        overlay_cmd = [pythonw, str(BASE_DIR / "deskmon_overlay.pyw")]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if pythonw.endswith("python.exe") else 0
 
     # 把可勾选的显示项转成 --set 参数传给 addon
@@ -336,7 +336,7 @@ def start_monitor() -> str:
         launcher_cmd.extend(["--set", f"{option}={str(show_config.get(key, True)).lower()}"])
     # 把托盘自身 PID 传给子进程，供其守护线程在托盘退出时自动清理进程链。
     child_env = dict(os.environ)
-    child_env["RF4_TRAY_PARENT_PID"] = str(os.getpid())
+    child_env["DESKMON_PARENT_PID"] = str(os.getpid())
     launcher = subprocess.Popen(
         launcher_cmd,
         cwd=str(BASE_DIR),
@@ -394,12 +394,12 @@ def _make_icon() -> Image.Image:
 
 def on_start(icon, item):
     msg = start_monitor()
-    icon.notify(msg, "RF4 Monitor")
+    icon.notify(msg, "来鱼提示")
 
 
 def on_stop(icon, item):
     msg = stop_monitor()
-    icon.notify(msg, "RF4 Monitor")
+    icon.notify(msg, "来鱼提示")
 
 
 def on_quit(icon, item):
@@ -425,9 +425,9 @@ def main() -> None:
         for style in OVERLAY_STYLES
     ]
     icon = pystray.Icon(
-        "rf4_monitor_tray",
+        "deskmon_tray",
         icon=_make_icon(),
-        title="RF4 Monitor",
+        title="来鱼提示",
         menu=pystray.Menu(
             pystray.MenuItem("启动监控", on_start),
             pystray.MenuItem("停止监控", on_stop),

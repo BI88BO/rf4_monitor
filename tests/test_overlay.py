@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-_OVERLAY_PATH = Path(__file__).resolve().parents[1] / "rf4_overlay.pyw"
-_spec = importlib.util.spec_from_file_location("rf4_overlay", _OVERLAY_PATH)
+_OVERLAY_PATH = Path(__file__).resolve().parents[1] / "deskmon_overlay.pyw"
+_spec = importlib.util.spec_from_file_location("deskmon_overlay", _OVERLAY_PATH)
 overlay_mod = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(overlay_mod)
@@ -319,7 +319,7 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         texts = [k for k in ov.created if k[0] == "text"]
         self.assertEqual(len(texts), 1)
         self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_DIM)
-        self.assertEqual(texts[0][1]["text"], "RF4 来鱼提醒 · 待机中")
+        self.assertEqual(texts[0][1]["text"], "来鱼提示 · 待机中")
 
     def test_transparent_mode_skips_glass_and_draws_text_only(self) -> None:
         ov = self._overlay()
