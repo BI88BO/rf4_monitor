@@ -68,14 +68,64 @@ def extract_system_labels_from_resources(resources_assets: Path, locale_id: str 
     return extract_system_labels_from_text(_find_locale_blob(resources_assets, locale_id))
 
 
+def _iter_fixed_drive_roots() -> list[Path]:
+    import string
+
+    roots: list[Path] = []
+    for letter in string.ascii_uppercase:
+        root = Path(f"{letter}:/")
+        try:
+            if root.exists():
+                roots.append(root)
+        except OSError:
+            continue
+    return roots
+
+
+def _extra_rf4_data_dirs() -> list[Path]:
+    """常见游戏安装布局下的 rf4_x64_Data 目录（官方启动器/Steam 库）。"""
+    patterns = (
+        ("RF4*", "rf4game", "Game", "rf4_x64_Data"),
+        ("RF4*", "Game", "rf4_x64_Data"),
+        ("*Steam*", "steamapps", "common", "Russian Fishing 4", "rf4_x64_Data"),
+    )
+    found: list[Path] = []
+    for root in _iter_fixed_drive_roots():
+        for pattern in patterns:
+            try:
+                found.extend(root.glob("/".join(pattern)))
+            except OSError:
+                continue
+    return found
+
+
 def _candidate_resources_assets(profile_name: str) -> Iterable[Path]:
+    candidates: list[Path] = []
     direct = ROOT / "version" / profile_name / "rf4_x64_Data" / "resources.assets"
     if direct.exists():
-        yield direct
+        candidates.append(direct)
+    try:
+        for data_dir in sorted((ROOT / "version").glob("*/rf4_x64_Data")):
+            assets = data_dir / "resources.assets"
+            if assets.exists() and assets != direct:
+                candidates.append(assets)
+    except OSError:
+        pass
+    # 常见安装位置（如 D:\RF4_CN\rf4game\Game、Steam 库）也纳入探测，
+    # 保证游戏更新后能直接从最新客户端提取鱼名映射。
+    for data_dir in _extra_rf4_data_dirs():
+        assets = data_dir / "resources.assets"
+        if assets.exists() and assets not in candidates:
+            candidates.append(assets)
+    # 按客户端修改时间倒序：优先用最近更新的游戏数据。
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
 
-    for candidate in sorted((ROOT / "version").glob("*/rf4_x64_Data/resources.assets"), reverse=True):
-        if candidate != direct:
-            yield candidate
+    candidates.sort(key=_mtime, reverse=True)
+    yield from candidates
 
 
 def _cache_path(profile_name: str) -> Path:

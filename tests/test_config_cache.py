@@ -165,18 +165,20 @@ class ConfigCacheDecryptTests(unittest.TestCase):
         self.assertIn("Turion SW 30000", bridge._format_item_id(5274, object_type_id=149))
 
     def test_system_item_name_prefix_fallback(self) -> None:
-        """实例 system_id(带后缀) 应回退到基础 model 名。"""
+        """官方直译存在时直查优先；无直译的实例后缀回退基础 model 名。"""
         bridge = self._bridge()
+        # 新版客户端目录已提供九周年变体官方名：直接命中，不走回退。
         self.assertEqual(
             bridge._format_system_item_name("tele_10175_5_9"),
-            '"Soul Pole 5"(tele_10175_5 变体)',
+            '"Soul Pole-九周年纪念版"(tele_10175_5_9)',
         )
+        # 无直译的变体后缀仍回退到基础 model 名。
         self.assertEqual(
-            bridge._format_system_item_name("spin_6115_g"),
+            bridge._format_system_item_name("spin_6115_h"),
             '"Mayor III 3000S"(spin_6115 变体)',
         )
         # 无基础名时回退 family
-        self.assertIn("Victory", bridge._format_system_item_name("spin_10252_M70ML"))
+        self.assertIn("Victory", bridge._format_system_item_name("spin_10252_ZZ99"))
 
     def _tmp(self) -> Path:
         return Path(tempfile.mkdtemp(prefix="rf4_test_"))
