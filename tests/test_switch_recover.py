@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -300,6 +301,95 @@ class HermesGreetingTests(unittest.TestCase):
             session.session_id, "192.168.2.8:32000 -> 185.71.66.225:9443"
         )
         self.assertEqual(session.protocol.token, TOKEN)
+        self.assertTrue(session.protocol.handshake_complete())
+        self.assertGreater(session.valid_business_frames, 0)
+
+
+class HermesDeadlineTests(unittest.TestCase):
+    def test_silent_encrypted_switch_fails_after_deadline(self) -> None:
+        # 切服变体(01:25 线上事故)：auth 后客户端直接进加密流，永远没有
+        # <hermes> 问候帧，也没有可解析帧。超时前静默等待；超时后任一方向
+        # 的数据都判死会话（交由切服恢复接管），不再无限静默卡死。
+        _ctx()
+        bridge = _make_bridge()
+        session = PassiveSession.create("s-deadline", bridge)
+        clock = {"t": 1000.0}
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            session._process_client_bytes(_auth_packet())
+            self.assertTrue(session.protocol.auth_seen)
+            self.assertIsNotNone(session.hermes_deadline)
+            # 加密垃圾解析不出完整帧 → 超时前静默等待、无异常。
+            session._process_client_bytes(bytes(range(1, 60)))
+            session._process_server_bytes(b"\x09\x00\x00\x00\x01\x02")
+        clock["t"] += sniffer.HERMES_GREETING_TIMEOUT_SECONDS + 1.0
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            with self.assertRaises(ValueError):
+                session._process_client_bytes(b"\x02")
+        # 客户端长时间沉默时，靠服务器下行的包也能触发判死。
+        session2 = PassiveSession.create("s-deadline2", bridge)
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            session2._process_client_bytes(_auth_packet())
+        clock["t"] += sniffer.HERMES_GREETING_TIMEOUT_SECONDS + 1.0
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            with self.assertRaises(ValueError):
+                session2._process_server_bytes(b"\x09\x00\x00\x00\x01\x02")
+
+    def test_silent_switch_teardown_then_bootstrap_recovers(self) -> None:
+        # 复现 01:25 事故完整链路：切服 → auth 抓到但无问候帧(加密直连) →
+        # 超时判死拆除 → 同四元组继续来包(且先到的是服务器下行、方向提示
+        # 是错的) → bootstrap 用保存的 token 中途对齐恢复。
+        _ctx()
+        observer = _make_observer()
+        ref = RC4Stream(TOKEN.encode())
+        plain = build_request_envelope(call_id=6, main_cmd=14, sub_cmd=4, payload=b"resume2")
+        encrypted = build_frame(0, 600, ref.crypt(plain))
+        stream = build_ack_frame(9) + encrypted
+        observer._rc4_handoffs[TOKEN] = sniffer.Rc4Handoff(
+            token=TOKEN,
+            client_read_rc4=RC4Stream(TOKEN.encode()),
+            server_read_rc4=RC4Stream(TOKEN.encode()),
+            saved_at=sniffer.time.monotonic(),
+        )
+
+        client = ("192.168.2.8", 33000)
+        server = ("5.35.7.132", 9357)
+        # FlowKey 字典序排序："192.168.2.8" < "5.35.7.132"。
+        sorted_key = (("192.168.2.8", 33000), ("5.35.7.132", 9357))
+
+        clock = {"t": 2000.0}
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            observer._handle_auto_packet(
+                src=client[0], sport=client[1], dst=server[0], dport=server[1],
+                seq=8000, payload=b"", flags=0x02,
+            )
+            observer._handle_auto_packet(
+                src=client[0], sport=client[1], dst=server[0], dport=server[1],
+                seq=8001, payload=_auth_packet(), flags=0x18,
+            )
+            self.assertIn(sorted_key, observer._auto_sessions)
+            # 之后客户端沉默；服务器直发加密业务帧（无 UUID 明文、无问候帧）。
+            observer._handle_auto_packet(
+                src=server[0], sport=server[1], dst=client[0], dport=client[1],
+                seq=9000, payload=b"\x01", flags=0x18,
+            )
+            # 超时：下一个下行包触发判死 + 现场拆除。
+            clock["t"] += sniffer.HERMES_GREETING_TIMEOUT_SECONDS + 2.0
+            observer._handle_auto_packet(
+                src=server[0], sport=server[1], dst=client[0], dport=client[1],
+                seq=9001, payload=b"\x01", flags=0x18,
+            )
+            self.assertNotIn(sorted_key, observer._auto_sessions)
+            self.assertIn(sorted_key, observer._retry_candidate_keys)
+            # 后续加密流继续到来 → 重建探测并 bootstrap 恢复。注意该包仍是
+            # 服务器下行：suspected_server 提示是错的，靠双向校验纠正。
+            observer._handle_auto_packet(
+                src=server[0], sport=server[1], dst=client[0], dport=client[1],
+                seq=9002, payload=stream, flags=0x18,
+            )
+        self.assertEqual(len(observer._auto_sessions), 1)
+        _key, (session, client_ep) = next(iter(observer._auto_sessions.items()))
+        self.assertEqual(client_ep, client)
+        self.assertEqual(session.session_id, "192.168.2.8:33000 -> 5.35.7.132:9357")
         self.assertTrue(session.protocol.handshake_complete())
         self.assertGreater(session.valid_business_frames, 0)
 
