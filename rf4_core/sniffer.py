@@ -102,6 +102,10 @@ CACHED_TOKEN_RESYNC_WORK_BUDGET = 1024
 # handoff × 预算次 RC4 解密），切服连接持续有流量时若每包都重试会打满 CPU。
 # 只在 candidate 生命周期内按该间隔重试，其余包直接跳过探测。
 HANDOFF_BOOTSTRAP_RETRY_SECONDS = 5.0
+# 认证包后等待 <hermes> 问候帧时允许跳过的非问候帧总量上限。切服重连场景下
+# 问候帧前可能夹杂空控制帧（ACK/PING，payload 为空），跳过继续等待即可；
+# 超过上限仍未见问候帧才判定协议变化。
+HERMES_GREETING_SKIP_LIMIT = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -846,12 +850,20 @@ class PassiveSession:
             _print_line("session", f"认证握手已捕获 | token={core.mask_secret(token)} | 会话={self.session_id}")
 
         if session.auth_seen and not session.hermes_seen:
-            frame = core.try_parse_first_frame(bytes(session.client_buffer))
-            if frame is None:
-                self._check_handshake_buffer(session.client_buffer, "Hermes")
-                return
-            if b"<hermes>" not in frame.payload:
-                raise ValueError("认证包后未找到 Hermes 明文握手；协议版本可能已变化")
+            skipped = 0
+            while True:
+                frame = core.try_parse_first_frame(bytes(session.client_buffer))
+                if frame is None:
+                    self._check_handshake_buffer(session.client_buffer, "Hermes")
+                    return
+                if b"<hermes>" in frame.payload:
+                    break
+                # 切服重连时问候帧前可能夹杂空控制帧（ACK/PING，payload 为空）；
+                # 跳过继续等待，而不是把整个会话判死导致浮窗断粮。
+                del session.client_buffer[: len(frame.raw)]
+                skipped += len(frame.raw)
+                if skipped > HERMES_GREETING_SKIP_LIMIT:
+                    raise ValueError("认证包后未找到 Hermes 明文握手；协议版本可能已变化")
             del session.client_buffer[: len(frame.raw)]
             session.hermes_seen = True
             session.ensure_rc4()
@@ -1051,6 +1063,7 @@ class PacketObserver:
         self.sessions: dict[tuple[str, int, str, int], PassiveSession] = {}
         self._auto_sessions: dict[FlowKey, tuple[PassiveSession, Endpoint]] = {}
         self._candidates: dict[FlowKey, DiscoveryCandidate] = {}
+        self._retry_candidate_keys: set[FlowKey] = set()
         self._known_realtime_hosts: set[str] = set()
         self._closed_realtime_hosts: set[str] = set()
         self._reconnect_notified_hosts: set[str] = set()
@@ -1108,6 +1121,37 @@ class PacketObserver:
             if bool(getattr(core.ctx.options, "rf4_verbose_logging", False)):
                 _print_line("error", f"数据包处理失败 | {type(exc).__name__}: {exc}")
 
+    def _fail_auto_session(
+        self,
+        key: FlowKey,
+        session: PassiveSession,
+        exc: Exception,
+    ) -> None:
+        """解析异常的自动会话：现场拆除并允许重新探测。
+
+        此前这类异常会沿 _promote_candidate/feed_tcp 一路逃出 handle_packet，
+        而兜底 except 拿不到 session 对象（日志只能打 会话=unknown），
+        failed 标志从未生效：坏会话留在 _auto_sessions 里，之后每个数据包
+        都重复抛同一异常（坏帧卡在缓冲区头消费不掉），且流程永远回不到
+        candidate 状态、handoff bootstrap 无法介入恢复。
+        """
+        session.failed = True
+        self._auto_sessions.pop(key, None)
+        for oriented_key, candidate_session in list(self.sessions.items()):
+            if candidate_session is session:
+                self.sessions.pop(oriented_key, None)
+                break
+        # 允许该流无需 SYN/auth 首字节即可重建 candidate，走 handoff
+        # bootstrap 用已保存 token 中途对齐 RC4 恢复解析。
+        self._retry_candidate_keys.add(key)
+        _print_line_once(
+            session,
+            "session-failed",
+            "error",
+            f"会话解析已停止 | {exc} | 会话={session.session_id}"
+            " | 将按切服恢复对该连接重新探测",
+        )
+
     def _handle_auto_packet(
         self,
         src: str,
@@ -1142,12 +1186,16 @@ class PacketObserver:
                 active = None
         if active is not None:
             session, client_endpoint = active
-            session.feed_tcp(
-                from_client=source == client_endpoint,
-                seq=seq,
-                payload=payload,
-                syn=syn,
-            )
+            try:
+                session.feed_tcp(
+                    from_client=source == client_endpoint,
+                    seq=seq,
+                    payload=payload,
+                    syn=syn,
+                )
+            except (BufferError, UnicodeDecodeError, ValueError) as exc:
+                self._fail_auto_session(key, session, exc)
+                return
             if fin_or_rst:
                 from_client = source == client_endpoint
                 self._remove_auto_session(key, session, flags=flags, from_client=from_client)
@@ -1158,7 +1206,8 @@ class PacketObserver:
         candidate = self._candidates.get(key)
         if candidate is None:
             looks_like_auth = bool(payload[:1] == b"\x01")
-            if not (syn and not ack) and not looks_like_auth:
+            force_retry = key in self._retry_candidate_keys
+            if not (syn and not ack) and not looks_like_auth and not force_retry:
                 return
             self._make_candidate_room()
             now = time.monotonic()
@@ -1222,6 +1271,7 @@ class PacketObserver:
         self.sessions[oriented_key] = session
         self._auto_sessions[key] = (session, client_endpoint)
         self._candidates.pop(key, None)
+        self._retry_candidate_keys.discard(key)
         self._known_realtime_hosts.add(server_endpoint[0])
         self._closed_realtime_hosts.discard(server_endpoint[0])
 
@@ -1232,10 +1282,13 @@ class PacketObserver:
         )
         server_data = bytes(candidate.buffers.get(server_endpoint, b""))
         client_data = bytes(candidate.buffers.get(client_endpoint, b""))
-        if server_data:
-            session._process_server_bytes(server_data)
-        if client_data:
-            session._process_client_bytes(client_data)
+        try:
+            if server_data:
+                session._process_server_bytes(server_data)
+            if client_data:
+                session._process_client_bytes(client_data)
+        except (BufferError, UnicodeDecodeError, ValueError) as exc:
+            self._fail_auto_session(key, session, exc)
 
     def _remove_auto_session(
         self,
@@ -1413,7 +1466,13 @@ class PacketObserver:
         server_endpoint = candidate.suspected_server
         if server_endpoint is None:
             return False
-        client_endpoint = key[0]
+        # FlowKey 按字典序排序，不能假设客户端端点排在 key[0]：服务器 IP
+        # （如 185.71.x）可能排在客户端（192.168.x）之前，按 key[0] 取会把
+        # 服务器当成客户端、两个方向共用同一 reassembler 导致 RC4 方向颠倒。
+        if key[0] != server_endpoint:
+            client_endpoint = key[0]
+        else:
+            client_endpoint = key[1]
         server_data = bytes(candidate.buffers.get(server_endpoint, b""))
         client_data = bytes(candidate.buffers.get(client_endpoint, b""))
         if not server_data and not client_data:

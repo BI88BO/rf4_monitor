@@ -74,7 +74,7 @@ def _feed_auth_handshake(observer: PacketObserver) -> tuple[object, str]:
 def _auth_packet() -> bytes:
     import struct
     token_b = TOKEN.encode()
-    return b"\x01\x00" + struct.pack("!I", len(token_b)) + token_b
+    return b"\x01\x00" + struct.pack("<I", len(token_b)) + token_b
 
 
 class Rc4HandoffCaptureTests(unittest.TestCase):
@@ -211,6 +211,97 @@ class HandoffBootstrapTests(unittest.TestCase):
             seq=9001, payload=encrypted, flags=0x18,
         )
         self.assertNotIn(new_key, observer._auto_sessions)
+
+
+class HermesGreetingTests(unittest.TestCase):
+    def test_control_frame_before_hermes_is_skipped(self) -> None:
+        # 切服重连时客户端可能在 <hermes> 问候帧前先发空控制帧
+        # （body_len<=1，payload 为空）。旧逻辑遇到第一个非问候帧直接把会话
+        # 判死，导致浮窗断粮；现在应跳过控制帧继续等待。
+        _ctx()
+        session = PassiveSession.create("s-hermes", _make_bridge())
+        session._process_client_bytes(_auth_packet() + b"\x01\x00\x00\x00\x00")
+        self.assertTrue(session.protocol.auth_seen)
+        self.assertFalse(session.protocol.hermes_seen)
+        # 问候帧随后到达：正常完成握手。
+        session._process_client_bytes(build_frame(0, 0, b"<hermes>"))
+        self.assertTrue(session.protocol.hermes_seen)
+
+    def test_failed_session_is_torn_down_and_flow_reprobes(self) -> None:
+        # 会话解析异常后必须现场拆除（failed 标志 + 移出注册表），并把该流
+        # 标记为可重新探测；否则坏会话会每个包重复抛错、bootstrap 永远无法
+        # 介入恢复。
+        _ctx()
+        observer = _make_observer()
+        client = ("192.168.2.8", 31000)
+        old_server = ("91.132.228.133", 9453)
+        old_key = (client[0], client[1], old_server[0], old_server[1])
+        session = PassiveSession.create("old-broken", observer.bridge)
+        session.protocol.token = TOKEN
+        session.protocol.auth_seen = True
+        session.protocol.uuid_seen = True
+        session.protocol.hermes_seen = True
+        session.protocol.ensure_rc4()
+        session.valid_business_frames = 2
+        observer._auto_sessions[old_key] = (session, client)
+        observer.sessions[(client[0], client[1], old_server[0], old_server[1])] = session
+        observer._remember_rc4_handoff(session)
+        self.assertIn(TOKEN, observer._rc4_handoffs)
+
+        observer._fail_auto_session(old_key, session, ValueError("认证包后未找到 Hermes 明文握手"))
+
+        self.assertTrue(session.failed)
+        self.assertNotIn(old_key, observer._auto_sessions)
+        self.assertNotIn((client[0], client[1], old_server[0], old_server[1]), observer.sessions)
+        self.assertIn(old_key, observer._retry_candidate_keys)
+
+    def test_retry_flag_lets_midstream_flow_bootstrap(self) -> None:
+        # 复现线上事故路径：切服连接解析失败被拆除后，同一四元组继续来包
+        # （无 SYN、首字节是密文不是 auth），必须仍能建 candidate 走
+        # handoff bootstrap 中途恢复。
+        _ctx()
+        observer = _make_observer()
+        ref = RC4Stream(TOKEN.encode())
+        plain = build_request_envelope(call_id=9, main_cmd=14, sub_cmd=4, payload=b"resume")
+        encrypted = build_frame(0, 900, ref.crypt(plain))
+        stream = build_ack_frame(11) + encrypted
+
+        broken_key = ("192.168.2.8", 32000, "185.71.66.225", 9443)
+        observer._rc4_handoffs[TOKEN] = sniffer.Rc4Handoff(
+            token=TOKEN,
+            client_read_rc4=RC4Stream(TOKEN.encode()),
+            server_read_rc4=RC4Stream(TOKEN.encode()),
+            saved_at=sniffer.time.monotonic(),
+        )
+        # FlowKey 与 _handle_auto_packet 一致按字典序排序：
+        # ("185.71.66.225", 9443) 排在 ("192.168.2.8", 32000) 之前。
+        observer._retry_candidate_keys.add(
+            (("185.71.66.225", 9443), ("192.168.2.8", 32000))
+        )
+
+        seq = 7000
+        # 客户端上行包先建立 candidate（事故场景：同一四元组持续来包，无 SYN）。
+        observer._handle_auto_packet(
+            src="192.168.2.8", sport=32000, dst="185.71.66.225", dport=9443,
+            seq=seq, payload=b"", flags=0x18,
+        )
+        seq += 1
+        observer._handle_auto_packet(
+            src="185.71.66.225", sport=9443, dst="192.168.2.8", dport=32000,
+            seq=seq, payload=stream, flags=0x18,
+        )
+
+        self.assertEqual(len(observer._auto_sessions), 1)
+        _key, (session, client) = next(iter(observer._auto_sessions.items()))
+        # 方向必须正确：客户端是 192.168.2.8，服务器是 185.71.66.225
+        # （旧逻辑按字典序取 key[0] 会把 185.x 当客户端、方向颠倒）。
+        self.assertEqual(client, ("192.168.2.8", 32000))
+        self.assertEqual(
+            session.session_id, "192.168.2.8:32000 -> 185.71.66.225:9443"
+        )
+        self.assertEqual(session.protocol.token, TOKEN)
+        self.assertTrue(session.protocol.handshake_complete())
+        self.assertGreater(session.valid_business_frames, 0)
 
 
 if __name__ == "__main__":
