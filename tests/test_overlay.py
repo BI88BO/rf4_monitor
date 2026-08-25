@@ -57,7 +57,8 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
             ensure_ascii=False,
         )
         ov._handle_datagram(payload.encode("utf-8"))
-        self.assertEqual(ov.calls, [("self", "2", "【我自己】：有鱼过来了", 0)])
+        # 事件短句化 + 来鱼/咬钩 8 秒自动消失。
+        self.assertEqual(ov.calls, [("self", "2", "鱼 来鱼", 8000)])
 
     def test_kept_events_clear_after_three_seconds(self) -> None:
         ov = _empty_overlay()
@@ -128,7 +129,7 @@ class OverlayFightStatusTests(unittest.TestCase):
             ensure_ascii=False,
         )
         ov._handle_datagram(payload.encode("utf-8"))
-        self.assertEqual(ov._rows.get("3号杆"), "3号杆 | 体力 78% 出线 12.3米")
+        self.assertEqual(ov._rows.get("3号杆"), "3号杆 78% 12.3米")
 
     def test_fight_status_category_updates_rod_row(self) -> None:
         # 三档拆分后搏鱼状态行走 fight_status 类别，仍按号杆前缀就地更新。
@@ -138,7 +139,18 @@ class OverlayFightStatusTests(unittest.TestCase):
             ensure_ascii=False,
         )
         ov._handle_datagram(payload.encode("utf-8"))
-        self.assertEqual(ov._rows.get("1号杆"), "1号杆 | 体力 100% 出线 33.486米")
+        self.assertEqual(ov._rows.get("1号杆"), "1号杆 100% 33.486米")
+
+    def test_handheld_fight_status_gets_own_row(self) -> None:
+        # 手持竿搏鱼状态独立成行就地更新，不进遥测区闪现。
+        ov = self._overlay()
+        payload = json.dumps(
+            {"event": "telemetry", "category": "fish",
+             "text": "手持竿 | 鱼=蓝鳃太阳鱼 重量=1.553 公斤 体力 90% 出线 5.0米"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("手持竿"), "手持竿 蓝鳃太阳鱼1.553kg 90% 5.0米")
 
     def test_fight_details_goes_to_generic(self) -> None:
         # fight_details 无号杆前缀，进遥测区通用显示。
@@ -338,6 +350,94 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         ov._draw(width=320, height=60)
         texts = [k for k in ov.created if k[0] == "text"]
         self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_RED)
+
+
+class OverlayCompactTests(unittest.TestCase):
+    """浮窗紧凑化：搏鱼行单行化 + 事件短句化，三竿同开不再满屏折行。"""
+
+    def test_compact_fight_full(self) -> None:
+        text = "1号杆 | [稀有★] 鱼=黑线鳕 重量=444 克 体力 78% 出线 12.3米"
+        self.assertEqual(
+            Overlay._compact_fight_line(text),
+            "1号杆 ★黑线鳕444g 78% 12.3米",
+        )
+
+    def test_compact_fight_kilograms_trim_zeros(self) -> None:
+        text = "2号杆 | 鱼=隆头鳕 重量=1.250 公斤 体力 80% 出线 18.6米"
+        self.assertEqual(
+            Overlay._compact_fight_line(text),
+            "2号杆 隆头鳕1.25kg 80% 18.6米",
+        )
+
+    def test_compact_fight_super_rare_symbol(self) -> None:
+        text = "3号杆 | [超级稀有◆] 鱼=蓝鳃太阳鱼 重量=6.030 公斤 体力 55% 出线 40.02米"
+        self.assertEqual(
+            Overlay._compact_fight_line(text),
+            "3号杆 ◆蓝鳃太阳鱼6.03kg 55% 40.02米",
+        )
+
+    def test_compact_fight_without_fish_meta(self) -> None:
+        self.assertEqual(
+            Overlay._compact_fight_line("3号杆 | 体力 78% 出线 12.3米"),
+            "3号杆 78% 12.3米",
+        )
+
+    def test_compact_fight_minimal_unchanged(self) -> None:
+        # 解析不到任何内容时保持原样。
+        self.assertEqual(Overlay._compact_fight_line("1号杆"), "1号杆")
+
+    def test_compact_self_event_incoming(self) -> None:
+        text = "【我自己】：[稀有★] 有蓝鳃太阳鱼 1.553 公斤 过来了"
+        self.assertEqual(Overlay._compact_self_event(text), "★蓝鳃太阳鱼1.553kg 来鱼")
+
+    def test_compact_self_event_bitten(self) -> None:
+        text = "【我自己】：[达标] 黑线鳕 444 克 咬钩了"
+        self.assertEqual(Overlay._compact_self_event(text), "黑线鳕444g 咬钩")
+
+    def test_compact_self_event_released(self) -> None:
+        text = "【我自己】：[超级稀有◆] 放生了 鲤鱼"
+        self.assertEqual(Overlay._compact_self_event(text), "◆鲤鱼 放生")
+
+    def test_compact_self_event_escaped(self) -> None:
+        text = "【我自己】：鲤鱼 2.0 公斤 挣脱跑了（脱钩）"
+        self.assertEqual(Overlay._compact_self_event(text), "鲤鱼2kg 脱钩")
+
+    def test_compact_self_event_plain_release(self) -> None:
+        self.assertEqual(Overlay._compact_self_event("【我自己】：放生了"), "放生")
+
+    def test_compact_self_event_fallback_keeps_original(self) -> None:
+        text = "完全不是事件格式的文本"
+        self.assertEqual(Overlay._compact_self_event(text), text)
+
+    def test_incoming_and_bitten_auto_clear_after_8s(self) -> None:
+        ov = object.__new__(Overlay)
+        after_calls: list[tuple] = []
+        ov.root = SimpleNamespace(after=lambda delay, fn: after_calls.append(delay))
+        ov._rows = {}
+        ov._refresh_display = lambda: None
+        payload = json.dumps(
+            {"event": "fish_incoming", "gear_slot": "2号杆",
+             "text": "【我自己】：有鲤鱼 2.0 公斤 过来了"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("2号杆"), "鲤鱼2kg 来鱼")
+        self.assertIn(8000, after_calls)
+
+    def test_kept_still_clears_after_3s(self) -> None:
+        ov = object.__new__(Overlay)
+        after_calls: list[tuple] = []
+        ov.root = SimpleNamespace(after=lambda delay, fn: after_calls.append(delay))
+        ov._rows = {}
+        ov._refresh_display = lambda: None
+        payload = json.dumps(
+            {"event": "fish_kept", "gear_slot": "1号杆",
+             "text": "【我自己】：黑线鳕 444 克 入护了"},
+            ensure_ascii=False,
+        )
+        ov._handle_datagram(payload.encode("utf-8"))
+        self.assertEqual(ov._rows.get("1号杆"), "黑线鳕444g 入护")
+        self.assertIn(3000, after_calls)
 
 
 class OverlayAnticheatTimerTests(unittest.TestCase):

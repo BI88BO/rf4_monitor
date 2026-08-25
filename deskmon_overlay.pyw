@@ -306,11 +306,109 @@ class Overlay:
 
     @staticmethod
     def _fight_row_color(text: str, default: str) -> str:
-        # 体力 ≤ 0 表示鱼已力竭，行文字变红；其余用默认前景色。
-        match = re.search(r"体力\s*(\d+)%", text)
+        # 力竭判定：行内唯一的百分数即体力，≤0 变红（兼容新旧两种行格式）。
+        match = re.search(r"(\d+)\s*%", text)
         if match and int(match.group(1)) <= 0:
             return "#ff5252"
         return default
+
+    _WEIGHT_PART_RE = re.compile(r"重量=\s*([\d.]+)\s*(公斤|克)")
+    _BARE_WEIGHT_RE = re.compile(r"([\d.]+)\s*(公斤|克)")
+
+    @classmethod
+    def _fmt_weight(cls, value: str, unit: str) -> str:
+        if unit == "公斤":
+            return value.rstrip("0").rstrip(".") + "kg"
+        return value + "g"
+
+    @classmethod
+    def _grade_symbol(cls, grade: str) -> str:
+        """等级徽标压缩：只保留稀有度符号，达标/不达标不占宽度。"""
+        if "超级稀有" in grade or "◆" in grade:
+            return "◆"
+        if "稀有" in grade or "★" in grade:
+            return "★"
+        return ""
+
+    @classmethod
+    def _compact_fight_line(cls, text: str) -> str:
+        """把搏鱼状态行压缩成单行：`1号杆 ★黑线鳕444g 78% 12.3米`。
+
+        浮窗仅 320px 宽，完整格式(`1号杆 | [达标] 鱼=x 重量=x 克 体力=x% 出线=x米`)
+        必然折行 2~3 行，三竿同开时整窗全是文字。解析失败时返回原文。
+        """
+        m = re.match(r"^(\d+号杆|手持竿)\s*\|\s*", text)
+        if not m:
+            return text
+        slot, body = m.group(1), text[m.end():]
+        out = [slot]
+        star = ""
+        gm = re.search(r"\[([^\]]+)\]", body)
+        if gm:
+            star = cls._grade_symbol(gm.group(1))
+        fm = re.search(r"鱼=([^\s]+)", body)
+        wm = cls._WEIGHT_PART_RE.search(body)
+        if fm:
+            fish = fm.group(1)
+            wtxt = cls._fmt_weight(wm.group(1), wm.group(2)) if wm else ""
+            out.append(star + fish + wtxt)
+        elif wm:
+            out.append(star + cls._fmt_weight(wm.group(1), wm.group(2)))
+        elif star:
+            out.append(star)
+        sm = re.search(r"体力\s*(\d+)\s*%", body)
+        if sm:
+            out.append(sm.group(1) + "%")
+        dm = re.search(r"出线\s*([\d.]+)米", body)
+        if dm:
+            out.append(dm.group(1) + "米")
+        if len(out) == 1:
+            return text
+        return " ".join(out)
+
+    _SELF_EVENT_PREFIX = "【我自己】："
+    _SELF_PHASE_SUFFIXES = (
+        ("挣脱跑了（脱钩）", "脱钩"),
+        ("咬钩了", "咬钩"),
+        ("过来了", "来鱼"),
+        ("入护了", "入护"),
+    )
+
+    @classmethod
+    def _compact_self_event(cls, text: str) -> str:
+        """来鱼/咬钩等事件压成短句：`★蓝鳃太阳鱼1.55kg 来鱼`。失败返回原文。"""
+        if not text.startswith(cls._SELF_EVENT_PREFIX):
+            return text
+        body = text[len(cls._SELF_EVENT_PREFIX):]
+        star = ""
+        gm = re.match(r"\[([^\]]+)\]\s*", body)
+        if gm:
+            star = cls._grade_symbol(gm.group(1))
+            body = body[gm.end():]
+        phase = ""
+        for pat, tag in cls._SELF_PHASE_SUFFIXES:
+            if body.endswith(pat):
+                body = body[: -len(pat)]
+                phase = tag
+                break
+        else:
+            if body.startswith("放生"):
+                phase = "放生"
+                body = body[len("放生了"):].lstrip()
+        body = body.strip()
+        if body.startswith("有"):
+            body = body[1:].strip()
+        wm = cls._BARE_WEIGHT_RE.search(body)
+        name, wtxt = body.strip(), ""
+        if wm:
+            wtxt = cls._fmt_weight(wm.group(1), wm.group(2))
+            name = (body[: wm.start()] + body[wm.end():]).strip()
+        core = (star + name + wtxt).strip()
+        if phase and core:
+            return f"{core} {phase}"
+        if core:
+            return core
+        return phase or text
 
     def _show_telemetry(self, text):
         # 遥测信息独立成区：新消息追加，不覆盖旧的；超限时丢弃最旧。
@@ -498,19 +596,26 @@ class Overlay:
         name = event.get("event")
         gear_slot = event.get("gear_slot") or ""
         text = event.get("text") or ""
-        clear_after = 3000 if name in ("fish_kept", "fish_escaped", "fish_released") else 0
+        # 来鱼/咬钩 8 秒自动消失(避免长期占用竿行)；入护/脱钩/放生维持 3 秒。
+        if name in ("fish_kept", "fish_escaped", "fish_released"):
+            clear_after = 3000
+        elif name in ("fish_incoming", "fish_bitten"):
+            clear_after = 8000
+        else:
+            clear_after = 0
         if name == "reset":
             self._reset_to_idle()
         elif name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
-            self._show_self_event(gear_slot, text, clear_after)
+            self._show_self_event(gear_slot, self._compact_self_event(text), clear_after)
         elif name in ("fish_catch", "chat"):
             self._show_generic(text)
         elif name == "telemetry":
             if not text:
                 return
-            match = re.match(r"^(\d+)号杆 ", text)
+            # 竿行/手持竿就地更新并压缩成单行；其余进遥测区通用显示。
+            match = re.match(r"^(\d+号杆|手持竿) ", text)
             if match:
-                self._update_row(f"{match.group(1)}号杆", text)
+                self._update_row(match.group(1), self._compact_fight_line(text))
             else:
                 self._show_generic(text)
         elif name == "anticheat":
