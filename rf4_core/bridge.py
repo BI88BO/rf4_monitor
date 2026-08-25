@@ -40,7 +40,12 @@ class BoundedSet(set):
             self.discard(next(iter(self)))
 
 from . import console
-from .fish_labels import load_fish_grade_config, load_fish_labels, load_unlocalized_fish_keys
+from .fish_labels import (
+    CACHE_DIR,
+    load_fish_grade_config,
+    load_fish_labels,
+    load_unlocalized_fish_keys,
+)
 from .launcher import parse_https_upstream_map, rewrite_login_logon_info
 from .protocol import (
     BuildingRpcRequest,
@@ -478,6 +483,10 @@ class RF4ChatBridge:
         self._gear_config_by_id: Dict[int, dict] = {}
         self._gear_config_hashes: List[str] = []
         try:
+            self._restore_gear_config_hashes()
+        except Exception:
+            pass
+        try:
             self._load_gear_config_from_cache()
         except Exception:
             pass
@@ -487,6 +496,37 @@ class RF4ChatBridge:
         self._show_cfg_min_interval = 1.0  # 秒，避免每次广播读盘
         self._fish_grade_labels, self._fish_grade_by_line_type = load_fish_grade_config()
         self._unlocalized_fish_keys = load_unlocalized_fish_keys()
+
+    def _gear_hash_store_path(self) -> Path:
+        """配置版本 hash 的持久化位置（.cache 目录，打包态在 exe 旁）。"""
+        return CACHE_DIR / "gear_config_hashes.json"
+
+    def _restore_gear_config_hashes(self) -> None:
+        """恢复上次运行捕获的配置版本 hash，使启动时即可解密本地部件目录。
+
+        hash 仅在登录流量中出现且此前只存内存，重启即丢；持久化后只要成功
+        捕获过一次，之后每次启动都能解密出完整部件目录（游戏更新配置版本
+        后会被新捕获的 hash 覆盖）。
+        """
+        try:
+            payload = json.loads(self._gear_hash_store_path().read_text("utf-8"))
+        except (OSError, ValueError):
+            return
+        hashes = payload.get("hashes") if isinstance(payload, dict) else None
+        if isinstance(hashes, list):
+            self._gear_config_hashes = [str(h) for h in hashes if str(h)]
+    def _persist_gear_config_hashes(self) -> None:
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._gear_hash_store_path().write_text(
+                json.dumps(
+                    {"hashes": list(dict.fromkeys(self._gear_config_hashes))},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _load_gear_config_from_cache(self) -> None:
         try:
@@ -541,6 +581,12 @@ class RF4ChatBridge:
             self._log(
                 f"已从游戏本地缓存读取真实装备部件目录：{len(self._gear_config_by_id)} 件"
                 + (f" (hash={best_hash[:8]}...)" if best_hash else "")
+            )
+        elif hashes and hashes != [""]:
+            # 有 hash 却解不出：缓存文件缺失/版本不匹配，需要用户感知而非静默。
+            self._log(
+                "未能从游戏本地配置缓存解密出部件目录"
+                f"(尝试 {len(hashes)} 个版本 hash)；将在下次登录捕获新 hash 后重试"
             )
 
     def _load_item_catalog_index(self) -> None:
@@ -2189,8 +2235,12 @@ class RF4ChatBridge:
         if not hashes:
             return
         self._gear_config_hashes = list(dict.fromkeys(hashes))
-        if ctx.options.rf4_verbose_logging:
-            self._log(f"已捕获 game/configs 1/5 配置版本 hash={self._gear_config_hashes}")
+        # 捕获成功必须可见（此前被 verbose 开关吞掉，难以定位部件目录为何为空）。
+        self._log(
+            f"已捕获 game/configs 配置版本 hash {len(self._gear_config_hashes)} 个，"
+            "已持久化供启动解密部件目录"
+        )
+        self._persist_gear_config_hashes()
         if not self._gear_config_by_id:
             self._load_gear_config_from_cache()
 
@@ -3193,9 +3243,15 @@ class RF4ChatBridge:
         if not slots:
             return
         # 11/1(请求当前装备槽位)响应包含完整快捷键槽位映射，可更新 slot_items 反查竿号。
-        # 11/2(切换装备槽位)响应只是"当前活动槽位"单条(slot_type 恒为 4，非快捷键编号)，
-        # 不更新映射也不参与竿号显示，直接忽略。
+        shortcut_numbers = session.profile.shortcut_slot_numbers
         if sub_cmd == 2:
+            # 11/2(切换装备槽位)单条响应：玩家切到快捷键槽 N 时携带该槽当前内容，
+            # 是中途换杆后唯一的槽位更新来源，必须采纳，否则换杆后新竿永远没有
+            # 竿号（映射停留在登录时的旧钓组上）。
+            # slot_type=4 是"当前活动位"噪声(占绝大多数)，不可翻译成竿号，仍忽略。
+            for slot in slots:
+                if slot.slot_type in shortcut_numbers:
+                    session.slot_items[slot.slot_type] = slot.item_guid
             return
         for slot in slots:
             session.slot_items[slot.slot_type] = slot.item_guid
@@ -3203,10 +3259,9 @@ class RF4ChatBridge:
     def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
         if not fishing_gear_id:
             return ""
-        # 竿号只来自 11/1 请求当前装备槽位的完整快捷键映射(slot_items 1/2/3...)。
-        # 注意：11/2 切换槽位响应的 slot_type 恒为 4(当前活动位)，不是快捷键编号，
-        # 不经映射直接显示会错误输出"4号杆"。slot_type 经 profile.shortcut_slot_numbers
-        # 翻译成竿号；未收录的类型不显示竿号，并记 verbose 日志便于补全映射。
+        # 竿号来自 slot_items 映射（11/1 完整映射 + 11/2 单槽增量更新）。
+        # slot_type 经 profile.shortcut_slot_numbers 翻译成竿号；
+        # 未收录的类型不显示竿号，并记 verbose 日志便于补全映射。
         for slot_type, item_guid in session.slot_items.items():
             if item_guid == fishing_gear_id:
                 rod_number = session.profile.shortcut_slot_numbers.get(slot_type)

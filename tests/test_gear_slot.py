@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rf4_core import bridge as bridge_mod
 from rf4_core.bridge import FlowSession, RF4ChatBridge
-from rf4_core.protocol import get_profile
+from rf4_core.protocol import (
+    build_response_envelope,
+    get_profile,
+    pack_u16,
+    pack_u32,
+)
 
 
 def _session_with_slots(slots: dict[int, str]) -> tuple[RF4ChatBridge, FlowSession]:
@@ -25,6 +31,16 @@ def _session_with_slots(slots: dict[int, str]) -> tuple[RF4ChatBridge, FlowSessi
     session = FlowSession(profile=get_profile("4.0.24799"))
     session.slot_items.update(slots)
     return bridge, session
+
+
+def _slot_payload(slot_type: int, item_guid: str) -> bytes:
+    """11/2 单条槽位响应的 payload：typed_list(65)[object(136){u16 type; guid}]。"""
+    entry = (
+        b"\x01" + pack_u32(136)
+        + pack_u16(slot_type)
+        + uuid.UUID(item_guid).bytes_le
+    )
+    return b"\x03\x02" + b"65" + pack_u16(1) + entry
 
 
 class GearSlotTextTests(unittest.TestCase):
@@ -50,6 +66,91 @@ class GearSlotTextTests(unittest.TestCase):
     def test_gear_not_in_slots_returns_empty(self) -> None:
         bridge, session = _session_with_slots({1: "gear-a"})
         self.assertEqual(bridge._gear_slot_text(session, "gear-zzz"), "")
+
+
+class SwitchSlotUpdateTests(unittest.TestCase):
+    """11/2(切换装备槽位)增量更新：中途换杆后竿号映射必须跟上。"""
+
+    def setUp(self) -> None:
+        self.bridge, self.session = _session_with_slots(
+            {1: "11111111-1111-1111-1111-111111111111"}
+        )
+
+    def _feed_switch(self, call_id: int, slot_type: int, item_guid: str) -> None:
+        self.session.slot_request_calls[call_id] = 2
+        plain = build_response_envelope(
+            call_id=call_id, payload=_slot_payload(slot_type, item_guid)
+        )
+        self.bridge._remember_server_slot_items(self.session, plain, sub_cmd=2)
+
+    def test_switch_updates_shortcut_slot_mapping(self) -> None:
+        # 换杆场景：新钓组进 1 号槽，玩家按键切换时 11/2 上报该槽内容。
+        new_gear = "22222222-2222-2222-2222-222222222222"
+        self._feed_switch(7, 1, new_gear)
+        self.assertEqual(self.session.slot_items[1], new_gear)
+        # 旧钓组已不在槽内，新钓组正确显示竿号。
+        self.assertEqual(
+            self.bridge._gear_slot_text(self.session, new_gear), "1号杆"
+        )
+        self.assertEqual(
+            self.bridge._gear_slot_text(
+                self.session, "11111111-1111-1111-1111-111111111111"
+            ),
+            "",
+        )
+
+    def test_switch_ignores_active_slot_noise(self) -> None:
+        # slot_type=4 是"当前活动位"，不是快捷键编号，不得写入映射。
+        gear = "33333333-3333-3333-3333-333333333333"
+        self._feed_switch(8, 4, gear)
+        self.assertNotIn(4, self.session.slot_items)
+        self.assertEqual(
+            self.bridge._gear_slot_text(self.session, gear), ""
+        )
+
+    def test_switch_ignores_unmapped_slot_types(self) -> None:
+        gear = "44444444-4444-4444-4444-444444444444"
+        self._feed_switch(9, 50, gear)
+        self.assertNotIn(50, self.session.slot_items)
+
+
+class GearConfigHashStoreTests(unittest.TestCase):
+    """配置版本 hash 持久化：捕获一次后重启即可解密部件目录。"""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        tmp_path = Path(self._tmpdir.name)
+        self.bridge, _session = _session_with_slots({})
+        self.store = tmp_path / "gear_config_hashes.json"
+        self.bridge._gear_hash_store_path = lambda: self.store
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+        bridge_mod.ctx = getattr(self, "_prev_ctx", None)
+
+    def test_persist_then_restore_roundtrip(self) -> None:
+        self.bridge._gear_config_hashes = ["abc123", "def456"]
+        self.bridge._persist_gear_config_hashes()
+        self.assertTrue(self.store.exists())
+        fresh_bridge, _session = _session_with_slots({})
+        fresh_bridge._gear_hash_store_path = lambda: self.store
+        fresh_bridge._restore_gear_config_hashes()
+        self.assertEqual(fresh_bridge._gear_config_hashes, ["abc123", "def456"])
+
+    def test_restore_missing_file_keeps_empty(self) -> None:
+        self.bridge._restore_gear_config_hashes()
+        self.assertEqual(self.bridge._gear_config_hashes, [])
+
+    def test_restore_ignores_malformed_payload(self) -> None:
+        self.store.write_text("not json{", encoding="utf-8")
+        try:
+            self.bridge._restore_gear_config_hashes()
+        except ValueError:
+            self.fail("malformed store should not raise")
+        # 解析失败时保持原状（不抛出、不写入坏数据）。
+        self.assertEqual(self.bridge._gear_config_hashes, [])
 
 
 if __name__ == "__main__":
