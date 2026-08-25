@@ -111,6 +111,13 @@ HERMES_GREETING_SKIP_LIMIT = 256 * 1024
 # 卡死（无错误也无数据）。超时后判死该会话并交由切服恢复(token 重建 RC4)
 # 中途接管。
 HERMES_GREETING_TIMEOUT_SECONDS = 8.0
+# 切服诊断窗口：会话判死拆除后，在自动识别的所有过滤门槛之前统计每条 TCP
+# 流的双向字节数/特征，窗口结束打印汇总表。用于定位切换后真正承载业务但
+# 因无 auth/SYN 特征而被放行的连接（纯加密续传流）。
+FLOW_DIAG_WINDOW_SECONDS = 60.0
+FLOW_DIAG_MAX_FLOWS = 96
+# 每条流每个方向保留的 auth 特征扫描字节上限。
+FLOW_DIAG_AUTH_SCAN_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -1017,6 +1024,16 @@ def _print_line_once(owner: object, name: str, category: str, text: str) -> None
 
 
 @dataclass
+class _DiagFlow:
+    """切服诊断窗口内单条 TCP 流的统计信息。"""
+
+    bytes_by_ep: dict[Endpoint, int] = field(default_factory=dict)
+    auth_buf_by_ep: dict[Endpoint, bytearray] = field(default_factory=dict)
+    saw_syn: bool = False
+    packets: int = 0
+
+
+@dataclass
 class Rc4Handoff:
     token: str
     client_read_rc4: object
@@ -1095,6 +1112,8 @@ class PacketObserver:
         self._rc4_handoffs: dict[str, Rc4Handoff] = {}
         self._packets_since_cleanup = 0
         self.total_packets = 0
+        self._diag_deadline: Optional[float] = None
+        self._diag_flows: dict[FlowKey, _DiagFlow] = {}
 
     def handle_packet(self, packet) -> None:
         try:
@@ -1169,6 +1188,8 @@ class PacketObserver:
         # 允许该流无需 SYN/auth 首字节即可重建 candidate，走 handoff
         # bootstrap 用已保存 token 中途对齐 RC4 恢复解析。
         self._retry_candidate_keys.add(key)
+        # 启动切服诊断窗口：统计随后所有 TCP 流，定位真正承载业务的连接。
+        self._start_flow_diag()
         _print_line_once(
             session,
             "session-failed",
@@ -1176,6 +1197,94 @@ class PacketObserver:
             f"会话解析已停止 | {exc} | 会话={session.session_id}"
             " | 将按切服恢复对该连接重新探测",
         )
+
+    def _start_flow_diag(self) -> None:
+        """启动切服诊断窗口：记录接下来所有 TCP 流的特征，定位真正业务流。"""
+        self._diag_deadline = time.monotonic() + FLOW_DIAG_WINDOW_SECONDS
+        self._diag_flows = {}
+
+    def _record_flow_diag(
+        self,
+        key: FlowKey,
+        source: Endpoint,
+        payload: bytes,
+        syn: bool,
+    ) -> None:
+        """在所有过滤门槛之前统计当前包，确保被放行的流也纳入诊断。"""
+        if self._diag_deadline is None:
+            return
+        flow = self._diag_flows.get(key)
+        if flow is None:
+            if len(self._diag_flows) >= FLOW_DIAG_MAX_FLOWS:
+                return
+            flow = _DiagFlow()
+            self._diag_flows[key] = flow
+        flow.packets += 1
+        if syn:
+            flow.saw_syn = True
+        flow.bytes_by_ep[source] = flow.bytes_by_ep.get(source, 0) + len(payload)
+        if payload:
+            buf = flow.auth_buf_by_ep.setdefault(source, bytearray())
+            if len(buf) < FLOW_DIAG_AUTH_SCAN_BYTES:
+                room = FLOW_DIAG_AUTH_SCAN_BYTES - len(buf)
+                buf.extend(payload[:room])
+
+    def _maybe_dump_flow_diag(self) -> None:
+        if self._diag_deadline is None:
+            return
+        if time.monotonic() < self._diag_deadline:
+            return
+        self._dump_flow_diag()
+        self._diag_deadline = None
+        self._diag_flows = {}
+
+    def _dump_flow_diag(self) -> None:
+        """打印诊断窗口内所有流的特征表，定位切换后被放行的业务连接。"""
+        known_hosts = self._known_realtime_hosts | self._closed_realtime_hosts
+        rows: list[str] = []
+        for key, flow in self._diag_flows.items():
+            ep_a, ep_b = key
+            server_ep = None
+            if ep_a[0] in known_hosts:
+                server_ep = ep_a
+            elif ep_b[0] in known_hosts:
+                server_ep = ep_b
+            if server_ep is not None:
+                client_ep = ep_b if server_ep == ep_a else ep_a
+                c_bytes = flow.bytes_by_ep.get(client_ep, 0)
+                s_bytes = flow.bytes_by_ep.get(server_ep, 0)
+                display = f"{client_ep[0]}:{client_ep[1]} -> {server_ep[0]}:{server_ep[1]}"
+                auth_seen = core.try_parse_auth_packet(
+                    bytes(flow.auth_buf_by_ep.get(client_ep, b""))
+                ) is not None or core.try_parse_auth_packet(
+                    bytes(flow.auth_buf_by_ep.get(server_ep, b""))
+                ) is not None
+            else:
+                c_bytes = flow.bytes_by_ep.get(ep_a, 0)
+                s_bytes = flow.bytes_by_ep.get(ep_b, 0)
+                display = f"{ep_a[0]}:{ep_a[1]} <-> {ep_b[0]}:{ep_b[1]}"
+                auth_seen = False
+            tags: list[str] = []
+            if auth_seen:
+                tags.append("auth")
+            if flow.saw_syn:
+                tags.append("syn")
+            if key in self._auto_sessions:
+                tags.append("session")
+            if key in self._candidates:
+                tags.append("candidate")
+            if key in self._retry_candidate_keys:
+                tags.append("retry")
+            rows.append(
+                f"  {display}  ↑{c_bytes}B ↓{s_bytes}B "
+                f"包={flow.packets} [{' '.join(tags) or '-'}]"
+            )
+        _print_line(
+            "warning",
+            f"切服诊断窗口结束：共 {len(rows)} 条 TCP 流",
+        )
+        for row in rows:
+            _print_line("warning", row)
 
     def _handle_auto_packet(
         self,
@@ -1199,6 +1308,10 @@ class PacketObserver:
         syn = bool(flags & 0x02)
         ack = bool(flags & 0x10)
         fin_or_rst = bool(flags & 0x05)
+
+        # 切服诊断：在任何识别/过滤门槛之前记录当前包，业务流即使被放行也可见。
+        self._record_flow_diag(key, source, payload, syn)
+        self._maybe_dump_flow_diag()
 
         active = self._auto_sessions.get(key)
         if active is not None and syn and not ack:
