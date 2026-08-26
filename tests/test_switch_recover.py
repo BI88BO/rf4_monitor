@@ -476,5 +476,30 @@ class FlowDiagTests(unittest.TestCase):
         self.assertIn(old_key, observer._retry_candidate_keys)
 
 
+class ResyncWarnThrottleTests(unittest.TestCase):
+    def test_resync_failure_warning_throttled_per_direction(self) -> None:
+        # VPN/丢包场景同一缺口每秒重复失败：30s 窗口内只打一条，
+        # 下条附带累计次数；两个方向互不影响。
+        _ctx()
+        session = PassiveSession.create("s-throttle", _make_bridge())
+        clock = {"t": 0.0}
+        msgs: list[str] = []
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            with mock.patch.object(
+                sniffer, "_print_line", lambda cat, text: msgs.append(text)
+            ):
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += 10
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += 10
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += sniffer.RESYNC_FAIL_WARN_INTERVAL_SECONDS + 1
+                session._warn_resync_failure("服务器下行", 163)
+                session._warn_resync_failure("客户端上行", 163)
+            self.assertEqual(len(msgs), 3)
+            self.assertIn("已连续失败 2 次", msgs[1])
+            self.assertIn("163 字节", msgs[2])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,9 @@ MAX_RECOVERABLE_TCP_GAP_BYTES = 4096
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
 TCP_GAP_STALL_SECONDS = 45.0
+# 缺口重同步失败警告的最小间隔：VPN/丢包场景下同一缺口会每秒重复失败，
+# 不限频会以 ~1.6 条/秒的速度淹没日志。
+RESYNC_FAIL_WARN_INTERVAL_SECONDS = 30.0
 VIRTUAL_INTERFACE_HINTS = (
     "accelerator",
     "clash",
@@ -687,6 +690,8 @@ class PassiveSession:
     invalid_client_frames: int = 0
     invalid_server_frames: int = 0
     warned_tcp_gaps: set[str] = field(default_factory=set)
+    # 缺口重同步失败限频状态：direction -> (上次告警时间, 连续失败次数)。
+    resync_fail_warn: dict[str, tuple[float, int]] = field(default_factory=dict)
 
     @classmethod
     def create(cls, session_id: str, bridge: core.RF4ChatBridge) -> "PassiveSession":
@@ -791,10 +796,7 @@ class PassiveSession:
             return 0, b""
         resync = self._resync_gap_cipher(cipher, pending_data, gap_bytes)
         if resync is None:
-            _print_line(
-                "warning",
-                f"{direction} TCP 缺口 {gap_bytes} 字节无法通过信封校验重同步，放弃恢复 | 会话={self.session_id}",
-            )
+            self._warn_resync_failure(direction, gap_bytes)
             return 0, b""
         lost, fpos = resync
         cipher.keystream(lost + fpos)
@@ -802,6 +804,24 @@ class PassiveSession:
         buffer.clear()
         gap_bytes, chunk = reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
         return gap_bytes, chunk[fpos:]
+
+    def _warn_resync_failure(self, direction: str, gap_bytes: int) -> None:
+        """重同步失败警告按方向限频：VPN/丢包场景同一缺口每秒重复失败，
+        不限频会以 ~1.6 条/秒淹没日志。窗口内的失败只累计计数，下次告警
+        时附带"已连续失败 N 次"。"""
+        now = time.monotonic()
+        state = self.resync_fail_warn.get(direction)
+        streak = state[1] + 1 if state else 1
+        if state is not None and now - state[0] < RESYNC_FAIL_WARN_INTERVAL_SECONDS:
+            self.resync_fail_warn[direction] = (state[0], streak)
+            return
+        self.resync_fail_warn[direction] = (now, 0)
+        extra = f"（此前已连续失败 {streak - 1} 次）" if streak > 1 else ""
+        _print_line(
+            "warning",
+            f"{direction} TCP 缺口 {gap_bytes} 字节无法通过信封校验重同步，放弃恢复{extra}"
+            f" | 会话={self.session_id}",
+        )
 
     @staticmethod
     def _resync_gap_cipher(
