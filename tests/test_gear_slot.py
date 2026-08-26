@@ -118,17 +118,20 @@ class GearConfigHashStoreTests(unittest.TestCase):
     """配置版本 hash 持久化：捕获一次后重启即可解密部件目录。"""
 
     def setUp(self) -> None:
+        self.bridge, _session = _session_with_slots({})
+        # 桥接构造时会恢复真实 .cache 存档；本类只测存取逻辑，清零隔离。
+        self.bridge._gear_config_hashes = []
         import tempfile
 
         self._tmpdir = tempfile.TemporaryDirectory()
         tmp_path = Path(self._tmpdir.name)
-        self.bridge, _session = _session_with_slots({})
         self.store = tmp_path / "gear_config_hashes.json"
         self.bridge._gear_hash_store_path = lambda: self.store
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
-        bridge_mod.ctx = getattr(self, "_prev_ctx", None)
+        if hasattr(self, "_prev_ctx"):
+            bridge_mod.ctx = self._prev_ctx
 
     def test_persist_then_restore_roundtrip(self) -> None:
         self.bridge._gear_config_hashes = ["abc123", "def456"]

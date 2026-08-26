@@ -229,6 +229,8 @@ class FlowSession:
 
 
 class RF4ChatBridge:
+    # 启动时解密本地部件目录（多文件×多变体，较慢）；测试套件置 False 跳过。
+    ALLOW_STARTUP_CACHE_DECRYPT = True
     SELF_EVENT_PHASE_INCOMING = "incoming"
     SELF_EVENT_PHASE_BITTEN = "bitten"
     SELF_EVENT_PHASE_KEPT = "kept"
@@ -529,6 +531,9 @@ class RF4ChatBridge:
             pass
 
     def _load_gear_config_from_cache(self) -> None:
+        # 测试套件通过类开关跳过真实解密（慢：多文件 × 多变体 RC4/SHA1）。
+        if not self.__class__.ALLOW_STARTUP_CACHE_DECRYPT:
+            return
         try:
             from .game_catalog import (
                 extract_gear_config_records_from_cache,

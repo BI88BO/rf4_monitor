@@ -322,15 +322,6 @@ class Overlay:
         return value + "g"
 
     @classmethod
-    def _grade_symbol(cls, grade: str) -> str:
-        """等级徽标压缩：只保留稀有度符号，达标/不达标不占宽度。"""
-        if "超级稀有" in grade or "◆" in grade:
-            return "◆"
-        if "稀有" in grade or "★" in grade:
-            return "★"
-        return ""
-
-    @classmethod
     def _compact_fight_line(cls, text: str) -> str:
         """把搏鱼状态行压缩成单行：`1号杆 ★黑线鳕444g 78% 12.3米`。
 
@@ -342,20 +333,17 @@ class Overlay:
             return text
         slot, body = m.group(1), text[m.end():]
         out = [slot]
-        star = ""
         gm = re.search(r"\[([^\]]+)\]", body)
         if gm:
-            star = cls._grade_symbol(gm.group(1))
+            out.append(f"[{gm.group(1)}]")
         fm = re.search(r"鱼=([^\s]+)", body)
         wm = cls._WEIGHT_PART_RE.search(body)
         if fm:
             fish = fm.group(1)
             wtxt = cls._fmt_weight(wm.group(1), wm.group(2)) if wm else ""
-            out.append(star + fish + wtxt)
+            out.append(fish + wtxt)
         elif wm:
-            out.append(star + cls._fmt_weight(wm.group(1), wm.group(2)))
-        elif star:
-            out.append(star)
+            out.append(cls._fmt_weight(wm.group(1), wm.group(2)))
         sm = re.search(r"体力\s*(\d+)\s*%", body)
         if sm:
             out.append(sm.group(1) + "%")
@@ -380,10 +368,10 @@ class Overlay:
         if not text.startswith(cls._SELF_EVENT_PREFIX):
             return text
         body = text[len(cls._SELF_EVENT_PREFIX):]
-        star = ""
+        grade = ""
         gm = re.match(r"\[([^\]]+)\]\s*", body)
         if gm:
-            star = cls._grade_symbol(gm.group(1))
+            grade = f"[{gm.group(1)}]"
             body = body[gm.end():]
         phase = ""
         for pat, tag in cls._SELF_PHASE_SUFFIXES:
@@ -403,7 +391,7 @@ class Overlay:
         if wm:
             wtxt = cls._fmt_weight(wm.group(1), wm.group(2))
             name = (body[: wm.start()] + body[wm.end():]).strip()
-        core = (star + name + wtxt).strip()
+        core = f"{grade} {name}{wtxt}".strip() if grade else f"{name}{wtxt}".strip()
         if phase and core:
             return f"{core} {phase}"
         if core:

@@ -43,7 +43,13 @@ def pack_string_array(values: list[str]) -> bytes:
 
 
 class ConfigCacheDecryptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # 本类专测解密链路：临时放开 conftest 的全局跳过。
+        self._prev_decrypt_flag = RF4ChatBridge.ALLOW_STARTUP_CACHE_DECRYPT
+        RF4ChatBridge.ALLOW_STARTUP_CACHE_DECRYPT = True
+
     def tearDown(self) -> None:
+        RF4ChatBridge.ALLOW_STARTUP_CACHE_DECRYPT = self._prev_decrypt_flag
         bridge_mod.ctx = getattr(self, "_prev_ctx", None)
 
     def _bridge(self) -> RF4ChatBridge:
@@ -67,6 +73,10 @@ class ConfigCacheDecryptTests(unittest.TestCase):
         cache.write_bytes(encrypted)
 
         bridge = self._bridge()
+        # hash 持久化路径指向临时目录，避免测试数据污染真实 .cache 存档。
+        bridge._gear_hash_store_path = lambda: Path(self._tmp()) / "hashes.json"
+        # 构造时 __init__ 可能恢复了本机真实存档的 hash；本用例从零验证链路。
+        bridge._gear_config_hashes = []
         saved = gc.local_config_cache_candidates
         gc.local_config_cache_candidates = lambda **kw: [cache]
         try:

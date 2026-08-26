@@ -359,7 +359,7 @@ class OverlayCompactTests(unittest.TestCase):
         text = "1号杆 | [稀有★] 鱼=黑线鳕 重量=444 克 体力 78% 出线 12.3米"
         self.assertEqual(
             Overlay._compact_fight_line(text),
-            "1号杆 ★黑线鳕444g 78% 12.3米",
+            "1号杆 [稀有★] 黑线鳕444g 78% 12.3米",
         )
 
     def test_compact_fight_kilograms_trim_zeros(self) -> None:
@@ -373,7 +373,7 @@ class OverlayCompactTests(unittest.TestCase):
         text = "3号杆 | [超级稀有◆] 鱼=蓝鳃太阳鱼 重量=6.030 公斤 体力 55% 出线 40.02米"
         self.assertEqual(
             Overlay._compact_fight_line(text),
-            "3号杆 ◆蓝鳃太阳鱼6.03kg 55% 40.02米",
+            "3号杆 [超级稀有◆] 蓝鳃太阳鱼6.03kg 55% 40.02米",
         )
 
     def test_compact_fight_without_fish_meta(self) -> None:
@@ -388,15 +388,27 @@ class OverlayCompactTests(unittest.TestCase):
 
     def test_compact_self_event_incoming(self) -> None:
         text = "【我自己】：[稀有★] 有蓝鳃太阳鱼 1.553 公斤 过来了"
-        self.assertEqual(Overlay._compact_self_event(text), "★蓝鳃太阳鱼1.553kg 来鱼")
+        self.assertEqual(
+            Overlay._compact_self_event(text),
+            "[稀有★] 蓝鳃太阳鱼1.553kg 来鱼",
+        )
 
     def test_compact_self_event_bitten(self) -> None:
         text = "【我自己】：[达标] 黑线鳕 444 克 咬钩了"
-        self.assertEqual(Overlay._compact_self_event(text), "黑线鳕444g 咬钩")
+        self.assertEqual(Overlay._compact_self_event(text), "[达标] 黑线鳕444g 咬钩")
+
+    def test_compact_fight_grade_preserved_verbatim(self) -> None:
+        # 四档品质文字原样保留（用户要求：几个字没影响）。
+        for grade in ("不达标", "达标", "稀有★", "超级稀有◆"):
+            text = f"1号杆 | [{grade}] 鱼=拟鲤 重量=120 克 体力 100% 出线 4.2米"
+            self.assertEqual(
+                Overlay._compact_fight_line(text),
+                f"1号杆 [{grade}] 拟鲤120g 100% 4.2米",
+            )
 
     def test_compact_self_event_released(self) -> None:
         text = "【我自己】：[超级稀有◆] 放生了 鲤鱼"
-        self.assertEqual(Overlay._compact_self_event(text), "◆鲤鱼 放生")
+        self.assertEqual(Overlay._compact_self_event(text), "[超级稀有◆] 鲤鱼 放生")
 
     def test_compact_self_event_escaped(self) -> None:
         text = "【我自己】：鲤鱼 2.0 公斤 挣脱跑了（脱钩）"
