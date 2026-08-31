@@ -584,11 +584,10 @@ class Overlay:
         name = event.get("event")
         gear_slot = event.get("gear_slot") or ""
         text = event.get("text") or ""
-        # 来鱼/咬钩 8 秒自动消失(避免长期占用竿行)；入护/脱钩/放生维持 3 秒。
+        # 来鱼/咬钩保持到下一条事件(咬钩/搏鱼/结算/脱钩)覆盖，不再定时消失；
+        # 入护/脱钩/放生维持 3 秒后消失。
         if name in ("fish_kept", "fish_escaped", "fish_released"):
             clear_after = 3000
-        elif name in ("fish_incoming", "fish_bitten"):
-            clear_after = 8000
         else:
             clear_after = 0
         if name == "reset":

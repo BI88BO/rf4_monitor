@@ -20,6 +20,7 @@ from . import bridge as _bridge_mod
 from .bridge import FlowSession, RF4ChatBridge
 from .console import format_console_line, mask_secret
 from .protocol import (
+    RC4Stream,
     get_profile,
     parse_envelope,
     take_complete_frames,
@@ -1413,6 +1414,9 @@ class PacketObserver:
         client_endpoint: Endpoint,
     ) -> None:
         server_endpoint = key[1] if key[0] == client_endpoint else key[0]
+        client_data = bytes(candidate.buffers.get(client_endpoint, b""))
+        parsed = core.try_parse_auth_packet(client_data)
+        handoff = self._take_rc4_handoff(parsed[0]) if parsed is not None else None
         oriented_key = (
             client_endpoint[0],
             client_endpoint[1],
@@ -1424,6 +1428,36 @@ class PacketObserver:
             f"{server_endpoint[0]}:{server_endpoint[1]}"
         )
         session = PassiveSession.create(session_id, self.bridge)
+        server_data = bytes(candidate.buffers.get(server_endpoint, b""))
+        client_payload = self._first_business_payload(client_data, from_client=True)
+        server_payload = self._first_business_payload(server_data, from_client=False)
+        if handoff is not None:
+            # Auth variant 0 包含 Hermes 握手、从新鲜 RC4 状态开始；variant 1
+            # 是静默重连，延续旧 RC4 流。无 auth 的切服也用 handoff 恢复。
+            if parsed is None or client_data[1] == 0x01:
+                reconnect_token = parsed[0] if parsed is not None else handoff.token
+                session.protocol.client_read_rc4 = self._select_reconnect_cipher(
+                    reconnect_token,
+                    handoff.client_read_rc4,
+                    client_payload,
+                )
+                session.protocol.server_read_rc4 = self._select_reconnect_cipher(
+                    reconnect_token,
+                    handoff.server_read_rc4,
+                    server_payload,
+                )
+                session.protocol.token = reconnect_token
+                session.protocol.auth_seen = True
+                session.protocol.hermes_seen = True
+                _print_line(
+                    "session",
+                    (
+                        "重连同 token 静默切换，复用 handoff RC4 状态"
+                        if parsed is not None and client_data[1] == 0x01
+                        else "重连无 auth，复用 handoff RC4 状态"
+                    )
+                    + f" | 会话={session_id}",
+                )
         session.client_tcp = candidate.streams.setdefault(client_endpoint, TcpStreamReassembler())
         session.server_tcp = candidate.streams.setdefault(server_endpoint, TcpStreamReassembler())
         self.sessions[oriented_key] = session
@@ -1438,8 +1472,6 @@ class PacketObserver:
             ("realtime 重连已识别" if candidate.reconnect_attempt else "自动识别 realtime")
             + f" | 服务器={server_endpoint[0]}:{server_endpoint[1]} | 会话={session_id}",
         )
-        server_data = bytes(candidate.buffers.get(server_endpoint, b""))
-        client_data = bytes(candidate.buffers.get(client_endpoint, b""))
         try:
             if server_data:
                 session._process_server_bytes(server_data)
@@ -1491,6 +1523,21 @@ class PacketObserver:
         self._expire_candidates()
         if len(self._candidates) < DISCOVERY_MAX_CANDIDATES:
             return
+        # 优先淘汰"非 realtime 主机"的候选（普通上网/局域网连接），把空间留给
+        # 真正可能承载 realtime 续传的连接，避免在重连风暴+上网时被无关流量挤出。
+        realtime_hosts = self._known_realtime_hosts | self._closed_realtime_hosts
+        if realtime_hosts:
+            non_realtime = [
+                key for key, candidate in self._candidates.items()
+                if candidate.suspected_server is None
+                or candidate.suspected_server[0] not in realtime_hosts
+            ]
+            if non_realtime:
+                oldest_key = min(
+                    non_realtime, key=lambda key: self._candidates[key].updated_at
+                )
+                self._candidates.pop(oldest_key, None)
+                return
         oldest_key = min(self._candidates, key=lambda key: self._candidates[key].updated_at)
         self._candidates.pop(oldest_key, None)
 
@@ -1507,6 +1554,23 @@ class PacketObserver:
                 key=lambda key: self._rc4_handoffs[key].saved_at,
             )
             self._rc4_handoffs.pop(oldest_key, None)
+
+    def _candidate_auth_token(self, candidate: "DiscoveryCandidate") -> Optional[str]:
+        """从候选缓冲里直接解析 auth 包得到 token。
+
+        切服恢复不依赖"已解出业务帧"的保存 handoff：死亡于 Hermes 超时、从未解出
+        任何业务帧的会话不会留下 handoff，但它的客户端上行缓冲通常仍带着 auth 包，
+        从中拿到的 token 足以用 RC4(token) 位置 0 对齐切服后的加密直连帧。
+        """
+        for _endpoint, buffer in candidate.buffers.items():
+            if len(buffer) >= 2 and buffer[:2] in (b"\x01\x00", b"\x01\x01"):
+                try:
+                    parsed = core.try_parse_auth_packet(bytes(buffer))
+                except UnicodeDecodeError:
+                    parsed = None
+                if parsed is not None:
+                    return parsed[0]
+        return None
 
     def _take_rc4_handoff(self, token: str) -> Optional[Rc4Handoff]:
         handoff = self._rc4_handoffs.get(token)
@@ -1525,7 +1589,13 @@ class PacketObserver:
         handoff: Rc4Handoff,
     ) -> Optional[PassiveSession]:
         """切服无 auth 时用内存 RC4 handoff 直接建立会话并返回；返回 None 表示
-        handoff 会话已存在或无法确认边界，调用方保持 candidate 状态即可。"""
+        handoff 会话已存在或无法确认边界，调用方保持 candidate 状态即可。
+
+        无 auth 的切服直连：新连接由同一 token 派生、从位置 0 重新开始 RC4 密钥流
+        （旧 handoff 只提供身份/状态，不提供旧连接的密钥流游标）。真正让首帧对得
+        上的是调用方在喂数据前按 _align_handoff_cipher 返回的 encrypted_before 推进
+        密钥流——前面那些帧的密文载荷已经消耗了等额密钥流。
+        """
         active = self._auto_sessions.get(key)
         if active is not None:
             return None
@@ -1543,9 +1613,9 @@ class PacketObserver:
         session.protocol.auth_seen = True
         session.protocol.uuid_seen = True
         session.protocol.hermes_seen = True
-        # 切服后新连接的 RC4 由同一 token 独立派生、从位置 0 开始（与登录时
-        # 一致），并非延续旧连接的位置；旧连接的密文位置只用于跨服务器的
-        # 会话身份关联。这里用重建的 RC4 流，后续由帧边界搜索对齐。
+        # 切服后新连接 RC4 由同一 token 独立派生、从位置 0 开始（与登录时一致）；
+        # 旧连接的密文位置只用于跨服务器的会话身份关联。首帧对齐所需的密钥流推进
+        # 由调用方按 encrypted_before 完成，这里只用重建的 RC4 流即可。
         session.protocol.ensure_rc4()
         self.sessions[oriented_key] = session
         self._auto_sessions[key] = (session, source)
@@ -1553,10 +1623,60 @@ class PacketObserver:
         self._closed_realtime_hosts.discard(destination[0])
         _print_line(
             "session",
-            "realtime 切服已识别（token 重建 RC4，等待帧边界对齐）"
+            "realtime 切服已识别（token 重建 RC4，按 encrypted_before 推进密钥流对齐）"
             f" | 服务器={destination[0]}:{destination[1]} | 会话={session_id}",
         )
         return session
+
+    @staticmethod
+    def _first_business_payload(
+        data: bytes,
+        *,
+        from_client: bool,
+    ) -> Optional[bytes]:
+        """从已识别的认证流里提取第一个加密业务载荷（跳过明文认证/UUID 头）。"""
+        buffer = bytearray(data)
+        if from_client:
+            auth = core.try_parse_auth_packet(bytes(buffer))
+            if auth is not None:
+                del buffer[:auth[1]]
+        else:
+            while buffer.startswith(b"\x00" * 6):
+                del buffer[:6]
+            uuid = core.try_parse_uuid_packet(bytes(buffer))
+            if uuid is not None:
+                del buffer[:uuid[1]]
+        try:
+            frames = core.take_complete_frames(buffer)
+        except (ValueError, IndexError):
+            return None
+        for frame in frames:
+            if frame.frame_type != 1 and frame.payload:
+                return frame.payload
+        return None
+
+    @staticmethod
+    def _select_reconnect_cipher(
+        token: str,
+        existing: Optional[object],
+        payload: Optional[bytes],
+    ) -> Optional[object]:
+        """选择重连 RC4 续传起点：先试旧连接保存的游标，再试 token 新建的游标。
+
+        切服/重连时服务器可能延续旧密钥流（旧游标有效），也可能重新初始化
+        （token 新建有效）。逐个试，哪个能解出合法信封就用哪个。
+        """
+        if payload is None:
+            return existing.clone() if existing is not None else None
+        candidates = []
+        if existing is not None:
+            candidates.append(existing)
+        candidates.append(RC4Stream(token.encode("utf-8")))
+        for candidate in candidates:
+            probe = candidate.clone()
+            if parse_envelope(probe.crypt(payload)) is not None:
+                return candidate.clone()
+        return existing.clone() if existing is not None else candidates[-1].clone()
 
     @staticmethod
     def _align_handoff_cipher(
@@ -1564,23 +1684,28 @@ class PacketObserver:
         data: bytes,
         *,
         budget: int = CACHED_TOKEN_RESYNC_WORK_BUDGET,
-    ) -> Optional[int]:
-        """在无 auth 切服的新连接密文流里搜索第一个可验证业务帧的起点。
+    ) -> Optional[tuple[int, int]]:
+        """在无 auth 切服的新连接密文流里搜索第一个可验证业务帧。
 
-        从数据流中尝试所有满足 RF4 帧头形状（body_len 合法、非 ACK/控制帧、
-        长度足够信封校验）的偏移，对每个偏移用已重建的 RC4（位置 0）从该
-        偏移开始解密并校验信封。返回命中的密文帧起点（相对 data 的字节偏移），
+        返回 (帧起点 offset, 该帧之前已消耗的密文载荷字节数 encrypted_before)。
         找不到返回 None。
 
-        流开头的 ACK/控制帧（frame_type==1、body_len<=5）是明文，不参与 RC4，
-        先按帧结构跳过，再在后续业务帧上校验。
+        RC4 是流密码：每个业务帧只有 payload 消耗密钥流，明文帧头(13B)不消耗。
+        因此当首帧不在流最开头时，必须把 cipher 按 encrypted_before 推进后再解密
+        该帧 payload，否则密钥流错位、永远解不出信封——这正是切服承接会"对不上"的
+        根因。encrypted_before = 帧起点之前的全部字节，减去前面每个完整帧的明文头。
+
+        流开头的 ACK/控制帧（frame_type==1）是明文，不参与 RC4，按帧结构整体跳过。
         """
+        if not data:
+            return None
         attempts = 0
         offset = 0
+        raw = bytearray(data)
         while offset + 4 <= len(data) and attempts < budget:
             body_len = u32(data, offset)
             if body_len == 0:
-                offset += 1
+                offset += 4
                 attempts += 1
                 continue
             if body_len == 1:
@@ -1588,23 +1713,35 @@ class PacketObserver:
                 offset += 5
                 attempts += 1
                 continue
-            if body_len < 9 or body_len > len(data) - offset - 4:
+            total = 4 + body_len
+            if body_len < 9 or total > len(data) - offset:
                 offset += 1
                 attempts += 1
                 continue
             frame_type = data[offset + 4]
             if frame_type == 1:
-                offset += 4 + body_len
+                offset += total
                 attempts += 1
                 continue
-            payload = data[offset + 13 : offset + 13 + body_len - 9]
+            payload = data[offset + 13 : offset + total]
             if len(payload) < CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES:
                 offset += 1
                 attempts += 1
                 continue
+            # 统计该帧之前所有完整帧消耗的"密文载荷"字节数（明文帧头不算）。
+            encrypted_before = offset
+            cursor = 0
+            while cursor < offset:
+                preceding = core.try_parse_first_frame(bytes(raw[cursor:]))
+                if preceding is None or cursor + len(preceding.raw) > offset:
+                    break
+                encrypted_before -= len(preceding.raw) - len(preceding.payload)
+                cursor += len(preceding.raw)
+            encrypted_before = max(0, encrypted_before)
             probe = cipher.clone()
+            probe.keystream(encrypted_before)
             if parse_envelope(probe.crypt(payload)) is not None:
-                return offset
+                return offset, encrypted_before
             offset += 1
             attempts += 1
         return None
@@ -1619,7 +1756,10 @@ class PacketObserver:
         成功返回 True（candidate 已转正，调用方无需再走 auth 提升路径）。
         仅当候选缓冲已积累足够数据且存在未过期 handoff 时尝试。
         """
-        if not self._rc4_handoffs:
+        # 仅当"有已保存 handoff"或"候选缓冲自身带 auth token"时才值得尝试：
+        # 否则既无 token 也无法重建 RC4，探测必然失败。
+        candidate_token = self._candidate_auth_token(candidate)
+        if not self._rc4_handoffs and candidate_token is None:
             return False
         # 探测很贵且失败后不改变 candidate 状态；按冷却间隔节流，避免切服连接
         # 持续有流量时每个数据包都全量扫描 RC4 打满 CPU。
@@ -1632,6 +1772,14 @@ class PacketObserver:
         for ep in key:
             if ep not in endpoints:
                 endpoints.append(ep)
+        # handoff 探测只用 RF4 的 RC4 流去对齐"无 auth 的切服续传帧"，
+        # 对非 realtime 流量（普通上网/局域网连接）毫无意义：既永远对不上、
+        # 又会每包做昂贵的 RC4 扫描拖垮解析线程、还会把真实 realtime 候选挤出
+        # 候选表。因此仅在候选端点属于已知 realtime 主机时才跑探测；首次连接
+        # 还没有已知主机时本就不依赖 handoff（靠 auth 握手直接转正）。
+        realtime_hosts = self._known_realtime_hosts | self._closed_realtime_hosts
+        if realtime_hosts and not any(ep[0] in realtime_hosts for ep in endpoints):
+            return False
         # 方向不依赖 suspected_server 提示：重建探测可能由服务器下行的包先触发，
         # 此时 destination 是客户端、提示方向是错的。对所有端点有序对各校验一次，
         # 提示方向优先尝试。
@@ -1665,26 +1813,63 @@ class PacketObserver:
             client_data = bytes(candidate.buffers.get(client_endpoint, b""))
             if not server_data and not client_data:
                 continue
+            # 构造待尝试的 RC4 候选（token, server_cipher, client_cipher）：
+            # 切服/重连时服务器可能延续旧密钥流（旧游标有效），也可能重新初始化
+            # （token 新建有效）。每个 handoff 用 _select_reconnect_cipher 先试旧游标
+            # 再试新建，哪个能解出信封就用哪个。来源有两处：
+            #  - 已保存 handoff（此前成功解过业务帧的会话留下的 token）；
+            #  - 候选自身缓冲里的 auth token：即使本会话未解出任何业务帧、没有保存
+            #    handoff，只要客户端上行带 auth 包就能拿到 token，用 RC4(token) 位置 0
+            #    直接对齐切服后的加密直连帧（死亡于 Hermes 超时、无任何业务帧的场景靠这个）。
+            # 对齐成功的标准是能解出业务信封；首个帧之前消耗的密钥流由 encrypted_before 补偿。
+            try_entries: list[tuple[str, object, object]] = []
             for handoff in list(self._rc4_handoffs.values()):
-                probe_protocol = FlowSession(profile=self.bridge._profile)
-                probe_protocol.token = handoff.token
-                probe_protocol.ensure_rc4()
-                probe_server = probe_protocol.server_read_rc4
-                frame_offset = self._align_handoff_cipher(probe_server, server_data)
+                server_payload = self._first_business_payload(server_data, from_client=False)
+                client_payload = self._first_business_payload(client_data, from_client=True)
+                reconnect_server = self._select_reconnect_cipher(
+                    handoff.token, handoff.server_read_rc4, server_payload,
+                )
+                reconnect_client = self._select_reconnect_cipher(
+                    handoff.token, handoff.client_read_rc4, client_payload,
+                )
+                if reconnect_server is not None and reconnect_client is not None:
+                    try_entries.append((handoff.token, reconnect_server, reconnect_client))
+            if candidate_token is not None:
+                cf = FlowSession(profile=self.bridge._profile)
+                cf.token = candidate_token
+                cf.ensure_rc4()
+                try_entries.append((candidate_token, cf.server_read_rc4, cf.client_read_rc4))
+            for token, server_cipher, client_cipher in try_entries:
+                server_alignment = self._align_handoff_cipher(server_cipher, server_data)
+                if server_alignment is None:
+                    continue
+                frame_offset, server_encrypted_before = server_alignment
                 if frame_offset is None:
                     continue
+                # 用对齐成功的 token 构建会话（无需真实保存的 handoff 对象；
+                # 其中的 cipher 字段不会被使用，会话 RC4 由 ensure_rc4() 重新派生）。
+                handoff_like = self._rc4_handoffs.get(token) or Rc4Handoff(
+                    token=token,
+                    client_read_rc4=None,
+                    server_read_rc4=None,
+                    saved_at=time.monotonic(),
+                )
                 session = self._bootstrap_handoff_session(
                     key,
                     source=client_endpoint,
                     destination=server_endpoint,
-                    handoff=handoff,
+                    handoff=handoff_like,
                 )
                 if session is None:
                     return False
-                # 客户端上行同样可能存在明文前置，用重建的 client RC4 对齐。
-                client_offset = self._align_handoff_cipher(
-                    probe_protocol.client_read_rc4, client_data
+                # 客户端上行同样可能存在帧前置，用同一个 token 的 client RC4 对齐。
+                client_alignment = (
+                    self._align_handoff_cipher(client_cipher, client_data)
+                    if client_data
+                    else None
                 )
+                client_frame_offset = client_alignment[0] if client_alignment is not None else None
+                client_encrypted_before = client_alignment[1] if client_alignment is not None else 0
                 # 把候选缓冲喂给新会话（含对齐的帧偏移，丢弃对齐前的明文前置）。
                 session.client_tcp = candidate.streams.setdefault(
                     client_endpoint, TcpStreamReassembler()
@@ -1693,30 +1878,46 @@ class PacketObserver:
                     server_endpoint, TcpStreamReassembler()
                 )
                 self._candidates.pop(key, None)
+                # 关键：首帧之前还有帧的密文载荷已消耗等额密钥流，必须先按
+                # encrypted_before 推进会话 RC4，否则解首帧 payload 会密钥流错位。
                 server_chunk = server_data[frame_offset:]
                 if server_chunk:
+                    session.protocol.server_read_rc4.keystream(server_encrypted_before)
                     session._process_server_bytes(server_chunk)
                 if client_data:
-                    client_chunk = client_data[client_offset:] if client_offset is not None else client_data
+                    client_chunk = (
+                        client_data[client_frame_offset:] if client_frame_offset is not None else client_data
+                    )
                     if client_chunk:
+                        session.protocol.client_read_rc4.keystream(client_encrypted_before)
                         session._process_client_bytes(client_chunk)
                 return True
             if diag_server is None:
                 diag_server = server_endpoint
                 diag_sizes = (len(server_data), len(client_data))
         # 探测失败：把诊断信息打一次，便于定位切服恢复为何未命中（token 是否
-        # 匹配、缓冲是否缺下行数据等）。冷却节流下不会每包刷屏。
+        # 匹配、缓冲是否缺下行数据、密钥流起点是否对得上等）。冷却节流下不会每包刷屏。
         if not candidate.bootstrap_diag_printed:
             candidate.bootstrap_diag_printed = True
             shown_server = diag_server or hinted or (endpoints[0] if endpoints else ("?", 0))
             shown_sizes = diag_sizes or (0, 0)
             token_names = "/".join(core.mask_secret(h.token) for h in self._rc4_handoffs.values())
+            cand_token_name = core.mask_secret(candidate_token) if candidate_token else "(无)"
+            # 转储下行缓冲前若干字节，便于确认密钥流起点/明文前置/是否真为 RC4 密文。
+            dump_bytes = b""
+            for ep in endpoints:
+                b = bytes(candidate.buffers.get(ep, b""))
+                if len(b) > len(dump_bytes):
+                    dump_bytes = b
+            dump_hex = dump_bytes[:192].hex()
             _print_line(
                 "session",
                 "切服恢复探测未命中 | "
                 f"服务器={shown_server[0]}:{shown_server[1]} | "
                 f"下行缓冲={shown_sizes[0]} 字节 上行缓冲={shown_sizes[1]} 字节 | "
-                f"已保存 handoff token: {token_names or '(无)'}",
+                f"已保存 handoff token: {token_names or '(无)'} | "
+                f"候选 auth token: {cand_token_name} | "
+                f"下行前192字节(hex)={dump_hex}",
             )
         return False
 

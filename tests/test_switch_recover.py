@@ -135,8 +135,9 @@ class HandoffBootstrapTests(unittest.TestCase):
         data = build_ack_frame(1) + build_ack_frame(2) + encrypted
 
         probe = RC4Stream(TOKEN.encode())
-        offset = observer._align_handoff_cipher(probe, data)
-        self.assertIsNotNone(offset)
+        result = observer._align_handoff_cipher(probe, data)
+        self.assertIsNotNone(result)
+        offset, encrypted_before = result
         self.assertEqual(offset, len(build_ack_frame(1)) + len(build_ack_frame(2)))
         self.assertEqual(data[offset:], encrypted)
 

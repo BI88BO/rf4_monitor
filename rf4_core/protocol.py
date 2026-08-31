@@ -866,6 +866,7 @@ class FishSetupMeta:
     length_hint: Optional[float] = None
     extra_floats: Tuple[float, ...] = ()
     flag_byte: Optional[bool] = None
+    value_raw: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1255,7 @@ def parse_fish_setup_push(envelope: RpcEnvelope, profile: RF4ProtocolProfile) ->
         length_hint=length_hint,
         extra_floats=tuple(extra_floats_before + extra_floats_after),
         flag_byte=flag_byte,
+        value_raw=extra_floats_before[0] if extra_floats_before else None,
     )
 
 

@@ -229,8 +229,6 @@ class FlowSession:
 
 
 class RF4ChatBridge:
-    # 启动时解密本地部件目录（多文件×多变体，较慢）；测试套件置 False 跳过。
-    ALLOW_STARTUP_CACHE_DECRYPT = True
     SELF_EVENT_PHASE_INCOMING = "incoming"
     SELF_EVENT_PHASE_BITTEN = "bitten"
     SELF_EVENT_PHASE_KEPT = "kept"
@@ -482,117 +480,12 @@ class RF4ChatBridge:
             self._load_item_catalog_index()
         except Exception:
             pass
-        self._gear_config_by_id: Dict[int, dict] = {}
-        self._gear_config_hashes: List[str] = []
-        try:
-            self._restore_gear_config_hashes()
-        except Exception:
-            pass
-        try:
-            self._load_gear_config_from_cache()
-        except Exception:
-            pass
         self._show_cfg_path = getattr(getattr(ctx, "options", None), "rf4_show_config_path", "") or ""
         self._show_cfg_mtime = 0.0
         self._show_cfg_cache: Dict[Tuple[str, bool], bool] = {}
         self._show_cfg_min_interval = 1.0  # 秒，避免每次广播读盘
         self._fish_grade_labels, self._fish_grade_by_line_type = load_fish_grade_config()
         self._unlocalized_fish_keys = load_unlocalized_fish_keys()
-
-    def _gear_hash_store_path(self) -> Path:
-        """配置版本 hash 的持久化位置（.cache 目录，打包态在 exe 旁）。"""
-        return CACHE_DIR / "gear_config_hashes.json"
-
-    def _restore_gear_config_hashes(self) -> None:
-        """恢复上次运行捕获的配置版本 hash，使启动时即可解密本地部件目录。
-
-        hash 仅在登录流量中出现且此前只存内存，重启即丢；持久化后只要成功
-        捕获过一次，之后每次启动都能解密出完整部件目录（游戏更新配置版本
-        后会被新捕获的 hash 覆盖）。
-        """
-        try:
-            payload = json.loads(self._gear_hash_store_path().read_text("utf-8"))
-        except (OSError, ValueError):
-            return
-        hashes = payload.get("hashes") if isinstance(payload, dict) else None
-        if isinstance(hashes, list):
-            self._gear_config_hashes = [str(h) for h in hashes if str(h)]
-    def _persist_gear_config_hashes(self) -> None:
-        try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self._gear_hash_store_path().write_text(
-                json.dumps(
-                    {"hashes": list(dict.fromkeys(self._gear_config_hashes))},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    def _load_gear_config_from_cache(self) -> None:
-        # 测试套件通过类开关跳过真实解密（慢：多文件 × 多变体 RC4/SHA1）。
-        if not self.__class__.ALLOW_STARTUP_CACHE_DECRYPT:
-            return
-        try:
-            from .game_catalog import (
-                extract_gear_config_records_from_cache,
-                local_config_cache_candidates,
-                preferred_local_config_cache_path,
-            )
-        except Exception:
-            return
-        try:
-            cache_paths = local_config_cache_candidates()
-        except Exception:
-            cache_paths = []
-        known_system_ids = {
-            key
-            for key in self._fish_labels_zh
-            if key and not key.startswith("card_")
-        }
-        best: list = []
-        best_hash = ""
-        # 优先用运行时捕获的 configs_version hash 解密缓存(否则缓存是加密的)；
-        # 找不到 hash 时再退回到未解密数据(仅对未加密的旧缓存有效)。
-        hashes = list(self._gear_config_hashes or ())
-        if not hashes:
-            hashes = [""]
-        for cache_hash in hashes:
-            for path in cache_paths:
-                try:
-                    records = extract_gear_config_records_from_cache(
-                        path=path,
-                        known_system_ids=None if cache_hash else known_system_ids,
-                        cache_hash=cache_hash or None,
-                    )
-                except Exception:
-                    records = []
-                if len(records) > len(best):
-                    best = records
-                    best_hash = cache_hash
-        by_id: Dict[int, dict] = {}
-        for record in best:
-            attributes = dict(record.attributes)
-            by_id[int(record.config_id)] = {
-                "config_id": int(record.config_id),
-                "system_id": str(record.system_id),
-                "object_type_id": int(record.object_type_id),
-                "group_key": str(record.group_key),
-                "attributes": attributes,
-            }
-        self._gear_config_by_id = by_id
-        if self._gear_config_by_id:
-            self._log(
-                f"已从游戏本地缓存读取真实装备部件目录：{len(self._gear_config_by_id)} 件"
-                + (f" (hash={best_hash[:8]}...)" if best_hash else "")
-            )
-        elif hashes and hashes != [""]:
-            # 有 hash 却解不出：缓存文件缺失/版本不匹配，需要用户感知而非静默。
-            self._log(
-                "未能从游戏本地配置缓存解密出部件目录"
-                f"(尝试 {len(hashes)} 个版本 hash)；将在下次登录捕获新 hash 后重试"
-            )
 
     def _load_item_catalog_index(self) -> None:
         candidates = [
@@ -704,6 +597,12 @@ class RF4ChatBridge:
             "Telemetry categories to print: all, fish, player, feed, chat, room, session, unknown. Comma-separated.",
         )
         loader.add_option("rf4_log_plain_frames", bool, False, "Log every decrypted RF4 business frame with hex/ascii details.")
+        loader.add_option(
+            "rf4_debug_fish_price",
+            bool,
+            False,
+            "Dump raw fish packet bytes (fish_setup_push / catch response / keep response / login observed catches) to locate a server-side price field.",
+        )
         loader.add_option("rf4_verbose_logging", bool, False, "Log per-session handshake and injection details.")
         loader.add_option(
             "rf4_event_bridge_host",
@@ -976,6 +875,15 @@ class RF4ChatBridge:
         if not ctx.options.rf4_log_parsed_events:
             return
         self._safe_log(_colorize_console_text(text, "96"))
+
+    def _debug_fish_price_bytes(self, label: str, payload: bytes, extra: Optional[Dict[str, object]] = None) -> None:
+        if not bool(getattr(ctx.options, "rf4_debug_fish_price", False)):
+            return
+        parts = [f"[fish-price-debug] {label} len={len(payload)} hex={payload.hex()}"]
+        if extra:
+            for key, value in extra.items():
+                parts.append(f"{label}.{key}={value}")
+        self._log(" | ".join(parts))
 
     def _log_telemetry(self, category: str, text: str) -> None:
         if not self._telemetry_enabled(category):
@@ -1461,6 +1369,11 @@ class RF4ChatBridge:
             fishing_end_request = session.fishing_end_requests.get(envelope.call_id)
             if fishing_end_request and envelope.marker == -2:
                 catch = extract_catch_summary_from_response(plain_body)
+                self._debug_fish_price_bytes(
+                    "fishing_end_response",
+                    plain_body,
+                    {"fish_key": catch.fish_key, "weight_raw": catch.weight_raw, "size_enum": catch.size_enum},
+                )
                 fish_key = catch.fish_key
                 weight_raw = catch.weight_raw
                 meta = self._fish_setup_meta_for_request(session, fishing_end_request)
@@ -1479,6 +1392,18 @@ class RF4ChatBridge:
             if fish_setup:
                 weight = self._format_chat_weight(fish_setup.weight_hint_raw) if fish_setup.weight_hint_raw else "unknown"
                 length = f"{fish_setup.length_hint:.3f}" if fish_setup.length_hint is not None else "unknown"
+                self._debug_fish_price_bytes(
+                    "fish_setup_push",
+                    envelope.payload,
+                    {
+                        "fish_key": fish_setup.fish_key,
+                        "weight_hint": fish_setup.weight_hint_raw,
+                        "length_hint": fish_setup.length_hint,
+                        "setup_enum": fish_setup.setup_enum,
+                        "value_raw": fish_setup.value_raw,
+                        "extra_floats": list(fish_setup.extra_floats),
+                    },
+                )
                 return (
                     "fish",
                     f"有鱼靠近 | 鱼={self._format_fish_name(fish_setup.fish_key)} "
@@ -1510,6 +1435,11 @@ class RF4ChatBridge:
             keep_request = session.keep_requests.get(envelope.call_id)
             if keep_request and envelope.marker == -2:
                 catch = extract_catch_summary_from_response(plain_body)
+                self._debug_fish_price_bytes(
+                    "keep_response",
+                    plain_body,
+                    {"fish_key": catch.fish_key, "weight_raw": catch.weight_raw, "size_enum": catch.size_enum},
+                )
                 fish_key = catch.fish_key
                 weight_raw = catch.weight_raw
                 if keep_request.fish_setup_id:
@@ -2038,20 +1968,6 @@ class RF4ChatBridge:
         return config_group.startswith(hint_group) or hint_group.startswith(config_group)
 
     def _gear_config_by_id_lookup(self, item_id: int) -> Optional[dict]:
-        config = self._gear_config_by_id.get(item_id)
-        if config:
-            system_id = str(config.get("system_id") or "")
-            catalog_name = ""
-            game_name = str(self._fish_labels_zh.get(system_id) or "").strip()
-            if game_name and game_name != system_id:
-                catalog_name = game_name
-            else:
-                entry = self._catalog_key_lookup.get(system_id)
-                if entry:
-                    catalog_name = entry.name
-            config = dict(config)
-            config["catalog_name"] = catalog_name
-            return config
         entries = self._item_catalog_index.get(item_id)
         if not entries:
             return None
@@ -2239,15 +2155,6 @@ class RF4ChatBridge:
             return
         if not hashes:
             return
-        self._gear_config_hashes = list(dict.fromkeys(hashes))
-        # 捕获成功必须可见（此前被 verbose 开关吞掉，难以定位部件目录为何为空）。
-        self._log(
-            f"已捕获 game/configs 配置版本 hash {len(self._gear_config_hashes)} 个，"
-            "已持久化供启动解密部件目录"
-        )
-        self._persist_gear_config_hashes()
-        if not self._gear_config_by_id:
-            self._load_gear_config_from_cache()
 
     def _format_item_state_payload(self, payload: bytes) -> str:
         summary = parse_item_state_summary(payload)
@@ -2294,6 +2201,11 @@ class RF4ChatBridge:
         if command == (20, 2):
             results = parse_fish_sale_results(payload)
             if results:
+                self._debug_fish_price_bytes(
+                    "fish_sale_response",
+                    payload,
+                    {"paid_raw_list": [value.paid_raw for value in results]},
+                )
                 lines = []
                 total_raw = 0
                 for value in results[:12]:
@@ -2360,6 +2272,11 @@ class RF4ChatBridge:
         elif command == (4, 5):
             catches = parse_observed_catch_records(payload)
             if catches:
+                self._debug_fish_price_bytes(
+                    "observed_catch_records",
+                    payload,
+                    {"count": len(catches)},
+                )
                 self._remember_observed_catches(session, catches)
                 values = [
                     f"{self._format_fish_name(value.fish_key)}/"
@@ -3358,7 +3275,7 @@ class RF4ChatBridge:
             sender_name=self._self_sender_name(phase),
             line_type=session.profile.room_message_line_type_catch,
             fishing_gear_id=fishing_gear_id or "",
-            gear_slot_text=self._gear_slot_text(session, fishing_gear_id),
+            gear_slot_text=self._gear_slot_text(session, fishing_gear_id) or "手持竿",
             grade_enum=grade_enum,
         )
 

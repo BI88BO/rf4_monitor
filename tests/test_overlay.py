@@ -57,8 +57,8 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
             ensure_ascii=False,
         )
         ov._handle_datagram(payload.encode("utf-8"))
-        # 事件短句化 + 来鱼/咬钩 8 秒自动消失。
-        self.assertEqual(ov.calls, [("self", "2", "鱼 来鱼", 8000)])
+        # 事件短句化 + 来鱼保持到下一条事件覆盖(不再 8 秒自动消失)。
+        self.assertEqual(ov.calls, [("self", "2", "鱼 来鱼", 0)])
 
     def test_kept_events_clear_after_three_seconds(self) -> None:
         ov = _empty_overlay()
@@ -421,7 +421,7 @@ class OverlayCompactTests(unittest.TestCase):
         text = "完全不是事件格式的文本"
         self.assertEqual(Overlay._compact_self_event(text), text)
 
-    def test_incoming_and_bitten_auto_clear_after_8s(self) -> None:
+    def test_incoming_and_bitten_persist_until_next_event(self) -> None:
         ov = object.__new__(Overlay)
         after_calls: list[tuple] = []
         ov.root = SimpleNamespace(after=lambda delay, fn: after_calls.append(delay))
@@ -434,7 +434,7 @@ class OverlayCompactTests(unittest.TestCase):
         )
         ov._handle_datagram(payload.encode("utf-8"))
         self.assertEqual(ov._rows.get("2号杆"), "鲤鱼2kg 来鱼")
-        self.assertIn(8000, after_calls)
+        self.assertNotIn(8000, after_calls)
 
     def test_kept_still_clears_after_3s(self) -> None:
         ov = object.__new__(Overlay)

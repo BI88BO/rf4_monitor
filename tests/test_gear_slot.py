@@ -114,47 +114,5 @@ class SwitchSlotUpdateTests(unittest.TestCase):
         self.assertNotIn(50, self.session.slot_items)
 
 
-class GearConfigHashStoreTests(unittest.TestCase):
-    """配置版本 hash 持久化：捕获一次后重启即可解密部件目录。"""
-
-    def setUp(self) -> None:
-        self.bridge, _session = _session_with_slots({})
-        # 桥接构造时会恢复真实 .cache 存档；本类只测存取逻辑，清零隔离。
-        self.bridge._gear_config_hashes = []
-        import tempfile
-
-        self._tmpdir = tempfile.TemporaryDirectory()
-        tmp_path = Path(self._tmpdir.name)
-        self.store = tmp_path / "gear_config_hashes.json"
-        self.bridge._gear_hash_store_path = lambda: self.store
-
-    def tearDown(self) -> None:
-        self._tmpdir.cleanup()
-        if hasattr(self, "_prev_ctx"):
-            bridge_mod.ctx = self._prev_ctx
-
-    def test_persist_then_restore_roundtrip(self) -> None:
-        self.bridge._gear_config_hashes = ["abc123", "def456"]
-        self.bridge._persist_gear_config_hashes()
-        self.assertTrue(self.store.exists())
-        fresh_bridge, _session = _session_with_slots({})
-        fresh_bridge._gear_hash_store_path = lambda: self.store
-        fresh_bridge._restore_gear_config_hashes()
-        self.assertEqual(fresh_bridge._gear_config_hashes, ["abc123", "def456"])
-
-    def test_restore_missing_file_keeps_empty(self) -> None:
-        self.bridge._restore_gear_config_hashes()
-        self.assertEqual(self.bridge._gear_config_hashes, [])
-
-    def test_restore_ignores_malformed_payload(self) -> None:
-        self.store.write_text("not json{", encoding="utf-8")
-        try:
-            self.bridge._restore_gear_config_hashes()
-        except ValueError:
-            self.fail("malformed store should not raise")
-        # 解析失败时保持原状（不抛出、不写入坏数据）。
-        self.assertEqual(self.bridge._gear_config_hashes, [])
-
-
 if __name__ == "__main__":
     unittest.main()
