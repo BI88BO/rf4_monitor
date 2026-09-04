@@ -8,9 +8,22 @@ __pycache__/
 *.log
 
 # RF4 runtime artifacts
+certs/
 logs/
+rf4_token_cache.json
+rf4_overlay_events.sqlite3
 rf4_overlay_config.json
 rf4_show_config.json
+rf4_core/rf4_token_cache.json
+rf4_core/rf4_overlay_events.sqlite3
+rf4_core/rf4_overlay_config.json
+rf4_core/rf4_show_config.json
+
+# Deprecated deployment directories
+packaging/
+docs/
+.superpowers/
+semi_auto/
 
 # Build / distribution artifacts
 build/

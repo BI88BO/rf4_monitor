@@ -11,14 +11,15 @@ import sys
 import tkinter as tk
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+BASE_DIR = PACKAGE_DIR.parent
 if getattr(sys, "frozen", False):
     # 打包态：__file__ 指向临时解压区(_MEIPASS)，改用 exe 所在目录，
     # 才能正确读写随 exe 分发的 rf4_overlay_config.json 与鱼种标签。
     BASE_DIR = Path(sys.executable).resolve().parent
-CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
+CONFIG_FILE = PACKAGE_DIR / "rf4_overlay_config.json"
 
-DEFAULT_DB_PATH = BASE_DIR / "rf4_overlay_events.sqlite3"
+DEFAULT_DB_PATH = PACKAGE_DIR / "rf4_overlay_events.sqlite3"
 WINDOW_WIDTH = 320
 WINDOW_HEIGHT = 70
 
@@ -45,7 +46,7 @@ def save_config(data):
 
 def load_fish_labels():
     labels = {}
-    path = BASE_DIR / "fish_labels_zh.json"
+    path = PACKAGE_DIR / "fish_labels_zh.json"
     try:
         data = json.loads(path.read_text("utf-8"))
     except (OSError, ValueError):
@@ -176,6 +177,8 @@ class Overlay:
         self._bind_drag(self.canvas)
 
         self._ensure_sqlite_db()
+        # 启动时只消费新事件；数据库里已有的都是上一轮运行的历史。
+        self._last_seen_id = self._latest_event_id()
         self._refresh_display()
         self.root.after(30, self._poll)
         self.root.after(800, self._poll_config)
@@ -538,8 +541,20 @@ class Overlay:
                 con.commit()
             finally:
                 con.close()
-        except OSError:
+        except (OSError, sqlite3.Error):
             pass
+
+    def _latest_event_id(self) -> int:
+        try:
+            con = sqlite3.connect(str(self.db_path), timeout=1.0)
+            try:
+                con.execute("PRAGMA busy_timeout = 1000")
+                row = con.execute("SELECT MAX(id) FROM overlay_events").fetchone()
+                return int(row[0] or 0)
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error):
+            return 0
 
     def _poll(self):
         try:
@@ -560,7 +575,7 @@ class Overlay:
                     self._last_seen_id = rows[-1][0]
             finally:
                 con.close()
-        except OSError:
+        except (OSError, sqlite3.Error):
             pass
         finally:
             self.root.after(30, self._poll)

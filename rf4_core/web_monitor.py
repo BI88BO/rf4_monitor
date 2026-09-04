@@ -32,21 +32,29 @@ def open_firewall():
         return
     name = f"RF4 Web Monitor {PORT}"
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
             capture_output=True, timeout=5,
         )
-        return
+        if result.returncode == 0:
+            return
     except Exception:
         pass
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["netsh", "advfirewall", "firewall", "add", "rule",
              f"name={name}", "dir=in", "action=allow", "protocol=tcp",
              f"localport={PORT}"],
             capture_output=True, timeout=5,
         )
-        print(f"  已添加防火墙规则: {name}")
+        result = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            print(f"  已添加防火墙规则: {name}")
+        else:
+            print(f"  防火墙规则未生效，请手动放行 TCP {PORT} 端口")
     except Exception:
         print(f"  防火墙规则添加失败，请手动放行 TCP {PORT} 端口")
 
@@ -166,7 +174,11 @@ def main():
     Handler.db_path = db
     ip = get_local_ip()
     open_firewall()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as exc:
+        print(f"  启动失败：端口 {PORT} 可能已被占用（{exc}）")
+        return
     print()
     print("========================================")
     print("  RF4 浮窗网页查看器")

@@ -38,7 +38,8 @@ def _acquire_single_instance() -> None:
     # 保持句柄引用，避免被 GC 提前释放导致互斥量失效。
     globals()["_single_instance_handle"] = handle
 
-BASE_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+BASE_DIR = PACKAGE_DIR.parent
 if getattr(sys, "frozen", False):
     # 打包态：脚本路径指向临时解压区(_MEIPASS)，改用 exe 所在目录，
     # 才能找到随 exe 分发的 DeskMon.exe 与数据文件。
@@ -46,8 +47,8 @@ if getattr(sys, "frozen", False):
 LOG_DIR = BASE_DIR / "logs"
 MONITOR_LOG = LOG_DIR / "rf4_monitor.log"
 SNIFFER_LOG = LOG_DIR / "rf4_sniffer.log"
-SHOW_CONFIG_FILE = BASE_DIR / "rf4_show_config.json"
-MODE_CONFIG_FILE = BASE_DIR / "rf4_mode.json"
+SHOW_CONFIG_FILE = PACKAGE_DIR / "rf4_show_config.json"
+MODE_CONFIG_FILE = PACKAGE_DIR / "rf4_mode.json"
 
 MODE_PROXY = "proxy"
 MODE_PASSIVE = "passive"
@@ -85,8 +86,8 @@ def _toggle_mode(icon, item) -> None:
 def _checked_mode(item) -> bool:
     return _load_mode() == MODE_PASSIVE
 
-# 浮窗背景样式配置(与 deskmon_overlay.pyw 约定一致)
-OVERLAY_CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
+# 浮窗背景样式配置(与 overlay.pyw 约定一致)
+OVERLAY_CONFIG_FILE = PACKAGE_DIR / "rf4_overlay_config.json"
 OVERLAY_STYLE_DARK = "dark"
 OVERLAY_STYLE_TRANSPARENT = "transparent"
 OVERLAY_STYLES = (OVERLAY_STYLE_DARK, OVERLAY_STYLE_TRANSPARENT)
@@ -320,12 +321,12 @@ def start_monitor() -> str:
         pythonw = _pythonw()
         launcher_cmd = [
             pythonw,
-            str(BASE_DIR / "deskmon_engine.py"),
+    str(BASE_DIR / "rf4_core" / "engine.py"),
             *mode_args,
             "--set",
             f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
-        overlay_cmd = [pythonw, str(BASE_DIR / "deskmon_overlay.pyw")]
+    overlay_cmd = [pythonw, str(BASE_DIR / "rf4_core" / "overlay.pyw")]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if pythonw.endswith("python.exe") else 0
 
     # 把可勾选的显示项转成 --set 参数传给 addon
@@ -377,7 +378,7 @@ def _toggle_web_monitor(icon, item) -> None:
         icon.notify("手机网页监控已停止", "来鱼提示")
     else:
         python_exe = sys.executable
-        script = str(BASE_DIR / "rf4_web_monitor.py")
+    script = str(BASE_DIR / "rf4_core" / "web_monitor.py")
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         p = subprocess.Popen(
             [python_exe, script],

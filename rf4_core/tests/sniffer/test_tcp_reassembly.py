@@ -1,16 +1,14 @@
+"""rf4_core.sniffer：TCP 重组与缺口恢复测试。"""
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
-from types import SimpleNamespace
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from unittest import mock
 
 from rf4_core import sniffer
-from rf4_core.bridge import RF4ChatBridge
 from rf4_core.protocol import RC4Stream, build_frame, build_request_envelope
 from rf4_core.sniffer import PassiveSession, TcpStreamReassembler
+
+from rf4_core.tests.sniffer.helpers import _ctx, _make_bridge, _make_ready_session
 
 
 class TcpStreamReassemblerGapRecoveryTests(unittest.TestCase):
@@ -60,28 +58,33 @@ class TcpStreamReassemblerGapRecoveryTests(unittest.TestCase):
         self.assertGreater(sniffer.MAX_RECOVERABLE_TCP_GAP_BYTES, 0)
 
 
-def _make_ready_session() -> PassiveSession:
-    options = SimpleNamespace(
-        rf4_log_plain_frames=False,
-        rf4_verbose_logging=False,
-        rf4_log_telemetry=True,
-        rf4_telemetry_categories="all",
-        rf4_default_location_id="",
-        rf4_default_users_count=0,
-    )
-    sniffer.core.ctx = SimpleNamespace(options=options)
-    sniffer._bridge_mod.ctx = sniffer.core.ctx
-    bridge = RF4ChatBridge()
-    bridge._handle_client_frame = lambda _session, _plain: (b"", [])
-    bridge._handle_server_frame = lambda _session, _plain: b""
-    bridge._maybe_log_telemetry_frame = lambda *_args, **_kwargs: None
-    session = PassiveSession.create("test", bridge)
-    session.protocol.token = "user|server|nonce|secret"
-    session.protocol.auth_seen = True
-    session.protocol.uuid_seen = True
-    session.protocol.hermes_seen = True
-    session.protocol.ensure_rc4()
-    return session
+class TcpStreamClearControlTests(unittest.TestCase):
+    def test_ignores_six_byte_clear_control_ack(self) -> None:
+        stream = TcpStreamReassembler(next_seq=100)
+        self.assertEqual(stream.feed(100, b"\x00" * 6), b"")
+        self.assertEqual(stream.next_seq, 100)
+        self.assertEqual(stream.feed(104, b"uuid"), b"uuid")
+
+    def test_out_of_order_clear_controls_suppress_virtual_four_byte_gap(self) -> None:
+        stream = TcpStreamReassembler(next_seq=8737)
+
+        # Npcap can record duplicate six-byte controls before their overlapping
+        # record during tunnel handoff.
+        self.assertEqual(stream.feed(8737, b"control-frame"), b"control-frame")
+        self.assertEqual(stream.feed(8750, b"\x00" * 6), b"")
+        self.assertEqual(stream.feed(8763, b"\x00" * 6), b"")
+        self.assertEqual(stream.feed(8767, b"business"), b"business")
+        self.assertEqual(stream.gap_age(), 0.0)
+        self.assertEqual(stream.first_pending_seq(), None)
+
+    def test_consecutive_clear_controls_advance_virtual_sequence_offset(self) -> None:
+        stream = TcpStreamReassembler(next_seq=100)
+
+        self.assertEqual(stream.feed(100, b"\x00" * 6), b"")
+        self.assertEqual(stream.feed(104, b"\x00" * 6), b"")
+        self.assertEqual(stream.next_seq, 104)
+        self.assertEqual(stream.feed(104, b"frame"), b"frame")
+        self.assertEqual(stream.next_seq, 109)
 
 
 class PassiveSessionGapRecoveryTests(unittest.TestCase):
@@ -295,3 +298,28 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
             session.server_tcp.next_seq,
             1000 + 25 + 25 + 25,
         )
+
+
+class ResyncWarnThrottleTests(unittest.TestCase):
+    def test_resync_failure_warning_throttled_per_direction(self) -> None:
+        # VPN/丢包场景同一缺口每秒重复失败：30s 窗口内只打一条，
+        # 下条附带累计次数；两个方向互不影响。
+        _ctx()
+        session = PassiveSession.create("s-throttle", _make_bridge())
+        clock = {"t": 0.0}
+        msgs: list[str] = []
+        with mock.patch.object(sniffer.time, "monotonic", lambda: clock["t"]):
+            with mock.patch.object(
+                sniffer, "_print_line", lambda cat, text: msgs.append(text)
+            ):
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += 10
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += 10
+                session._warn_resync_failure("服务器下行", 26)
+                clock["t"] += sniffer.RESYNC_FAIL_WARN_INTERVAL_SECONDS + 1
+                session._warn_resync_failure("服务器下行", 163)
+                session._warn_resync_failure("客户端上行", 163)
+            self.assertEqual(len(msgs), 3)
+            self.assertIn("已连续失败 2 次", msgs[1])
+            self.assertIn("163 字节", msgs[2])

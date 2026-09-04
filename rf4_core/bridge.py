@@ -490,9 +490,9 @@ class RF4ChatBridge:
 
     def _load_item_catalog_index(self) -> None:
         candidates = [
-            THIS_DIR.parent / "catalog" / "catalog.json",
-            THIS_DIR / "catalog" / "catalog.json",
-            Path(sys.argv[0]).resolve().parent / "catalog" / "catalog.json",
+    THIS_DIR / "catalog" / "catalog.json",
+    THIS_DIR / "catalog" / "catalog.json",
+    Path(sys.argv[0]).resolve().parent / "rf4_core" / "catalog" / "catalog.json",
         ]
         for path in candidates:
             if not path.exists():
@@ -890,7 +890,7 @@ class RF4ChatBridge:
         raw = getattr(ctx.options, "rf4_overlay_db", "") or ""
         if raw.strip():
             return Path(raw.strip())
-        return THIS_DIR.parent / "rf4_overlay_events.sqlite3"
+        return THIS_DIR / "rf4_overlay_events.sqlite3"
 
     def _ensure_overlay_db(self, con: sqlite3.Connection) -> None:
         con.execute(
@@ -929,7 +929,7 @@ class RF4ChatBridge:
                     con.commit()
             finally:
                 con.close()
-        except OSError:
+        except (OSError, sqlite3.Error):
             if ctx.options.rf4_verbose_logging:
                 self._log(f"failed to write overlay event to {db_path}")
 

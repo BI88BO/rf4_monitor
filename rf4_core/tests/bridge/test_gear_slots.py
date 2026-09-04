@@ -1,12 +1,9 @@
+"""rf4_core.bridge：装备槽位（11/2）映射测试。"""
 from __future__ import annotations
 
-import sys
 import unittest
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rf4_core import bridge as bridge_mod
 from rf4_core.bridge import FlowSession, RF4ChatBridge
@@ -111,7 +108,3 @@ class SwitchSlotUpdateTests(unittest.TestCase):
         gear = "44444444-4444-4444-4444-444444444444"
         self._feed_switch(9, 50, gear)
         self.assertNotIn(50, self.session.slot_items)
-
-
-if __name__ == "__main__":
-    unittest.main()

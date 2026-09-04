@@ -20,34 +20,40 @@ RF4 Monitor 是一个 `俄罗斯钓鱼4`游戏的网络流量监控工具，用�
 
 ```text
 rf4_monitor-main/
-  deskmon_engine.py       主入口（CLI launcher + mitmdump addon；进程名不含 rf4）
-  deskmon_tray.py         系统托盘控制（一键启动/停止监控 + 浮窗）
   deskmon.bat             双击启动托盘（自提权，后台运行无控制台）
-  deskmon_overlay.pyw     来鱼浮窗提醒（UDP 事件桥监听端）
-  rf4_core/               核心实现包
+  rf4_core/               核心实现包（入口、逻辑、配置、数据、测试全部在此）
+    engine.py             mitmdump addon + CLI 主入口
+    tray.py               系统托盘控制（一键启动/停止监控 + 浮窗）
+    overlay.pyw           来鱼浮窗提醒（UDP 事件桥监听端）
+    web_monitor.py        浏览器端监控面板（可选）
     launcher.py           CLI、hosts、证书、mitmdump 命令、登录改写
     protocol.py           协议编解码、数据类、协议 profile
+    sniffer.py            RC4 嗅探器、TCP 重组、Hermes 会话
+    game_catalog.py       游戏内物品目录加载
     fish_labels.py        鱼名中文映射加载
     console.py            终端着色辅助
     bridge.py             RF4ChatBridge（mitmdump addon）、FlowSession、事件桥
-  rf4_hosts.txt           hosts 示例
-  reference_defaults.txt  默认网络参考配置
-  fish_labels_zh.json     鱼名中文映射
+    catalog/              装备目录索引
+    fish_labels_zh.json   鱼名中文映射
+    rf4_config.json       主配置（协议 profile、抓包模式、服务器地址）
+    rf4_mode.json         监控模式（proxy / passive）
+    rf4_hosts.txt         hosts 示例
+    reference_defaults.txt 默认网络参考配置
+    tests/                单元测试
+      protocol/           协议编解码测试
+      bridge/             事件桥测试
+      sniffer/            嗅探器测试
+      overlay/            浮窗测试
   安装依赖.bat            Python 依赖安装脚本，使用清华源
   requirements.txt        Python 依赖列表
-  certs/                  证书目录
-  logs/                   运行日志目录
-  screenshot/             截图目录
 ```
 
-> 命名说明：入口脚本、托盘、浮窗与打包产物统一使用中性代号 **DeskMon**（进程名、互斥量、环境变量均不含 rf4 字样），浮窗窗口标题为「来鱼提示」，避免被游戏进程扫描注意到。`rf4_core/` 内部包与 `rf4_*.json` 配置为磁盘文件，保留原名不影响。
+> 命名说明：入口脚本、托盘、浮窗统一使用中性代号 **DeskMon**（进程名、互斥量、环境变量均不含 rf4 字样），浮窗窗口标题为「来鱼提示」，避免被游戏进程扫描注意到。`rf4_core/` 内部包与 `rf4_*.json` 配置为磁盘文件，保留原名不影响。
 
-证书文件：
+证书文件由启动流程自动生成，保存在本机 `certs/` 目录：
 
 ```text
 certs/rf4_monitor.crt
-certs/rf4_monitor.key
-certs/rf4_monitor.pem
 ```
 
 ## 安装
@@ -168,6 +174,11 @@ py -3 deskmon_engine.py
 浮窗只显示自己的鱼获事件，其他玩家的钓到/记录消息不会弹出。浮窗为透明置顶小窗，可按住左键拖动到任意位置，位置会自动记忆在 `rf4_overlay_config.json`。
 
 浮窗可单独运行（不依赖主程序启动脚本）：双击 `deskmon_overlay.pyw`。若端口被占用会提示已有实例在运行。
+
+### 手机网页监控
+
+托盘菜单里的 **手机网页监控** 会在本机启动 HTTP 服务，手机浏览器访问 `http://<电脑IP>:8088` 即可查看浮窗事件历史。服务监听局域网地址，同一 WiFi 内的其他设备也能访问。
+
 ## 截图
 
 ![RF4 Monitor 浮窗](QQ图片20260812091453.jpg)

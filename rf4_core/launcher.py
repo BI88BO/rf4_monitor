@@ -130,7 +130,7 @@ class LoginRewriteResult:
 
 THIS_DIR = data_root()
 REPO_ROOT = THIS_DIR.parents[1]
-BUNDLED_REFERENCE_PATH = THIS_DIR / "reference_defaults.txt"
+BUNDLED_REFERENCE_PATH = Path(__file__).resolve().parent / "reference_defaults.txt"
 
 
 def default_reference_paths(repo_root: Path) -> list[Path]:
@@ -1257,7 +1257,7 @@ def build_mitmdump_command(
     realtime_upstream_host: str,
     realtime_upstream_port: int,
 ) -> list[str]:
-    script = THIS_DIR / "deskmon_engine.py"
+    script = Path(__file__).resolve().parent / "engine.py"
     command: list[str] = ["mitmdump", "-s", str(script)]
     command.extend(passthrough)
     selected_reverse_targets = select_reverse_targets(reference.reverse_targets)

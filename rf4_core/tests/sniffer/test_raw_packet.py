@@ -1,12 +1,9 @@
+"""rf4_core.sniffer：裸以太网帧 TCP 解析测试。"""
 from __future__ import annotations
 
 import socket
 import struct
-import sys
 import unittest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rf4_core.sniffer import _parse_raw_eth_tcp_packet
 
@@ -114,7 +111,3 @@ class ParseRawEthTcpPacketTests(unittest.TestCase):
         self.assertIsNotNone(packet)
         self.assertEqual(packet.flags & 0x02, 0x02)
         self.assertEqual(packet.payload, b"")
-
-
-if __name__ == "__main__":
-    unittest.main()

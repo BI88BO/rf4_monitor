@@ -73,7 +73,7 @@ MIRRORED_SESSION_ACTIVE_SECONDS = 2.0
 # 本地 token 缓存：切服/重连后即使没有捕获到 auth 包，也能用磁盘缓存的
 # token 重建 RC4 并完成帧边界对齐（重启进程后依然可用）。
 TOKEN_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-TOKEN_CACHE_PATH = THIS_DIR.parent / "rf4_token_cache.json"
+TOKEN_CACHE_PATH = THIS_DIR / "rf4_token_cache.json"
 TOKEN_CACHE_LOCK = threading.Lock()
 VIRTUAL_INTERFACE_HINTS = (
     "accelerator",
@@ -554,21 +554,54 @@ class TcpStreamReassembler:
     fragments: dict[int, bytes] = field(default_factory=dict)
     pending_bytes: int = 0
     gap_started_at: Optional[float] = None
+    clear_control_seqs: set[int] = field(default_factory=set)
 
     def reset(self, initial_seq: Optional[int] = None) -> None:
         self.next_seq = initial_seq
         self.fragments.clear()
         self.pending_bytes = 0
         self.gap_started_at = None
+        self.clear_control_seqs.clear()
 
     def feed(self, seq: int, payload: bytes, *, syn: bool = False) -> bytes:
         payload_seq = seq + (1 if syn else 0)
         if self.next_seq is None:
             self.next_seq = payload_seq
+        # Npcap exposes RF4's six-byte clear control acknowledgement as TCP
+        # payload, but its sequence number is reused by the following record.
+        # Treating it as stream data advances next_seq and makes the following
+        # UUID/business frame look like an old retransmission.
+        if payload == b"\x00" * 6:
+            # The tunnel can emit several of these acknowledgements before the
+            # matching records arrive, and their metadata offsets can overlap
+            # the next business record by four bytes. Keep every observed
+            # offset so an out-of-order clear acknowledgement still removes
+            # only that virtual four-byte offset when the stream reaches it.
+            if (
+                self.next_seq in self.clear_control_seqs
+                and self.next_seq < payload_seq <= self.next_seq + 6
+            ):
+                self.next_seq = payload_seq
+            self.clear_control_seqs.add(payload_seq)
+            return b""
         if not payload:
             return b""
 
         assert self.next_seq is not None
+        # Some control acknowledgements are recorded at sequence N while the
+        # next real segment starts at N+4. This is capture metadata rather
+        # than a real four-byte TCP loss; consume that virtual offset before
+        # deciding that the stream has a gap.
+        virtual_offsets = [
+            offset
+            for offset in self.clear_control_seqs
+            if self.next_seq <= offset <= payload_seq
+        ]
+        if virtual_offsets:
+            self.next_seq = payload_seq
+            self.clear_control_seqs = {
+                offset for offset in self.clear_control_seqs if offset > payload_seq
+            }
         end_seq = payload_seq + len(payload)
         if end_seq <= self.next_seq:
             return b""
@@ -590,6 +623,24 @@ class TcpStreamReassembler:
             assert self.next_seq is not None
             usable_starts = [start for start in self.fragments if start <= self.next_seq]
             if not usable_starts:
+                # A six-byte clear control record can reuse its TCP sequence
+                # number. If the next buffered record starts four bytes later,
+                # consume that virtual capture offset silently instead of
+                # creating a recoverable TCP-gap warning.
+                virtual_offsets = [
+                    offset
+                    for offset in self.clear_control_seqs
+                    if self.next_seq <= offset < self.next_seq + 6
+                ]
+                if virtual_offsets:
+                    # The next buffered payload is the real continuation. The
+                    # missing bytes are the virtual overlap itself, so align to
+                    # that payload and let normal reassembly consume it.
+                    self.next_seq = min(usable_starts)
+                    self.clear_control_seqs = {
+                        offset for offset in self.clear_control_seqs if offset >= self.next_seq
+                    }
+                    continue
                 if self.gap_started_at is None:
                     self.gap_started_at = time.monotonic()
                 break
@@ -2059,14 +2110,25 @@ class PacketObserver:
             if not self._rc4_handoffs:
                 # 内存 handoff 为空时回退到磁盘 token 缓存（重启进程/长时间
                 # 未保存 handoff 后依然能用上次的 token 重建 RC4）。
-                cached = _load_cached_tokens().get(_token_cache_key(*server_endpoint))
-                if cached:
+                cached_tokens = _load_cached_tokens()
+                cached = cached_tokens.get(_token_cache_key(*server_endpoint))
+                if cached is not None:
                     self._rc4_handoffs[cached] = Rc4Handoff(
                         token=cached,
                         client_read_rc4=None,
                         server_read_rc4=None,
                         saved_at=now,
                     )
+                else:
+                    # 同一登录 token 会跨 realtime 服务器复用；精确 endpoint
+                    # 未命中时，把缓存里的 token 全部作为候选做探测。
+                    for token in cached_tokens.values():
+                        self._rc4_handoffs[token] = Rc4Handoff(
+                            token=token,
+                            client_read_rc4=None,
+                            server_read_rc4=None,
+                            saved_at=now,
+                        )
             if not self._rc4_handoffs:
                 return False
             server_data = bytes(candidate.buffers.get(server_endpoint, b""))
@@ -2928,7 +2990,7 @@ def _load_capture_config() -> dict:
         from . import data_root
 
         candidates = (
-            data_root() / "rf4_config.json",
+    Path(__file__).resolve().parent / "rf4_config.json",
             data_root() / "rf4_monitor.json",
         )
         for path in candidates:

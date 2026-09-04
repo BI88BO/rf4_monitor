@@ -22,9 +22,9 @@ echo [deskmon] ==============================================
 
 rem --- Start the tray program in the background (no console window) ---
 if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" "deskmon_tray.py"
+    start "" ".venv\Scripts\pythonw.exe" "rf4_core\tray.py"
 ) else (
-    start "" pyw -3 "deskmon_tray.py"
+    start "" pyw -3 "rf4_core\tray.py"
 )
 
 echo [deskmon] Tray icon launched. Use the tray menu to start/stop monitoring.
