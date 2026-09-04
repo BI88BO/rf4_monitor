@@ -18,6 +18,13 @@ from __future__ import annotations
 import os
 import sys
 import types
+from pathlib import Path
+
+# 直接以脚本方式运行（python rf4_core/engine.py 或 mitmdump -s）时，
+# sys.path 指向 rf4_core/ 而不是项目根目录，需要补上才能找到 rf4_core 包。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 if __name__ not in sys.modules:
     sys.modules[__name__] = types.ModuleType(__name__)
