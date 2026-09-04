@@ -8,6 +8,7 @@ import math
 import re
 import sqlite3
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 
@@ -75,12 +76,16 @@ class Overlay:
     CANVAS_TEXT = "#ffd166"
     CANVAS_DIM = "#b39a5a"
     CANVAS_RED = "#FF5252"
+    CANVAS_GRAY = "#5c6b64"
     TRANSPARENT_KEY = "#0000FF"
     CORNER_RADIUS = 12
     # 反外挂警告红字状态：object.__new__ 构造(测试)时默认为 False
     _anticheat_red = False
     # 反外挂红字恢复定时器：同一时刻至多一个，新事件会先取消旧的
     _anticheat_timer_id = None
+    # 抓包活跃状态：收到任何事件切正常色，15 秒无事件切灰（类默认 True 兼容测试）
+    _capture_active = True
+    _capture_last_event_ts = 0.0
 
     @staticmethod
     def font_family() -> str:
@@ -150,6 +155,8 @@ class Overlay:
         self._anticheat_red = False
         self._anticheat_timer_id = None
         self._last_seen_id = 0
+        self._capture_active = False
+        self._capture_last_event_ts = 0.0
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -435,7 +442,9 @@ class Overlay:
         if not rod_lines and not dim_lines:
             dim_lines = ["来鱼提示 · 待机中"]
         # 反外挂红字优先：直接整块红字，跳过力竭判断(避免无效计算)
-        if self._anticheat_red:
+        if not self._capture_active:
+            rod_color = self.CANVAS_GRAY
+        elif self._anticheat_red:
             rod_color = self.CANVAS_RED
         else:
             rod_color = self.CANVAS_RED if self._any_exhausted(rod_lines) else self.CANVAS_TEXT
@@ -455,7 +464,7 @@ class Overlay:
                 text="\n".join(dim_lines),
                 anchor="nw",
                 font=(Overlay.font_family(), 13, "bold"),
-                fill=self.CANVAS_DIM,
+                fill=self.CANVAS_GRAY if not self._capture_active else self.CANVAS_DIM,
                 width=width - 32,
                 justify="left",
             )
@@ -573,12 +582,31 @@ class Overlay:
                 if rows:
                     # 游标推进到最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
                     self._last_seen_id = rows[-1][0]
+                    self._on_capture_alive()
             finally:
                 con.close()
         except (OSError, sqlite3.Error):
             pass
         finally:
+            self._check_capture_timeout()
             self.root.after(30, self._poll)
+
+    def _on_capture_alive(self):
+        self._capture_last_event_ts = time.time()
+        if not self._capture_active:
+            self._capture_active = True
+            try:
+                self._refresh_display()
+            except AttributeError:
+                pass
+
+    def _check_capture_timeout(self):
+        if self._capture_active and time.time() - self._capture_last_event_ts > 15:
+            self._capture_active = False
+            try:
+                self._refresh_display()
+            except AttributeError:
+                pass
 
     def _handle_event_payload(self, payload):
         try:
