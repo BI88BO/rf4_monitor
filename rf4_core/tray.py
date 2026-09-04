@@ -321,12 +321,12 @@ def start_monitor() -> str:
         pythonw = _pythonw()
         launcher_cmd = [
             pythonw,
-    str(BASE_DIR / "rf4_core" / "engine.py"),
+            str(BASE_DIR / "rf4_core" / "engine.py"),
             *mode_args,
             "--set",
             f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
-    overlay_cmd = [pythonw, str(BASE_DIR / "rf4_core" / "overlay.pyw")]
+        overlay_cmd = [pythonw, str(BASE_DIR / "rf4_core" / "overlay.pyw")]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if pythonw.endswith("python.exe") else 0
 
     # 把可勾选的显示项转成 --set 参数传给 addon
@@ -378,7 +378,7 @@ def _toggle_web_monitor(icon, item) -> None:
         icon.notify("手机网页监控已停止", "来鱼提示")
     else:
         python_exe = sys.executable
-    script = str(BASE_DIR / "rf4_core" / "web_monitor.py")
+        script = str(BASE_DIR / "rf4_core" / "web_monitor.py")
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         p = subprocess.Popen(
             [python_exe, script],
