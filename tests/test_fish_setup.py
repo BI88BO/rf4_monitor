@@ -206,8 +206,7 @@ class FightPullAssociationTests(unittest.TestCase):
             rf4_verbose_logging=False,
             rf4_log_telemetry=True,
             rf4_telemetry_categories="all",
-            rf4_event_bridge_port=0,
-        )
+            )
         prev_ctx = bridge_mod.ctx
         bridge_mod.ctx = SimpleNamespace(options=options)
         try:
@@ -287,8 +286,7 @@ class FightLoadSlimLineTests(unittest.TestCase):
             rf4_verbose_logging=False,
             rf4_log_telemetry=True,
             rf4_telemetry_categories="all",
-            rf4_event_bridge_port=0,
-        )
+            )
         self.prev_ctx = bridge_mod.ctx
         bridge_mod.ctx = SimpleNamespace(options=options)
         self.bridge = RF4ChatBridge()
@@ -419,8 +417,7 @@ class FightLoadRecordDistanceTests(unittest.TestCase):
             rf4_verbose_logging=False,
             rf4_log_telemetry=True,
             rf4_telemetry_categories="all",
-            rf4_event_bridge_port=0,
-            rf4_show_fish=True,
+                rf4_show_fish=True,
         )
         self.prev_ctx = bridge_mod.ctx
         bridge_mod.ctx = SimpleNamespace(options=options)
@@ -482,8 +479,7 @@ class FightStageInitialLineTests(unittest.TestCase):
             rf4_verbose_logging=False,
             rf4_log_telemetry=True,
             rf4_telemetry_categories="all",
-            rf4_event_bridge_port=0,
-            rf4_show_fish=True,
+                rf4_show_fish=True,
             rf4_avatar_url="",
             rf4_sender_level=1,
             rf4_sender_region="",
@@ -578,8 +574,7 @@ class FightTelemetryCategoryTests(unittest.TestCase):
             rf4_verbose_logging=False,
             rf4_log_telemetry=True,
             rf4_telemetry_categories="all",
-            rf4_event_bridge_port=0,
-        )
+            )
         self.prev_ctx = bridge_mod.ctx
         bridge_mod.ctx = SimpleNamespace(options=options)
         self.bridge = RF4ChatBridge()

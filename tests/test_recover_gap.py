@@ -66,7 +66,6 @@ def _make_ready_session() -> PassiveSession:
         rf4_verbose_logging=False,
         rf4_log_telemetry=True,
         rf4_telemetry_categories="all",
-        rf4_event_bridge_port=0,
         rf4_default_location_id="",
         rf4_default_users_count=0,
     )

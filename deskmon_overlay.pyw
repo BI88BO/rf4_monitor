@@ -1,15 +1,13 @@
 """RF4 来鱼浮窗提醒
 
-监听 RF4 Monitor 的 UDP 事件桥，来鱼时在屏幕角落弹出透明置顶浮窗，
+监听 RF4 Monitor 的 SQLite 事件桥，来鱼时在屏幕角落弹出透明置顶浮窗，
 入护后消失。可按住鼠标拖动到任意位置，位置会自动记忆。
 """
 import json
 import math
-import queue
 import re
-import socket
+import sqlite3
 import sys
-import threading
 import tkinter as tk
 from pathlib import Path
 
@@ -20,8 +18,7 @@ if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
 CONFIG_FILE = BASE_DIR / "rf4_overlay_config.json"
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 25000
+DEFAULT_DB_PATH = BASE_DIR / "rf4_overlay_events.sqlite3"
 WINDOW_WIDTH = 320
 WINDOW_HEIGHT = 70
 
@@ -136,10 +133,9 @@ class Overlay:
         kwargs.setdefault("smooth", True)
         return canvas.create_polygon(pts, **kwargs)
 
-    def __init__(self, root, host, port):
+    def __init__(self, root, db_path):
         self.root = root
-        self.host = host
-        self.port = port
+        self.db_path = db_path
         self.labels = load_fish_labels()
         self.visible = False
         self._drag_offset = None
@@ -152,6 +148,7 @@ class Overlay:
         self.canvas = None
         self._anticheat_red = False
         self._anticheat_timer_id = None
+        self._last_seen_id = 0
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -178,38 +175,7 @@ class Overlay:
         self._bind_drag(self.root)
         self._bind_drag(self.canvas)
 
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.bind((self.host, self.port))
-        except OSError as exc:
-            self.root.destroy()
-            from tkinter import messagebox
-
-            try:
-                root2 = tk.Tk()
-                root2.withdraw()
-                messagebox.showerror(
-                    "来鱼提示 - 启动失败",
-                    f"无法监听 UDP {self.host}:{self.port}。\n\n"
-                    f"可能原因：已有来鱼提示实例在运行，或端口被占用。\n"
-                    f"错误：{exc}\n\n"
-                    f"请先关闭已运行的浮窗/监控，再重新双击启动。",
-                    parent=root2,
-                )
-                root2.destroy()
-            except Exception:
-                pass
-            return
-
-        self.sock.settimeout(0.2)
-        self.sock.setblocking(True)
-        self._display_queue = queue.Queue()
-        self._receiver_thread = threading.Thread(
-            target=self._receive_loop,
-            name="rf4-overlay-udp",
-            daemon=True,
-        )
-        self._receiver_thread.start()
+        self._ensure_sqlite_db()
         self._refresh_display()
         self.root.after(30, self._poll)
         self.root.after(800, self._poll_config)
@@ -552,33 +518,56 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self.visible = True
 
-    def _receive_loop(self):
-        while True:
+    def _ensure_sqlite_db(self):
+        try:
+            con = sqlite3.connect(str(self.db_path), timeout=1.0)
             try:
-                data, _ = self.sock.recvfrom(4096)
-            except (socket.timeout, OSError):
-                continue
-            self._display_queue.put(data)
+                con.execute("PRAGMA busy_timeout = 1000")
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS overlay_events ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "ts REAL NOT NULL,"
+                    "event_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL"
+                    ")"
+                )
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_overlay_events_ts "
+                    "ON overlay_events(ts)"
+                )
+                con.commit()
+            finally:
+                con.close()
+        except OSError:
+            pass
 
     def _poll(self):
-        # 接收由后台线程完成，主线程只做轻量队列轮询并在事件到来时立即刷新，
-        # 避免阻塞型 recvfrom 拖后显示（修复"来鱼弹窗慢半拍"）。
         try:
-            while True:
-                try:
-                    data = self._display_queue.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    self._handle_datagram(data)
-                except Exception:
-                    pass
+            con = sqlite3.connect(str(self.db_path), timeout=1.0)
+            try:
+                con.execute("PRAGMA busy_timeout = 1000")
+                rows = con.execute(
+                    "SELECT id, payload FROM overlay_events WHERE id > ? ORDER BY id",
+                    (self._last_seen_id,),
+                ).fetchall()
+                for row_id, payload in rows:
+                    try:
+                        self._handle_event_payload(payload)
+                    except Exception:
+                        pass
+                if rows:
+                    # 游标推进到最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
+                    self._last_seen_id = rows[-1][0]
+            finally:
+                con.close()
+        except OSError:
+            pass
         finally:
             self.root.after(30, self._poll)
 
-    def _handle_datagram(self, data):
+    def _handle_event_payload(self, payload):
         try:
-            event = json.loads(data.decode("utf-8"))
+            event = json.loads(payload)
         except (UnicodeDecodeError, ValueError):
             return
         name = event.get("event")
@@ -611,11 +600,10 @@ class Overlay:
 
 def main():
     config = load_config()
-    host = config.get("host", DEFAULT_HOST)
-    port = config.get("port", DEFAULT_PORT)
+    db_path = Path(config.get("db_path", str(DEFAULT_DB_PATH)))
     root = tk.Tk()
     root.title("来鱼提示")
-    Overlay(root, host, port)
+    Overlay(root, db_path)
     root.mainloop()
 
 

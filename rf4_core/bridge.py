@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import struct
 import sys
 import time
@@ -605,16 +606,10 @@ class RF4ChatBridge:
         )
         loader.add_option("rf4_verbose_logging", bool, False, "Log per-session handshake and injection details.")
         loader.add_option(
-            "rf4_event_bridge_host",
+            "rf4_overlay_db",
             str,
-            "127.0.0.1",
-            "UDP host used to broadcast fish incoming/kept events to an external overlay.",
-        )
-        loader.add_option(
-            "rf4_event_bridge_port",
-            int,
-            0,
-            "UDP port used to broadcast fish incoming/kept events. 0 disables the event bridge.",
+            "",
+            "Path to SQLite database for overlay event bridge. Empty uses default (rf4_overlay_events.sqlite3).",
         )
         loader.add_option("rf4_show_incoming", bool, True, "Show self fish incoming events (来鱼).")
         loader.add_option("rf4_show_bitten", bool, True, "Show self fish bitten events (确认咬钩).")
@@ -891,10 +886,54 @@ class RF4ChatBridge:
         self._safe_log(text)
         self._broadcast_telemetry(category, text)
 
+    def _overlay_db_path(self) -> Path:
+        raw = getattr(ctx.options, "rf4_overlay_db", "") or ""
+        if raw.strip():
+            return Path(raw.strip())
+        return THIS_DIR.parent / "rf4_overlay_events.sqlite3"
+
+    def _ensure_overlay_db(self, con: sqlite3.Connection) -> None:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS overlay_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "ts REAL NOT NULL,"
+            "event_type TEXT NOT NULL,"
+            "payload TEXT NOT NULL"
+            ")"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_overlay_events_ts "
+            "ON overlay_events(ts)"
+        )
+
+    def _write_overlay_event(self, event_type: str, payload: str) -> None:
+        db_path = self._overlay_db_path()
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            con = sqlite3.connect(str(db_path), timeout=1.0)
+            try:
+                con.execute("PRAGMA busy_timeout = 1000")
+                self._ensure_overlay_db(con)
+                con.execute(
+                    "INSERT INTO overlay_events (ts, event_type, payload) VALUES (?, ?, ?)",
+                    (time.time(), event_type, payload),
+                )
+                con.commit()
+                # 每 100 次写入清理一次旧事件，保留最近 2000 条
+                row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                if row_id and row_id % 100 == 0:
+                    con.execute(
+                        "DELETE FROM overlay_events WHERE id NOT IN "
+                        "(SELECT id FROM overlay_events ORDER BY id DESC LIMIT 2000)"
+                    )
+                    con.commit()
+            finally:
+                con.close()
+        except OSError:
+            if ctx.options.rf4_verbose_logging:
+                self._log(f"failed to write overlay event to {db_path}")
+
     def _broadcast_telemetry(self, category: str, text: str) -> None:
-        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
-        if port <= 0:
-            return
         switch = self._telemetry_show_option(category)
         if switch and not self._show_enabled(switch):
             return
@@ -907,20 +946,7 @@ class RF4ChatBridge:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        try:
-            import socket
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
-                sock.sendto(payload.encode("utf-8"), (host, port))
-            finally:
-                sock.close()
-        except OSError:
-            if ctx.options.rf4_verbose_logging:
-                self._log(
-                    f"failed to broadcast telemetry {category} on {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
-                )
+        self._write_overlay_event("telemetry", payload)
 
     @staticmethod
     def _telemetry_show_option(category: str) -> str:
@@ -3343,10 +3369,6 @@ class RF4ChatBridge:
             self._write_emit_probe(f"broadcast_exc|{type(e).__name__}|{e}")
 
     def _broadcast_self_event_impl(self, synthetic: SyntheticChatEvent) -> None:
-        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
-        if port <= 0:
-            self._log(f"[广播]跳过: port={getattr(ctx.options, 'rf4_event_bridge_port', 0)!r}")
-            return
         phase_switch = {
             self.SELF_EVENT_PHASE_INCOMING: "rf4_show_incoming",
             self.SELF_EVENT_PHASE_BITTEN: "rf4_show_bitten",
@@ -3380,20 +3402,8 @@ class RF4ChatBridge:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        try:
-            import socket
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
-                sock.sendto(payload.encode("utf-8"), (host, port))
-                self._log(f"[广播]已发送 {event_name} -> {host}:{port} 字节={len(payload)}")
-            finally:
-                sock.close()
-        except OSError:
-            self._log(
-                f"[广播]发送失败 {event_name} -> {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
-            )
+        self._write_overlay_event(event_name, payload)
+        self._log(f"[广播]已写入 {event_name} -> {self._overlay_db_path().name}")
 
     def broadcast_reset(self) -> None:
         """Broadcast a session-start reset so the overlay clears stale rows.
@@ -3406,9 +3416,6 @@ class RF4ChatBridge:
 
     def _broadcast_generic_event(self, event_name: str, text: str) -> None:
         """广播其他事件(频道鱼获/公共聊天等)到浮窗，受显示设置勾选控制。"""
-        port = int(getattr(ctx.options, "rf4_event_bridge_port", 0) or 0)
-        if port <= 0:
-            return
         switch = {
             "fish_catch": "rf4_show_catch_broadcast",
             "chat": "rf4_show_chat_broadcast",
@@ -3423,20 +3430,7 @@ class RF4ChatBridge:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        try:
-            import socket
-
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                host = getattr(ctx.options, "rf4_event_bridge_host", None) or "127.0.0.1"
-                sock.sendto(payload.encode("utf-8"), (host, port))
-            finally:
-                sock.close()
-        except OSError:
-            if ctx.options.rf4_verbose_logging:
-                self._log(
-                    f"failed to broadcast {event_name} on {getattr(ctx.options, 'rf4_event_bridge_host', None) or '127.0.0.1'}:{port}"
-                )
+        self._write_overlay_event(event_name, payload)
 
     @staticmethod
     def _format_weight(weight_raw: Optional[int]) -> str:

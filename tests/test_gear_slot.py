@@ -23,7 +23,6 @@ def _session_with_slots(slots: dict[int, str]) -> tuple[RF4ChatBridge, FlowSessi
         rf4_verbose_logging=False,
         rf4_log_telemetry=True,
         rf4_telemetry_categories="all",
-        rf4_event_bridge_port=0,
     )
     wrapper = bridge_mod.ctx
     bridge_mod.ctx = SimpleNamespace(options=options)

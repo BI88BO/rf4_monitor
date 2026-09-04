@@ -15,6 +15,7 @@ import ctypes
 import json
 import os
 import subprocess
+import socket
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,6 @@ if getattr(sys, "frozen", False):
 LOG_DIR = BASE_DIR / "logs"
 MONITOR_LOG = LOG_DIR / "rf4_monitor.log"
 SNIFFER_LOG = LOG_DIR / "rf4_sniffer.log"
-EVENT_BRIDGE_PORT = 25000
 SHOW_CONFIG_FILE = BASE_DIR / "rf4_show_config.json"
 MODE_CONFIG_FILE = BASE_DIR / "rf4_mode.json"
 
@@ -207,6 +207,7 @@ _state = {
     "overlay_proc": None,
     "running": False,
     "show_config": None,
+    "web_monitor_proc": None,
 }
 
 
@@ -311,8 +312,6 @@ def start_monitor() -> str:
             "engine",
             *mode_args,
             "--set",
-            f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
-            "--set",
             f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
         overlay_cmd = [self_exe, "--role", "overlay"]
@@ -323,8 +322,6 @@ def start_monitor() -> str:
             pythonw,
             str(BASE_DIR / "deskmon_engine.py"),
             *mode_args,
-            "--set",
-            f"rf4_event_bridge_port={EVENT_BRIDGE_PORT}",
             "--set",
             f"rf4_show_config_path={SHOW_CONFIG_FILE}",
         ]
@@ -370,6 +367,41 @@ def stop_monitor() -> str:
     _state["overlay_proc"] = None
     _state["running"] = False
     return "已停止"
+
+
+def _toggle_web_monitor(icon, item) -> None:
+    proc = _state["web_monitor_proc"]
+    if proc is not None and _is_alive(proc):
+        _terminate_pid_tree(proc.pid)
+        _state["web_monitor_proc"] = None
+        icon.notify("手机网页监控已停止", "来鱼提示")
+    else:
+        python_exe = sys.executable
+        script = str(BASE_DIR / "rf4_web_monitor.py")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        p = subprocess.Popen(
+            [python_exe, script],
+            creationflags=creationflags,
+        )
+        _state["web_monitor_proc"] = p
+        ip = _get_local_ip()
+        icon.notify(f"手机访问 http://{ip}:8088", "手机网页监控已启动")
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _checked_web_monitor(item) -> bool:
+    proc = _state["web_monitor_proc"]
+    return proc is not None and _is_alive(proc)
 
 
 def _open_log() -> None:
@@ -436,6 +468,8 @@ def main() -> None:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示设置", pystray.Menu(*show_menu_items)),
             pystray.MenuItem("浮窗样式", pystray.Menu(*style_menu_items)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("手机网页监控", _toggle_web_monitor, checked=_checked_web_monitor),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),
         ),

@@ -56,7 +56,7 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         # 事件短句化 + 来鱼保持到下一条事件覆盖(不再 8 秒自动消失)。
         self.assertEqual(ov.calls, [("self", "2", "鱼 来鱼", 0)])
 
@@ -66,23 +66,23 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
             {"event": "fish_kept", "gear_slot": "1", "text": "入护了"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov.calls, [("self", "1", "入护了", 3000)])
 
     def test_chat_and_telemetry_route_to_generic(self) -> None:
         ov = _empty_overlay()
-        ov._handle_datagram(b'{"event": "chat", "text": "hello"}')
-        ov._handle_datagram(b'{"event": "telemetry", "text": "w1"}')
+        ov._handle_event_payload('{"event": "chat", "text": "hello"}')
+        ov._handle_event_payload('{"event": "telemetry", "text": "w1"}')
         self.assertEqual(ov.calls, [("generic", "hello"), ("generic", "w1")])
 
     def test_reset_routes_to_reset_to_idle(self) -> None:
         ov = _empty_overlay()
-        ov._handle_datagram(b'{"event": "reset", "text": ""}')
+        ov._handle_event_payload('{"event": "reset", "text": ""}')
         self.assertEqual(ov.calls, [("reset",)])
 
     def test_anticheat_routes_to_show_anticheat(self) -> None:
         ov = _empty_overlay()
-        ov._handle_datagram(b'{"event": "anticheat", "text": "ac"}')
+        ov._handle_event_payload('{"event": "anticheat", "text": "ac"}')
         self.assertEqual(ov.calls, [("anticheat", "ac")])
 
     def test_real_show_anticheat_reroutes_without_label(self) -> None:
@@ -107,8 +107,8 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
 
     def test_garbage_datagram_is_ignored(self) -> None:
         ov = _empty_overlay()
-        ov._handle_datagram(b"not-json")
-        ov._handle_datagram(b"")
+        ov._handle_event_payload("not-json")
+        ov._handle_event_payload("")
         self.assertEqual(ov.calls, [])
 
 
@@ -128,7 +128,7 @@ class OverlayFightStatusTests(unittest.TestCase):
             {"event": "telemetry", "category": "fish", "text": "3号杆 | 体力 78% 出线 12.3米"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("3号杆"), "3号杆 78% 12.3米")
 
     def test_fight_status_category_updates_rod_row(self) -> None:
@@ -138,7 +138,7 @@ class OverlayFightStatusTests(unittest.TestCase):
             {"event": "telemetry", "category": "fight_status", "text": "1号杆 | 体力 100% 出线 33.486米"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("1号杆"), "1号杆 100% 33.486米")
 
     def test_handheld_fight_status_gets_own_row(self) -> None:
@@ -149,7 +149,7 @@ class OverlayFightStatusTests(unittest.TestCase):
              "text": "手持竿 | 鱼=蓝鳃太阳鱼 重量=1.553 公斤 体力 90% 出线 5.0米"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("手持竿"), "手持竿 蓝鳃太阳鱼1.553kg 90% 5.0米")
 
     def test_fight_details_goes_to_generic(self) -> None:
@@ -160,13 +160,13 @@ class OverlayFightStatusTests(unittest.TestCase):
             {"event": "telemetry", "category": "fight_details", "text": "钓鱼过程位置上报 | 钓组=abc123"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("generic"), "钓鱼过程位置上报 | 钓组=abc123")
 
     def test_plain_telemetry_goes_to_generic(self) -> None:
         ov = self._overlay()
         ov._show_generic = lambda text: ov._rows.__setitem__("generic", text)
-        ov._handle_datagram(b'{"event":"telemetry","category":"player","text":"x=1"}')
+        ov._handle_event_payload('{"event":"telemetry","category":"player","text":"x=1"}')
         self.assertEqual(ov._rows.get("generic"), "x=1")
         self.assertNotIn("3号杆", ov._rows)
 
@@ -432,7 +432,7 @@ class OverlayCompactTests(unittest.TestCase):
              "text": "【我自己】：有鲤鱼 2.0 公斤 过来了"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("2号杆"), "鲤鱼2kg 来鱼")
         self.assertNotIn(8000, after_calls)
 
@@ -447,7 +447,7 @@ class OverlayCompactTests(unittest.TestCase):
              "text": "【我自己】：黑线鳕 444 克 入护了"},
             ensure_ascii=False,
         )
-        ov._handle_datagram(payload.encode("utf-8"))
+        ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("1号杆"), "黑线鳕444g 入护")
         self.assertIn(3000, after_calls)
 
@@ -490,6 +490,61 @@ class OverlayAnticheatTimerTests(unittest.TestCase):
         after_calls[-1][1]()
         self.assertIsNone(ov._anticheat_timer_id)
         self.assertFalse(ov._anticheat_red)
+
+
+class OverlaySqliteCursorTests(unittest.TestCase):
+    def _overlay(self, db_path) -> Overlay:
+        ov = object.__new__(Overlay)
+        ov.db_path = db_path
+        ov._last_seen_id = 0
+        ov.root = SimpleNamespace(after=lambda delay, fn: None)
+        calls: list[tuple] = []
+        ov._handle_event_payload = lambda payload: calls.append(payload)
+        ov._ensure_sqlite_db()
+        ov.calls = calls
+        return ov
+
+    def _insert(self, db_path, ts: float, event: str, payload: str) -> None:
+        import sqlite3
+
+        con = sqlite3.connect(str(db_path))
+        con.execute(
+            "INSERT INTO overlay_events (ts, event_type, payload) VALUES (?, ?, ?)",
+            (ts, event, payload),
+        )
+        con.commit()
+        con.close()
+
+    def test_poll_reads_events_after_bridge_restart_by_id_cursor(self) -> None:
+        """回归：bridge 重启后 ts 归零，游标必须用自增 id 而非 ts。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "events.sqlite3"
+            ov = self._overlay(db)
+            # bridge 第一次运行：ts 较大
+            self._insert(db, 199009.0, "fish_incoming",
+                         '{"event":"fish_incoming","gear_slot":"1","text":"old"}')
+            ov._poll()
+            self.assertEqual(len(ov.calls), 1)
+            # bridge 重启：ts 从小的值重新开始，但 id 继续递增
+            self._insert(db, 3.0, "fish_incoming",
+                         '{"event":"fish_incoming","gear_slot":"1","text":"new"}')
+            ov._poll()
+            self.assertEqual(len(ov.calls), 2)
+            self.assertIn("new", ov.calls[-1])
+
+    def test_poll_does_not_replay_already_seen_events(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "events.sqlite3"
+            ov = self._overlay(db)
+            self._insert(db, 100.0, "reset", '{"event":"reset","text":""}')
+            ov._poll()
+            self.assertEqual(len(ov.calls), 1)
+            ov._poll()
+            self.assertEqual(len(ov.calls), 1, "已读事件不应重复触发")
 
 
 if __name__ == "__main__":
