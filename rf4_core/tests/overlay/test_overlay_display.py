@@ -328,3 +328,30 @@ class OverlayAnticheatTimerTests(unittest.TestCase):
         after_calls[-1][1]()
         self.assertIsNone(ov._anticheat_timer_id)
         self.assertFalse(ov._anticheat_red)
+
+
+class OverlaySuspendDisplayTests(unittest.TestCase):
+    def test_suspend_status_appended_to_display_lines(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 119")
+        self.assertEqual(ov._lines_for_display(), ["来鱼提示 · 待机中", "已挂起 119"])
+
+    def test_suspend_status_uses_red_even_without_capture(self) -> None:
+        ov = object.__new__(Overlay)
+        ov.style = Overlay.STYLE_TRANSPARENT
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 119")
+        ov._capture_active = False
+        created: list[tuple] = []
+        canvas = type("C", (), {
+            "delete": lambda self, tag: None,
+            "create_text": lambda self, *a, **k: created.append(k) or 1,
+        })()
+        ov.canvas = canvas
+        ov._ensure_canvas = lambda: canvas
+        ov._draw(width=320, height=60)
+        self.assertEqual(created[0]["fill"], Overlay.CANVAS_RED)
+        self.assertEqual(created[0]["text"], "已挂起 119")

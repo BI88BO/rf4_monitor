@@ -14,6 +14,7 @@ RF4 Monitor 是一个 `俄罗斯钓鱼4`游戏的网络流量监控工具，用�
 - 输出频道鱼获信息（其他玩家钓到/记录鱼）
 - 输出自己钓鱼全流程提示：来鱼、脱钩、入护、放生
 - 桌面浮窗提醒：自己来鱼/脱钩/入护/放生时弹出置顶提示（可拖动、记忆位置）
+- 浮窗 F8 挂起/恢复游戏进程（支持倒计时自动循环）
 - 输出人物坐标、钓组坐标、搏鱼状态、公共聊天等监控信息
 
 ## 目录文件
@@ -31,6 +32,7 @@ rf4_monitor-main/
     sniffer.py            RC4 嗅探器、TCP 重组、Hermes 会话
     game_catalog.py       游戏内物品目录加载
     fish_labels.py        鱼名中文映射加载
+    process_control.py    游戏进程挂起/恢复控制
     console.py            终端着色辅助
     bridge.py             RF4ChatBridge（mitmdump addon）、FlowSession、事件桥
     catalog/              装备目录索引
@@ -172,6 +174,22 @@ py -3 deskmon_engine.py
 - **放生**：`【我自己】： 放生了 太阳鱼`
 
 浮窗只显示自己的鱼获事件，其他玩家的钓到/记录消息不会弹出。浮窗为透明置顶小窗，可按住左键拖动到任意位置，位置会自动记忆在 `rf4_overlay_config.json`。
+
+### 游戏进程挂起
+
+浮窗运行时注册全局 F8 热键。第一次按 F8 会挂起 `rf4_x64.exe`，倒计时结束后自动恢复，短暂延迟后再次挂起；再按 F8 立即恢复。参数在 `rf4_core/rf4_config.json`：
+
+```json
+"process_suspend": {
+  "enabled": true,
+  "process_names": ["rf4_x64.exe"],
+  "loop_enabled": true,
+  "countdown_seconds": 120,
+  "rehang_delay_seconds": 2
+}
+```
+
+停止或关闭浮窗不会自动恢复游戏进程；需要手动恢复时，先按 F8 再退出。
 
 浮窗可单独运行（不依赖主程序启动脚本）：双击 `deskmon_overlay.pyw`。若端口被占用会提示已有实例在运行。
 

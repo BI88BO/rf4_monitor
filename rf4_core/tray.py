@@ -18,6 +18,7 @@ import subprocess
 import socket
 import sys
 import time
+from subprocess import TimeoutExpired
 from pathlib import Path
 
 # 单实例互斥量名称：防止重复启动多个托盘导致多进程抢端口/多浮窗。
@@ -263,13 +264,16 @@ def _find_children(parent_pid: int) -> list[int]:
     return pids
 
 
-def _terminate_pid_tree(pid: int) -> None:
+def _terminate_pid_tree(pid: int, *, force: bool = True) -> None:
     children = _find_children(pid)
     for child in children:
-        _terminate_pid_tree(child)
+        _terminate_pid_tree(child, force=force)
     try:
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            command.append("/F")
         subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            command,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             capture_output=True,
             timeout=10,
@@ -363,7 +367,14 @@ def stop_monitor() -> str:
         # 先终止 launcher 进程树（含 mitmdump），launcher 退出时会自动恢复 hosts
         _terminate_pid_tree(launcher.pid)
     if overlay is not None and _is_alive(overlay):
-        _terminate_pid_tree(overlay.pid)
+        # 浮窗退出前需要释放全局热键；先正常退出，强杀只是兜底。
+        _terminate_pid_tree(overlay.pid, force=False)
+        try:
+            overlay.wait(timeout=2)
+        except TimeoutExpired:
+            pass
+        if _is_alive(overlay):
+            _terminate_pid_tree(overlay.pid)
     _state["launcher_proc"] = None
     _state["overlay_proc"] = None
     _state["running"] = False

@@ -5,12 +5,28 @@
 """
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
 import time
 import tkinter as tk
 from pathlib import Path
+
+try:
+    from .process_control import (
+        GlobalHotkey,
+        ProcessSuspender,
+        SuspendConfig,
+        SuspendLoop,
+    )
+except ImportError:
+    from process_control import (
+        GlobalHotkey,
+        ProcessSuspender,
+        SuspendConfig,
+        SuspendLoop,
+    )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PACKAGE_DIR.parent
@@ -86,6 +102,9 @@ class Overlay:
     # 抓包活跃状态：收到任何事件切正常色，15 秒无事件切灰（类默认 True 兼容测试）
     _capture_active = True
     _capture_last_event_ts = 0.0
+    # 挂起状态：object.__new__ 构造(测试)时默认关闭
+    _suspend_loop = None
+    _hotkey = None
 
     @staticmethod
     def font_family() -> str:
@@ -157,6 +176,14 @@ class Overlay:
         self._last_seen_id = 0
         self._capture_active = False
         self._capture_last_event_ts = 0.0
+        self._suspend_config = SuspendConfig.load()
+        self._suspend_loop = None
+        self._hotkey = None
+        if self._suspend_config.enabled and os.name == "nt":
+            self._suspend_loop = SuspendLoop(
+                ProcessSuspender(self._suspend_config.process_names),
+                self._suspend_config,
+            )
 
         config = self.load_config()
         self.style = config.get("style", config.get("transparent", True) and self.STYLE_TRANSPARENT or self.STYLE_DARK)
@@ -189,6 +216,12 @@ class Overlay:
         self._refresh_display()
         self.root.after(30, self._poll)
         self.root.after(800, self._poll_config)
+        self._start_suspend_hotkey()
+        self.root.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def destroy(self):
+        self._close_suspend()
+        self.root.destroy()
 
     def load_config(self):
         return load_config()
@@ -405,6 +438,10 @@ class Overlay:
             lines.append(text)
         if not lines:
             lines = ["来鱼提示 · 待机中"]
+        if self._suspend_loop is not None:
+            status = self._suspend_loop.status_text()
+            if status:
+                lines.append(status)
         return lines
 
     def _any_exhausted(self, lines) -> bool:
@@ -439,10 +476,16 @@ class Overlay:
         # 第一块：竿号/搏鱼行(按竿号排序，主色)；第二块：遥测/待机行(降暗色)。
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())
+        if self._suspend_loop is not None:
+            status = self._suspend_loop.status_text()
+            if status:
+                rod_lines.append(status)
         if not rod_lines and not dim_lines:
             dim_lines = ["来鱼提示 · 待机中"]
         # 反外挂红字优先：直接整块红字，跳过力竭判断(避免无效计算)
-        if not self._capture_active:
+        if rod_lines and rod_lines[-1].startswith(("已挂起", "待挂起")):
+            rod_color = self.CANVAS_RED
+        elif not self._capture_active:
             rod_color = self.CANVAS_GRAY
         elif self._anticheat_red:
             rod_color = self.CANVAS_RED
@@ -588,8 +631,47 @@ class Overlay:
         except (OSError, sqlite3.Error):
             pass
         finally:
+            self._consume_suspend_hotkey()
+            self._update_suspend_loop()
             self._check_capture_timeout()
             self.root.after(30, self._poll)
+
+    def _consume_suspend_hotkey(self):
+        if self._hotkey is None:
+            return
+        if self._hotkey.poll():
+            self._toggle_suspend()
+
+    def _start_suspend_hotkey(self):
+        if self._suspend_loop is None:
+            return
+        self._hotkey = GlobalHotkey("F8")
+        if not self._hotkey.start():
+            self._hotkey = None
+            self._show_telemetry("F8 热键注册失败")
+
+    def _toggle_suspend(self):
+        if self._suspend_loop is None:
+            return
+        self._suspend_loop.toggle()
+        self._refresh_display()
+
+    def _update_suspend_loop(self):
+        if self._suspend_loop is None:
+            return
+        before = self._suspend_loop.status_text()
+        self._suspend_loop.tick()
+        if self._suspend_loop.status_text() != before:
+            self._refresh_display()
+
+    def _close_suspend(self):
+        if self._hotkey is not None:
+            self._hotkey.stop()
+            self._hotkey = None
+        if self._suspend_loop is not None:
+            # 用户要求手动恢复：退出只解除接管，不替他恢复目标进程。
+            self._suspend_loop.detach()
+            self._suspend_loop = None
 
     def _on_capture_alive(self):
         self._capture_last_event_ts = time.time()
