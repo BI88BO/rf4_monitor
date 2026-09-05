@@ -64,7 +64,10 @@ class SuspendConfigTests(unittest.TestCase):
         self.assertEqual(config.rehang_delay_seconds, 0.5)
 
     def test_load_uses_defaults_for_missing_or_invalid_file(self) -> None:
-        self.assertEqual(SuspendConfig.load(Path("missing.json")), SuspendConfig())
+        self.assertEqual(
+            SuspendConfig.load(Path("missing.json")),
+            SuspendConfig(countdown_seconds=60.0, rehang_delay_seconds=0.05),
+        )
 
 
 class SuspendLoopTests(unittest.TestCase):

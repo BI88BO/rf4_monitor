@@ -184,8 +184,8 @@ py -3 deskmon_engine.py
   "enabled": true,
   "process_names": ["rf4_x64.exe"],
   "loop_enabled": true,
-  "countdown_seconds": 120,
-  "rehang_delay_seconds": 2
+  "countdown_seconds": 60,
+  "rehang_delay_seconds": 0.05
 }
 ```
 
