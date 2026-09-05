@@ -127,6 +127,7 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         ov._show = lambda: None
         ov.created = created
         ov.root = SimpleNamespace()
+        ov._capture_active = True
         return ov
 
     def test_draw_renders_filled_rounded_card_and_text(self) -> None:
@@ -355,3 +356,31 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         ov._draw(width=320, height=60)
         self.assertEqual(created[0]["fill"], Overlay.CANVAS_RED)
         self.assertEqual(created[0]["text"], "已挂起 119")
+
+
+class OverlayCaptureStateTests(unittest.TestCase):
+    def test_capture_status_latches_after_first_event(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._capture_active = False
+        refresh_calls = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        ov._on_capture_alive()
+        ov._on_capture_alive()
+        self.assertTrue(ov._capture_active)
+        self.assertEqual(len(refresh_calls), 1)
+
+    def test_idle_fallback_uses_gray_before_capture(self) -> None:
+        ov = object.__new__(Overlay)
+        ov.style = Overlay.STYLE_TRANSPARENT
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._capture_active = False
+        created: list[tuple] = []
+        canvas = type("C", (), {
+            "delete": lambda self, tag: None,
+            "create_text": lambda self, *a, **k: created.append(k) or 1,
+        })()
+        ov.canvas = canvas
+        ov._ensure_canvas = lambda: canvas
+        ov._draw(width=320, height=60)
+        self.assertEqual(created[0]["fill"], Overlay.CANVAS_GRAY)

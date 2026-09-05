@@ -99,9 +99,8 @@ class Overlay:
     _anticheat_red = False
     # 反外挂红字恢复定时器：同一时刻至多一个，新事件会先取消旧的
     _anticheat_timer_id = None
-    # 抓包活跃状态：收到任何事件切正常色，15 秒无事件切灰（类默认 True 兼容测试）
-    _capture_active = True
-    _capture_last_event_ts = 0.0
+    # 抓包状态锁存：启动后未收到事件为灰色，收到事件后保持正常色
+    _capture_active = False
     # 挂起状态：object.__new__ 构造(测试)时默认关闭
     _suspend_loop = None
     _hotkey = None
@@ -175,7 +174,6 @@ class Overlay:
         self._anticheat_timer_id = None
         self._last_seen_id = 0
         self._capture_active = False
-        self._capture_last_event_ts = 0.0
         self._suspend_config = SuspendConfig.load()
         self._suspend_loop = None
         self._hotkey = None
@@ -633,7 +631,6 @@ class Overlay:
         finally:
             self._consume_suspend_hotkey()
             self._update_suspend_loop()
-            self._check_capture_timeout()
             self.root.after(30, self._poll)
 
     def _consume_suspend_hotkey(self):
@@ -674,17 +671,8 @@ class Overlay:
             self._suspend_loop = None
 
     def _on_capture_alive(self):
-        self._capture_last_event_ts = time.time()
         if not self._capture_active:
             self._capture_active = True
-            try:
-                self._refresh_display()
-            except AttributeError:
-                pass
-
-    def _check_capture_timeout(self):
-        if self._capture_active and time.time() - self._capture_last_event_ts > 15:
-            self._capture_active = False
             try:
                 self._refresh_display()
             except AttributeError:
