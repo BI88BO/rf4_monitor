@@ -104,6 +104,7 @@ class Overlay:
     # 挂起状态：object.__new__ 构造(测试)时默认关闭
     _suspend_loop = None
     _hotkey = None
+    _suspend_error = None
 
     @staticmethod
     def font_family() -> str:
@@ -177,6 +178,7 @@ class Overlay:
         self._suspend_config = SuspendConfig.load()
         self._suspend_loop = None
         self._hotkey = None
+        self._suspend_error = None
         if self._suspend_config.enabled and os.name == "nt":
             self._suspend_loop = SuspendLoop(
                 ProcessSuspender(self._suspend_config.process_names),
@@ -437,7 +439,7 @@ class Overlay:
         if not lines:
             lines = ["来鱼提示 · 待机中"]
         if self._suspend_loop is not None:
-            status = self._suspend_loop.status_text()
+            status = self._suspend_error or self._suspend_loop.status_text()
             if status:
                 lines.append(status)
         return lines
@@ -475,7 +477,7 @@ class Overlay:
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())
         if self._suspend_loop is not None:
-            status = self._suspend_loop.status_text()
+            status = self._suspend_error or self._suspend_loop.status_text()
             if status:
                 rod_lines.append(status)
         if not rod_lines and not dim_lines:
@@ -645,11 +647,15 @@ class Overlay:
         self._hotkey = GlobalHotkey("F8")
         if not self._hotkey.start():
             self._hotkey = None
-            self._show_telemetry("F8 热键注册失败")
+            self._suspend_error = "F8 热键注册失败，可能已被占用"
+            self._refresh_display()
+        else:
+            self._suspend_error = None
 
     def _toggle_suspend(self):
         if self._suspend_loop is None:
             return
+        self._suspend_error = None
         self._suspend_loop.toggle()
         self._refresh_display()
 

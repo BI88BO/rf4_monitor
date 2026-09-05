@@ -246,6 +246,7 @@ class SuspendLoop:
         self.active = False
         self.phase = ""
         self.deadline = 0.0
+        self.error = ""
 
     def start(self) -> bool:
         if not self.process.suspend():
@@ -253,7 +254,9 @@ class SuspendLoop:
             self.active = False
             self.phase = ""
             self.deadline = 0.0
+            self.error = "未找到 rf4_x64.exe 或挂起失败"
             return False
+        self.error = ""
         self.suspended = True
         if self.config.loop_enabled:
             self.active = True
@@ -270,9 +273,11 @@ class SuspendLoop:
         self.phase = ""
         self.deadline = 0.0
         if not self.suspended:
+            self.error = ""
             return False
         resumed = self.process.resume()
         self.suspended = False
+        self.error = "" if resumed else "游戏进程恢复失败"
         return resumed
 
     def detach(self) -> None:
@@ -280,6 +285,7 @@ class SuspendLoop:
         self.active = False
         self.phase = ""
         self.deadline = 0.0
+        self.error = ""
 
     def toggle(self) -> bool:
         if self.suspended:
@@ -302,12 +308,15 @@ class SuspendLoop:
                 self.active = False
                 self.phase = ""
                 self.deadline = 0.0
+                self.error = "未找到 rf4_x64.exe 或挂起失败"
                 return
             self.suspended = True
             self.phase = "countdown"
             self.deadline = now + self.config.countdown_seconds
 
     def status_text(self) -> str:
+        if self.error and not self.active:
+            return self.error
         if self.active:
             remaining = max(0.0, self.deadline - self.clock())
             text = str(int(remaining)) if remaining >= 1.0 else "<1"

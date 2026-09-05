@@ -19,8 +19,9 @@ from rf4_core.process_control import (
 
 
 class _FakeProcess:
-    def __init__(self, suspend_ok: bool = True) -> None:
+    def __init__(self, suspend_ok: bool = True, resume_ok: bool = True) -> None:
         self.suspend_ok = suspend_ok
+        self.resume_ok = resume_ok
         self.suspend_calls = 0
         self.resume_calls = 0
         self.suspended = False
@@ -33,6 +34,8 @@ class _FakeProcess:
         return True
 
     def resume(self) -> bool:
+        if not self.resume_ok:
+            return False
         self.resume_calls += 1
         self.suspended = False
         return True
@@ -120,6 +123,27 @@ class SuspendLoopTests(unittest.TestCase):
         self.assertTrue(loop.suspended)
         self.assertFalse(loop.active)
         self.assertEqual(process.resume_calls, 0)
+
+    def test_failed_start_reports_error_until_next_success(self) -> None:
+        now = [0.0]
+        process = _FakeProcess(suspend_ok=False)
+        loop = self._loop(process, lambda: now[0])
+        self.assertFalse(loop.toggle())
+        self.assertFalse(loop.active)
+        self.assertEqual(loop.status_text(), "未找到 rf4_x64.exe 或挂起失败")
+
+        process.suspend_ok = True
+        self.assertTrue(loop.toggle())
+        self.assertEqual(loop.status_text(), "已挂起 10")
+
+    def test_failed_resume_reports_error(self) -> None:
+        now = [0.0]
+        process = _FakeProcess(resume_ok=False)
+        loop = self._loop(process, lambda: now[0])
+        self.assertTrue(loop.toggle())
+        self.assertFalse(loop.toggle())
+        self.assertFalse(loop.active)
+        self.assertEqual(loop.status_text(), "游戏进程恢复失败")
 
     def test_process_name_is_normalized_for_toolhelp_lookup(self) -> None:
         process = ProcessSuspender(("RF4_x64.EXE",))

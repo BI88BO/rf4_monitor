@@ -357,6 +357,77 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         self.assertEqual(created[0]["fill"], Overlay.CANVAS_RED)
         self.assertEqual(created[0]["text"], "已挂起 119")
 
+    def test_suspend_countdown_change_refreshes_display(self) -> None:
+        texts = ["已挂起 60", "已挂起 59"]
+        ov = object.__new__(Overlay)
+        ov._suspend_loop = SimpleNamespace(
+            tick=lambda: texts.pop(0),
+            status_text=lambda: texts[0],
+        )
+        refresh_calls: list[bool] = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        ov._update_suspend_loop()
+        self.assertEqual(ov._suspend_loop.status_text(), "已挂起 59")
+        self.assertEqual(refresh_calls, [True])
+
+    def test_failed_toggle_shows_persistent_error(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = SimpleNamespace(
+            suspended=False,
+            toggle=lambda: False,
+            status_text=lambda: "未找到 rf4_x64.exe 或挂起失败",
+        )
+        refresh_calls: list[bool] = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        ov._toggle_suspend()
+        self.assertEqual(
+            ov._lines_for_display(),
+            ["来鱼提示 · 待机中", "未找到 rf4_x64.exe 或挂起失败"],
+        )
+        self.assertEqual(refresh_calls, [True])
+
+    def test_hotkey_registration_failure_persists(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = SimpleNamespace()
+        refresh_calls: list[bool] = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        real_hotkey = overlay_mod.GlobalHotkey
+        overlay_mod.GlobalHotkey = lambda hotkey: SimpleNamespace(start=lambda: False)
+        try:
+            ov._start_suspend_hotkey()
+        finally:
+            overlay_mod.GlobalHotkey = real_hotkey
+        self.assertIsNone(ov._hotkey)
+        self.assertEqual(
+            ov._lines_for_display(),
+            ["来鱼提示 · 待机中", "F8 热键注册失败，可能已被占用"],
+        )
+        self.assertEqual(refresh_calls, [True])
+
+    def test_fish_row_and_suspend_countdown_are_shown_together(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._rows = {"1号杆": "黑线鳕444g 咬钩"}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 60")
+        refresh_calls: list[bool] = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        ov.root = SimpleNamespace(after=lambda delay, fn: None)
+        payload = json.dumps(
+            {"event": "fish_bitten", "gear_slot": "1号杆",
+             "text": "【我自己】：黑线鳕 444 克 咬钩了"},
+            ensure_ascii=False,
+        )
+        ov._handle_event_payload(payload)
+        self.assertEqual(
+            ov._lines_for_display(),
+            ["黑线鳕444g 咬钩", "已挂起 60"],
+        )
+        self.assertEqual(len(refresh_calls), 1)
+
 
 class OverlayCaptureStateTests(unittest.TestCase):
     def test_capture_status_latches_after_first_event(self) -> None:
