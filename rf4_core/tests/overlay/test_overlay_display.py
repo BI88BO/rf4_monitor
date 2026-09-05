@@ -370,6 +370,21 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         self.assertEqual(ov._suspend_loop.status_text(), "已挂起 59")
         self.assertEqual(refresh_calls, [True])
 
+    def test_suspend_countdown_change_between_polls_refreshes_display(self) -> None:
+        # F8 后立刻画 60；下一次轮询读取到的可能已经是 59。
+        # 必须和上次画出的状态比较，否则 60 会一直挂到状态机切换。
+        ov = object.__new__(Overlay)
+        ov._last_suspend_status = "已挂起 60"
+        ov._suspend_loop = SimpleNamespace(
+            tick=lambda: None,
+            status_text=lambda: "已挂起 59",
+        )
+        refresh_calls: list[bool] = []
+        ov._refresh_display = lambda: refresh_calls.append(True)
+        ov._update_suspend_loop()
+        self.assertEqual(ov._last_suspend_status, "已挂起 59")
+        self.assertEqual(refresh_calls, [True])
+
     def test_failed_toggle_shows_persistent_error(self) -> None:
         ov = object.__new__(Overlay)
         ov._rows = {}

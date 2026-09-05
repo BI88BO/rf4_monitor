@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import threading
 import time
@@ -319,7 +320,7 @@ class SuspendLoop:
             return self.error
         if self.active:
             remaining = max(0.0, self.deadline - self.clock())
-            text = str(int(remaining)) if remaining >= 1.0 else "<1"
+            text = str(math.ceil(remaining)) if remaining > 0.0 else "<1"
             return f"{'已挂起' if self.suspended else '待挂起'} {text}"
         if self.suspended:
             return "已挂起"

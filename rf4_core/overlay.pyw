@@ -105,6 +105,7 @@ class Overlay:
     _suspend_loop = None
     _hotkey = None
     _suspend_error = None
+    _last_suspend_status = ""
 
     @staticmethod
     def font_family() -> str:
@@ -179,6 +180,7 @@ class Overlay:
         self._suspend_loop = None
         self._hotkey = None
         self._suspend_error = None
+        self._last_suspend_status = ""
         if self._suspend_config.enabled and os.name == "nt":
             self._suspend_loop = SuspendLoop(
                 ProcessSuspender(self._suspend_config.process_names),
@@ -657,14 +659,16 @@ class Overlay:
             return
         self._suspend_error = None
         self._suspend_loop.toggle()
+        self._last_suspend_status = self._suspend_loop.status_text()
         self._refresh_display()
 
     def _update_suspend_loop(self):
         if self._suspend_loop is None:
             return
-        before = self._suspend_loop.status_text()
         self._suspend_loop.tick()
-        if self._suspend_loop.status_text() != before:
+        status = self._suspend_loop.status_text()
+        if status != self._last_suspend_status:
+            self._last_suspend_status = status
             self._refresh_display()
 
     def _close_suspend(self):

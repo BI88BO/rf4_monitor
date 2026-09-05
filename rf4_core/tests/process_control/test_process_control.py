@@ -115,6 +115,17 @@ class SuspendLoopTests(unittest.TestCase):
         self.assertEqual(process.resume_calls, 1)
         self.assertEqual(process.suspend_calls, 2)
 
+    def test_countdown_displays_whole_seconds_from_start(self) -> None:
+        now = [100.0]
+        process = _FakeProcess()
+        loop = self._loop(process, lambda: now[0], countdown=60.0, delay=0.05)
+        self.assertTrue(loop.start())
+        self.assertEqual(loop.status_text(), "已挂起 60")
+        now[0] += 0.4
+        self.assertEqual(loop.status_text(), "已挂起 60")
+        now[0] += 0.7
+        self.assertEqual(loop.status_text(), "已挂起 59")
+
     def test_detach_keeps_suspension_for_manual_resume(self) -> None:
         process = _FakeProcess()
         loop = self._loop(process, lambda: 0.0)
