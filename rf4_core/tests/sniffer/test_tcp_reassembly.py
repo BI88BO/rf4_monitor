@@ -86,6 +86,23 @@ class TcpStreamClearControlTests(unittest.TestCase):
         self.assertEqual(stream.feed(104, b"frame"), b"frame")
         self.assertEqual(stream.next_seq, 109)
 
+    def test_discards_clear_controls_behind_stream_cursor(self) -> None:
+        stream = TcpStreamReassembler(next_seq=100)
+
+        self.assertEqual(stream.feed(100, b"\x00" * 6), b"")
+        self.assertEqual(stream.feed(200, b"frame"), b"frame")
+
+        self.assertEqual(stream.next_seq, 205)
+        self.assertEqual(stream.clear_control_seqs, set())
+
+    def test_clear_control_set_stays_bounded(self) -> None:
+        stream = TcpStreamReassembler(next_seq=100)
+
+        for offset in range(300):
+            self.assertEqual(stream.feed(1000 + offset, b"\x00" * 6), b"")
+
+        self.assertLessEqual(len(stream.clear_control_seqs), sniffer.MAX_CLEAR_CONTROL_SEQS)
+
 
 class PassiveSessionGapRecoveryTests(unittest.TestCase):
     def test_refuses_recovery_when_no_verifiable_frame(self) -> None:

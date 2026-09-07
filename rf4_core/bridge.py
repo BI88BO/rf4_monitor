@@ -5,6 +5,7 @@ import re
 import sqlite3
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -487,6 +488,10 @@ class RF4ChatBridge:
         self._show_cfg_min_interval = 1.0  # 秒，避免每次广播读盘
         self._fish_grade_labels, self._fish_grade_by_line_type = load_fish_grade_config()
         self._unlocalized_fish_keys = load_unlocalized_fish_keys()
+        # 浮窗事件库使用长连接：事件密集时不再每条事件重复打开数据库。
+        self._overlay_con: Optional[sqlite3.Connection] = None
+        self._overlay_con_path: Optional[Path] = None
+        self._overlay_write_lock = threading.Lock()
 
     def _load_item_catalog_index(self) -> None:
         candidates = [
@@ -908,30 +913,54 @@ class RF4ChatBridge:
 
     def _write_overlay_event(self, event_type: str, payload: str) -> None:
         db_path = self._overlay_db_path()
-        try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            con = sqlite3.connect(str(db_path), timeout=1.0)
+        with self._overlay_write_lock:
             try:
-                con.execute("PRAGMA busy_timeout = 1000")
-                self._ensure_overlay_db(con)
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                con = self._overlay_connection(db_path)
                 con.execute(
                     "INSERT INTO overlay_events (ts, event_type, payload) VALUES (?, ?, ?)",
                     (time.time(), event_type, payload),
                 )
                 con.commit()
-                # 每 100 次写入清理一次旧事件，保留最近 2000 条
+                # 每 100 次写入清理一次旧事件。id 单调递增，按阈值删除即可。
                 row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-                if row_id and row_id % 100 == 0:
+                keep_from_id = int(row_id) - 2000
+                if keep_from_id > 0:
                     con.execute(
-                        "DELETE FROM overlay_events WHERE id NOT IN "
-                        "(SELECT id FROM overlay_events ORDER BY id DESC LIMIT 2000)"
+                        "DELETE FROM overlay_events WHERE id <= ?",
+                        (keep_from_id,),
                     )
                     con.commit()
-            finally:
+            except (OSError, sqlite3.Error):
+                self._close_overlay_db()
+                if ctx.options.rf4_verbose_logging:
+                    self._log(f"failed to write overlay event to {db_path}")
+
+    def _overlay_connection(self, db_path: Path) -> sqlite3.Connection:
+        if self._overlay_con is not None and self._overlay_con_path == db_path:
+            return self._overlay_con
+        self._close_overlay_db()
+        con = sqlite3.connect(str(db_path), timeout=1.0, check_same_thread=False)
+        try:
+            con.execute("PRAGMA busy_timeout = 1000")
+            self._ensure_overlay_db(con)
+            con.execute("PRAGMA journal_mode = WAL")
+            con.execute("PRAGMA synchronous = NORMAL")
+            self._overlay_con = con
+            self._overlay_con_path = db_path
+        except Exception:
+            con.close()
+            raise
+        return con
+
+    def _close_overlay_db(self) -> None:
+        con, self._overlay_con = self._overlay_con, None
+        self._overlay_con_path = None
+        if con is not None:
+            try:
                 con.close()
-        except (OSError, sqlite3.Error):
-            if ctx.options.rf4_verbose_logging:
-                self._log(f"failed to write overlay event to {db_path}")
+            except sqlite3.Error:
+                pass
 
     def _broadcast_telemetry(self, category: str, text: str) -> None:
         switch = self._telemetry_show_option(category)

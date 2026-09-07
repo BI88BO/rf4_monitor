@@ -172,6 +172,7 @@ class Overlay:
         self._telemetry_seq = 0
         self._idle_visible = False
         self.canvas = None
+        self._sqlite_con = None
         self._anticheat_red = False
         self._anticheat_timer_id = None
         self._last_seen_id = 0
@@ -223,6 +224,7 @@ class Overlay:
 
     def destroy(self):
         self._close_suspend()
+        self._close_sqlite()
         self.root.destroy()
 
     def load_config(self):
@@ -575,63 +577,77 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self.visible = True
 
+    def _sqlite_connection(self):
+        con = getattr(self, "_sqlite_con", None)
+        if con is not None:
+            return con
+        con = sqlite3.connect(str(self.db_path), timeout=1.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 1000")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS overlay_events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "ts REAL NOT NULL,"
+                "event_type TEXT NOT NULL,"
+                "payload TEXT NOT NULL"
+                ")"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_overlay_events_ts "
+                "ON overlay_events(ts)"
+            )
+            con.execute("PRAGMA journal_mode = WAL")
+            con.commit()
+            self._sqlite_con = con
+        except Exception:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+            raise
+        return con
+
+    def _close_sqlite(self):
+        con, self._sqlite_con = getattr(self, "_sqlite_con", None), None
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+
     def _ensure_sqlite_db(self):
         try:
-            con = sqlite3.connect(str(self.db_path), timeout=1.0)
-            try:
-                con.execute("PRAGMA busy_timeout = 1000")
-                con.execute(
-                    "CREATE TABLE IF NOT EXISTS overlay_events ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                    "ts REAL NOT NULL,"
-                    "event_type TEXT NOT NULL,"
-                    "payload TEXT NOT NULL"
-                    ")"
-                )
-                con.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_overlay_events_ts "
-                    "ON overlay_events(ts)"
-                )
-                con.commit()
-            finally:
-                con.close()
+            self._sqlite_connection()
         except (OSError, sqlite3.Error):
-            pass
+            self._close_sqlite()
 
     def _latest_event_id(self) -> int:
         try:
-            con = sqlite3.connect(str(self.db_path), timeout=1.0)
-            try:
-                con.execute("PRAGMA busy_timeout = 1000")
-                row = con.execute("SELECT MAX(id) FROM overlay_events").fetchone()
-                return int(row[0] or 0)
-            finally:
-                con.close()
+            con = self._sqlite_connection()
+            row = con.execute("SELECT MAX(id) FROM overlay_events").fetchone()
+            return int(row[0] or 0)
         except (OSError, sqlite3.Error):
+            self._close_sqlite()
             return 0
 
     def _poll(self):
         try:
-            con = sqlite3.connect(str(self.db_path), timeout=1.0)
-            try:
-                con.execute("PRAGMA busy_timeout = 1000")
-                rows = con.execute(
-                    "SELECT id, payload FROM overlay_events WHERE id > ? ORDER BY id",
-                    (self._last_seen_id,),
-                ).fetchall()
-                for row_id, payload in rows:
-                    try:
-                        self._handle_event_payload(payload)
-                    except Exception:
-                        pass
-                if rows:
-                    # 游标推进到最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
-                    self._last_seen_id = rows[-1][0]
-                    self._on_capture_alive()
-            finally:
-                con.close()
+            con = self._sqlite_connection()
+            rows = con.execute(
+                "SELECT id, payload FROM overlay_events WHERE id > ? ORDER BY id",
+                (self._last_seen_id,),
+            ).fetchall()
+            for row_id, payload in rows:
+                try:
+                    self._handle_event_payload(payload)
+                except Exception:
+                    pass
+            if rows:
+                # 游标推进到最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
+                self._last_seen_id = rows[-1][0]
+                self._on_capture_alive()
         except (OSError, sqlite3.Error):
-            pass
+            self._close_sqlite()
         finally:
             self._consume_suspend_hotkey()
             self._update_suspend_loop()

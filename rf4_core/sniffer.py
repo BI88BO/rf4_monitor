@@ -18,7 +18,7 @@ from typing import Optional
 import ctypes
 
 from . import bridge as _bridge_mod
-from .bridge import FlowSession, RF4ChatBridge
+from .bridge import BoundedSet, FlowSession, RF4ChatBridge
 from .console import format_console_line, mask_secret
 from .protocol import (
     AppFrame,
@@ -55,6 +55,13 @@ MAX_PENDING_TCP_BYTES = 8 * 1024 * 1024
 DISCOVERY_TIMEOUT_SECONDS = 30.0
 DISCOVERY_MAX_STREAM_BYTES = 256 * 1024
 DISCOVERY_MAX_CANDIDATES = 2048
+# 失败会话允许在无 SYN/auth 情况下重建候选的时间窗。超过后不再无限保留
+# “重试 key”，避免长时间运行时把浏览过的无关 TCP 流一直留在内存里。
+RETRY_CANDIDATE_TTL_SECONDS = DISCOVERY_TIMEOUT_SECONDS
+RETRY_CANDIDATE_MAX_ENTRIES = DISCOVERY_MAX_CANDIDATES
+# 自动识别确认过的服务器 IP 只用于重连提示/恢复判断，少量上限足够覆盖
+# 一天内的多次切服；超过后淘汰最旧记录。
+REALTIME_HOST_CACHE_LIMIT = 256
 DYNAMIC_INTERFACE_SCAN_SECONDS = 1.0
 TCP_GAP_WARNING_SECONDS = 2.0
 # 缺口出现后优先等待 TCP 重传补齐（游戏客户端会一直等数据包重新到位），
@@ -132,6 +139,8 @@ FLOW_DIAG_WINDOW_SECONDS = 60.0
 FLOW_DIAG_MAX_FLOWS = 96
 # 每条流每个方向保留的 auth 特征扫描字节上限。
 FLOW_DIAG_AUTH_SCAN_BYTES = 4096
+# Npcap 隧道元数据会复用 TCP 序号；每条流只保留游标附近的少量虚拟偏移。
+MAX_CLEAR_CONTROL_SEQS = 128
 
 
 @dataclass(frozen=True)
@@ -563,6 +572,15 @@ class TcpStreamReassembler:
         self.gap_started_at = None
         self.clear_control_seqs.clear()
 
+    def _prune_clear_control_seqs(self) -> None:
+        assert self.next_seq is not None
+        clear_control_seqs = self.clear_control_seqs
+        for offset in tuple(clear_control_seqs):
+            if offset < self.next_seq:
+                clear_control_seqs.discard(offset)
+        while len(clear_control_seqs) > MAX_CLEAR_CONTROL_SEQS:
+            clear_control_seqs.discard(min(clear_control_seqs))
+
     def feed(self, seq: int, payload: bytes, *, syn: bool = False) -> bytes:
         payload_seq = seq + (1 if syn else 0)
         if self.next_seq is None:
@@ -582,7 +600,9 @@ class TcpStreamReassembler:
                 and self.next_seq < payload_seq <= self.next_seq + 6
             ):
                 self.next_seq = payload_seq
-            self.clear_control_seqs.add(payload_seq)
+            if payload_seq >= self.next_seq:
+                self.clear_control_seqs.add(payload_seq)
+                self._prune_clear_control_seqs()
             return b""
         if not payload:
             return b""
@@ -597,6 +617,8 @@ class TcpStreamReassembler:
             for offset in self.clear_control_seqs
             if self.next_seq <= offset <= payload_seq
         ]
+        if not virtual_offsets:
+            self._prune_clear_control_seqs()
         if virtual_offsets:
             self.next_seq = payload_seq
             self.clear_control_seqs = {
@@ -1262,10 +1284,10 @@ class PacketObserver:
         self.sessions: dict[tuple[str, int, str, int], PassiveSession] = {}
         self._auto_sessions: dict[FlowKey, tuple[PassiveSession, Endpoint]] = {}
         self._candidates: dict[FlowKey, DiscoveryCandidate] = {}
-        self._retry_candidate_keys: set[FlowKey] = set()
-        self._known_realtime_hosts: set[str] = set()
-        self._closed_realtime_hosts: set[str] = set()
-        self._reconnect_notified_hosts: set[str] = set()
+        self._retry_candidate_keys: dict[FlowKey, float] = {}
+        self._known_realtime_hosts: set[str] = BoundedSet(REALTIME_HOST_CACHE_LIMIT)
+        self._closed_realtime_hosts: set[str] = BoundedSet(REALTIME_HOST_CACHE_LIMIT)
+        self._reconnect_notified_hosts: set[str] = BoundedSet(REALTIME_HOST_CACHE_LIMIT)
         self._rc4_handoffs: dict[str, Rc4Handoff] = {}
         self._packets_since_cleanup = 0
         self.total_packets = 0
@@ -1344,7 +1366,7 @@ class PacketObserver:
                 break
         # 允许该流无需 SYN/auth 首字节即可重建 candidate，走 handoff
         # bootstrap 用已保存 token 中途对齐 RC4 恢复解析。
-        self._retry_candidate_keys.add(key)
+        self._add_retry_candidate_key(key)
         # 启动切服诊断窗口：统计随后所有 TCP 流，定位真正承载业务的连接。
         self._start_flow_diag()
         _print_line_once(
@@ -1664,7 +1686,7 @@ class PacketObserver:
         self.sessions[oriented_key] = session
         self._auto_sessions[key] = (session, client_endpoint)
         self._candidates.pop(key, None)
-        self._retry_candidate_keys.discard(key)
+        self._retry_candidate_keys.pop(key, None)
         self._known_realtime_hosts.add(server_endpoint[0])
         self._closed_realtime_hosts.discard(server_endpoint[0])
 
@@ -1724,10 +1746,27 @@ class PacketObserver:
         _print_line("session", f"realtime 连接已关闭{close_detail} | 会话={session.session_id}")
 
     def _expire_candidates(self) -> None:
-        cutoff = time.monotonic() - DISCOVERY_TIMEOUT_SECONDS
+        now = time.monotonic()
+        cutoff = now - DISCOVERY_TIMEOUT_SECONDS
         expired = [key for key, candidate in self._candidates.items() if candidate.updated_at < cutoff]
         for key in expired:
             self._candidates.pop(key, None)
+        expired_retries = [
+            key
+            for key, expiry in self._retry_candidate_keys.items()
+            if expiry < now
+        ]
+        for key in expired_retries:
+            self._retry_candidate_keys.pop(key, None)
+
+    def _add_retry_candidate_key(self, key: FlowKey) -> None:
+        self._retry_candidate_keys[key] = time.monotonic() + RETRY_CANDIDATE_TTL_SECONDS
+        while len(self._retry_candidate_keys) > RETRY_CANDIDATE_MAX_ENTRIES:
+            oldest_key = min(
+                self._retry_candidate_keys,
+                key=lambda retry_key: self._retry_candidate_keys[retry_key],
+            )
+            self._retry_candidate_keys.pop(oldest_key, None)
 
     def _make_candidate_room(self) -> None:
         self._expire_candidates()

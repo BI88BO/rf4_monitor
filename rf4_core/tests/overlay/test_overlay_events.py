@@ -216,6 +216,7 @@ class OverlayStartupHistoryTests(unittest.TestCase):
             finally:
                 con.close()
             ov._poll()
+            ov._close_sqlite()
         return ov, calls
 
     def test_startup_skips_history_and_consumes_new_events(self) -> None:
@@ -246,7 +247,10 @@ class OverlayStartupHistoryTests(unittest.TestCase):
                 con.close()
             ov = object.__new__(Overlay)
             ov.db_path = path
-            self.assertEqual(ov._latest_event_id(), 1)
+            try:
+                self.assertEqual(ov._latest_event_id(), 1)
+            finally:
+                ov._close_sqlite()
 
 
 class OverlaySqliteCursorTests(unittest.TestCase):
@@ -288,6 +292,7 @@ class OverlaySqliteCursorTests(unittest.TestCase):
             self._insert(db, 3.0, "fish_incoming",
                          '{"event":"fish_incoming","gear_slot":"1","text":"new"}')
             ov._poll()
+            ov._close_sqlite()
             self.assertEqual(len(ov.calls), 2)
             self.assertIn("new", ov.calls[-1])
 
@@ -299,6 +304,10 @@ class OverlaySqliteCursorTests(unittest.TestCase):
             ov = self._overlay(db)
             self._insert(db, 100.0, "reset", '{"event":"reset","text":""}')
             ov._poll()
+            ov._close_sqlite()
             self.assertEqual(len(ov.calls), 1)
-            ov._poll()
+            try:
+                ov._poll()
+            finally:
+                ov._close_sqlite()
             self.assertEqual(len(ov.calls), 1, "已读事件不应重复触发")

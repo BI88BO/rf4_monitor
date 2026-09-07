@@ -73,7 +73,7 @@ class HermesGreetingTests(unittest.TestCase):
         )
         # FlowKey 与 _handle_auto_packet 一致按字典序排序：
         # ("185.71.66.225", 9443) 排在 ("192.168.2.8", 32000) 之前。
-        observer._retry_candidate_keys.add(
+        observer._add_retry_candidate_key(
             (("185.71.66.225", 9443), ("192.168.2.8", 32000))
         )
 
