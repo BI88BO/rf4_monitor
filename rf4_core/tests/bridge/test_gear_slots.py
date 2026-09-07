@@ -108,3 +108,25 @@ class SwitchSlotUpdateTests(unittest.TestCase):
         gear = "44444444-4444-4444-4444-444444444444"
         self._feed_switch(9, 50, gear)
         self.assertNotIn(50, self.session.slot_items)
+
+
+class FullSlotMappingTests(unittest.TestCase):
+    """11/1 完整映射响应中的空槽不得覆盖已确认的竿位。"""
+
+    def test_empty_full_slot_response_preserves_known_mapping(self) -> None:
+        bridge, session = _session_with_slots({1: "11111111-1111-1111-1111-111111111111"})
+        session.slot_request_calls[12] = 1
+        plain = build_response_envelope(
+            call_id=12,
+            payload=_slot_payload(1, "00000000-0000-0000-0000-000000000000"),
+        )
+        bridge._remember_server_slot_items(session, plain, sub_cmd=1)
+        self.assertEqual(
+            session.slot_items[1], "11111111-1111-1111-1111-111111111111"
+        )
+        self.assertEqual(
+            bridge._gear_slot_text(
+                session, "11111111-1111-1111-1111-111111111111"
+            ),
+            "1号杆",
+        )

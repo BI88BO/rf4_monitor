@@ -3191,6 +3191,8 @@ class RF4ChatBridge:
         if not slots:
             return
         # 11/1(请求当前装备槽位)响应包含完整快捷键槽位映射，可更新 slot_items 反查竿号。
+        # 空槽响应里的全零 GUID 不能覆盖已确认映射；它可能在换装/界面刷新瞬间出现，
+        # 一旦覆盖会让当前搏鱼/入护事件反查不到竿号，全部回落到“手持竿”。
         shortcut_numbers = session.profile.shortcut_slot_numbers
         if sub_cmd == 2:
             # 11/2(切换装备槽位)单条响应：玩家切到快捷键槽 N 时携带该槽当前内容，
@@ -3202,6 +3204,8 @@ class RF4ChatBridge:
                     session.slot_items[slot.slot_type] = slot.item_guid
             return
         for slot in slots:
+            if slot.item_guid == "00000000-0000-0000-0000-000000000000":
+                continue
             session.slot_items[slot.slot_type] = slot.item_guid
 
     def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
