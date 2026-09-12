@@ -123,6 +123,16 @@ HANDOFF_REALTIME_PORT_RANGE = range(9000, 10000)
 # handoff × 预算次 RC4 解密），切服连接持续有流量时若每包都重试会打满 CPU。
 # 只在 candidate 生命周期内按该间隔重试，其余包直接跳过探测。
 HANDOFF_BOOTSTRAP_RETRY_SECONDS = 5.0
+# 晚启动接管：监控在游戏已建立 realtime 会话后才启动时，缺少 auth 握手就无法
+# 解密。被动模式不能从缓存 token 直接重建（否则与后续新认证会话并存）。改为
+# 观察一段时间的加密业务流后，用 Windows SetTcpEntry 强制断开该 TCP 连接，
+# 游戏会自动重连并重新发 auth，监控即可从握手开始正常解密。
+LATE_START_RECONNECT_OBSERVE_SECONDS = 5.0
+LATE_START_RECONNECT_MIN_PACKETS = 24
+LATE_START_RECONNECT_MIN_BYTES = 16 * 1024
+# 晚启动观察表的清理：长时间运行+上网流量下防止无界增长。
+LATE_START_FLOW_TTL_SECONDS = 120.0
+LATE_START_MAX_FLOWS = 64
 # 认证包后等待 <hermes> 问候帧时允许跳过的非问候帧总量上限。切服重连场景下
 # 问候帧前可能夹杂空控制帧（ACK/PING，payload 为空），跳过继续等待即可；
 # 超过上限仍未见问候帧才判定协议变化。
@@ -1221,6 +1231,308 @@ class _DiagFlow:
     packets: int = 0
 
 
+def _tcp_table_ipv4(value: int) -> str:
+    return socket.inet_ntoa(struct.pack("<L", int(value)))
+
+
+def _tcp_table_port(value: int) -> int:
+    return socket.ntohs(int(value) & 0xFFFF)
+
+
+def _iter_windows_ipv4_tcp_rows():
+    if sys.platform != "win32":
+        return
+
+    class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+        _fields_ = [
+            ("dwState", ctypes.c_ulong),
+            ("dwLocalAddr", ctypes.c_ulong),
+            ("dwLocalPort", ctypes.c_ulong),
+            ("dwRemoteAddr", ctypes.c_ulong),
+            ("dwRemotePort", ctypes.c_ulong),
+            ("dwOwningPid", ctypes.c_ulong),
+        ]
+
+    AF_INET = 2
+    TCP_TABLE_OWNER_PID_ALL = 5
+    ERROR_INSUFFICIENT_BUFFER = 122
+    NO_ERROR = 0
+
+    iphlpapi = ctypes.windll.iphlpapi
+    size = ctypes.c_ulong(0)
+    result = iphlpapi.GetExtendedTcpTable(
+        None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0
+    )
+    if result not in (NO_ERROR, ERROR_INSUFFICIENT_BUFFER) or size.value <= 0:
+        return
+    buffer = ctypes.create_string_buffer(size.value)
+    result = iphlpapi.GetExtendedTcpTable(
+        buffer, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0
+    )
+    if result != NO_ERROR:
+        return
+    row_count = ctypes.c_ulong.from_buffer_copy(
+        buffer.raw[: ctypes.sizeof(ctypes.c_ulong)]
+    ).value
+    row_size = ctypes.sizeof(MIB_TCPROW_OWNER_PID)
+    offset = ctypes.sizeof(ctypes.c_ulong)
+    for index in range(row_count):
+        yield MIB_TCPROW_OWNER_PID.from_buffer_copy(
+            buffer.raw[offset + index * row_size : offset + (index + 1) * row_size]
+        )
+
+
+def _delete_windows_ipv4_tcp_row(row) -> tuple[bool, str]:
+    class MIB_TCPROW(ctypes.Structure):
+        _fields_ = [
+            ("dwState", ctypes.c_ulong),
+            ("dwLocalAddr", ctypes.c_ulong),
+            ("dwLocalPort", ctypes.c_ulong),
+            ("dwRemoteAddr", ctypes.c_ulong),
+            ("dwRemotePort", ctypes.c_ulong),
+        ]
+
+    MIB_TCP_STATE_DELETE_TCB = 12
+    NO_ERROR = 0
+    local = (_tcp_table_ipv4(row.dwLocalAddr), _tcp_table_port(row.dwLocalPort))
+    remote = (_tcp_table_ipv4(row.dwRemoteAddr), _tcp_table_port(row.dwRemotePort))
+    delete_row = MIB_TCPROW(
+        MIB_TCP_STATE_DELETE_TCB,
+        row.dwLocalAddr,
+        row.dwLocalPort,
+        row.dwRemoteAddr,
+        row.dwRemotePort,
+    )
+    result = ctypes.windll.iphlpapi.SetTcpEntry(ctypes.byref(delete_row))
+    if result == NO_ERROR:
+        return True, (
+            f"已断开 TCP 连接 | 本地={local[0]}:{local[1]}"
+            f" | 远端={remote[0]}:{remote[1]} | pid={int(row.dwOwningPid)}"
+        )
+    return False, (
+        f"SetTcpEntry 失败：错误码={result}"
+        f" | 本地={local[0]}:{local[1]} | 远端={remote[0]}:{remote[1]}"
+    )
+
+
+def _iter_windows_ipv4_tcp_rows_for_endpoints(left: Endpoint, right: Endpoint):
+    for row in _iter_windows_ipv4_tcp_rows():
+        if int(row.dwState) != 5:
+            continue
+        local = (_tcp_table_ipv4(row.dwLocalAddr), _tcp_table_port(row.dwLocalPort))
+        remote = (_tcp_table_ipv4(row.dwRemoteAddr), _tcp_table_port(row.dwRemotePort))
+        if {local, remote} == {left, right}:
+            yield row
+
+
+def _reset_windows_ipv4_tcp_connection(left: Endpoint, right: Endpoint) -> tuple[bool, str]:
+    """用 iphlpapi SetTcpEntry 断开指定 IPv4 TCP 连接。"""
+    if sys.platform != "win32":
+        return False, "非 Windows 不支持 TCP 重置"
+    try:
+        ipaddress.IPv4Address(left[0])
+        ipaddress.IPv4Address(right[0])
+    except ipaddress.AddressValueError:
+        return False, "当前连接不是 IPv4，跳过 TCP 重置"
+    rows = list(_iter_windows_ipv4_tcp_rows_for_endpoints(left, right))
+    if not rows:
+        return False, "TCP 表中未找到该 realtime 连接"
+    messages = []
+    for row in rows:
+        ok, message = _delete_windows_ipv4_tcp_row(row)
+        if ok:
+            return True, message
+        messages.append(message)
+    return False, messages[0] if messages else "TCP 表中未找到该 realtime 连接"
+
+
+def _reset_windows_ipv4_tcp_connections_for_port(port: int) -> tuple[int, tuple[str, ...]]:
+    if sys.platform != "win32" or port <= 0:
+        return 0, ()
+    messages = []
+    reset_count = 0
+    for row in list(_iter_windows_ipv4_tcp_rows()):
+        if int(row.dwState) != 5:
+            continue
+        local = (_tcp_table_ipv4(row.dwLocalAddr), _tcp_table_port(row.dwLocalPort))
+        remote = (_tcp_table_ipv4(row.dwRemoteAddr), _tcp_table_port(row.dwRemotePort))
+        if port not in (local[1], remote[1]):
+            continue
+        ok, message = _delete_windows_ipv4_tcp_row(row)
+        messages.append(message)
+        if ok:
+            reset_count += 1
+    return reset_count, tuple(messages)
+
+
+def _windows_process_image(pid: int) -> str:
+    if sys.platform != "win32" or pid <= 0:
+        return ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _looks_like_rf4_process(image_path: str) -> bool:
+    normalized = image_path.replace("\\", "/").lower()
+    filename = normalized.rsplit("/", 1)[-1]
+    return any(
+        marker in filename for marker in ("rf4", "russianfishing", "russian fishing")
+    )
+
+
+def _endpoint_is_loopback(endpoint: Endpoint) -> bool:
+    try:
+        return ipaddress.ip_address(endpoint[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _tcp_row_endpoints(row) -> tuple[Endpoint, Endpoint]:
+    return (
+        (_tcp_table_ipv4(row.dwLocalAddr), _tcp_table_port(row.dwLocalPort)),
+        (_tcp_table_ipv4(row.dwRemoteAddr), _tcp_table_port(row.dwRemotePort)),
+    )
+
+
+def _tcp_row_reset_priority(row) -> tuple[int, int]:
+    local, remote = _tcp_row_endpoints(row)
+    both_loopback = _endpoint_is_loopback(local) and _endpoint_is_loopback(remote)
+    has_rf4_port_hint = (
+        local[1] in HANDOFF_REALTIME_PORT_RANGE or remote[1] in HANDOFF_REALTIME_PORT_RANGE
+    )
+    return (1 if both_loopback else 0, 0 if has_rf4_port_hint else 1)
+
+
+def _tcp_row_flow_key(row) -> FlowKey:
+    local, remote = _tcp_row_endpoints(row)
+    return (local, remote) if local <= remote else (remote, local)
+
+
+def _reset_windows_rf4_process_tcp_connections() -> tuple[int, tuple[str, ...]]:
+    """断开 RF4 游戏进程持有的全部已建立 TCP 连接（优先 loopback/realtime 端口）。"""
+    if sys.platform != "win32":
+        return 0, ()
+    rows = []
+    seen_flows: set[FlowKey] = set()
+    for row in list(_iter_windows_ipv4_tcp_rows()):
+        if int(row.dwState) != 5:
+            continue
+        image_path = _windows_process_image(int(row.dwOwningPid))
+        if not _looks_like_rf4_process(image_path):
+            continue
+        flow_key = _tcp_row_flow_key(row)
+        if flow_key in seen_flows:
+            continue
+        seen_flows.add(flow_key)
+        rows.append((row, image_path))
+    rows.sort(key=lambda item: _tcp_row_reset_priority(item[0]))
+
+    messages = []
+    reset_count = 0
+    for row, image_path in rows:
+        ok, message = _delete_windows_ipv4_tcp_row(row)
+        suffix = f" | 进程={image_path}" if image_path else ""
+        messages.append(message + suffix)
+        if ok:
+            reset_count += 1
+    return reset_count, tuple(messages)
+
+
+def _describe_windows_rf4_tcp_candidates(limit: int = 8) -> tuple[str, ...]:
+    candidates = []
+    for row in list(_iter_windows_ipv4_tcp_rows()):
+        if int(row.dwState) != 5:
+            continue
+        image_path = _windows_process_image(int(row.dwOwningPid))
+        if not _looks_like_rf4_process(image_path):
+            continue
+        local = (_tcp_table_ipv4(row.dwLocalAddr), _tcp_table_port(row.dwLocalPort))
+        remote = (_tcp_table_ipv4(row.dwRemoteAddr), _tcp_table_port(row.dwRemotePort))
+        scope = (
+            "loopback"
+            if _endpoint_is_loopback(local) or _endpoint_is_loopback(remote)
+            else "external"
+        )
+        candidates.append(
+            f"scope={scope} pid={int(row.dwOwningPid)}"
+            f" 本地={local[0]}:{local[1]} 远端={remote[0]}:{remote[1]} 进程={image_path}"
+        )
+        if len(candidates) >= limit:
+            break
+    return tuple(candidates)
+
+
+def _schedule_late_start_port_reset(observer: "PacketObserver", *, backend: str) -> None:
+    """捕获就绪后若仍未识别到会话，强制断开已存在的 realtime 连接触发游戏重连。"""
+    late_start_reconnect = bool(getattr(observer, "late_start_reconnect", False))
+    port = int(getattr(observer, "late_start_reconnect_port", 0) or 0)
+    if not late_start_reconnect or port <= 0:
+        return
+    if sys.platform != "win32":
+        return
+
+    def reset_after_capture_ready() -> None:
+        time.sleep(1.0)
+        if getattr(observer, "_auto_sessions", None) or getattr(observer, "sessions", None):
+            return
+        process_reset_count, process_messages = _reset_windows_rf4_process_tcp_connections()
+        if process_reset_count > 0:
+            _print_line(
+                "warning",
+                "检测到 monitor 启动时 RF4 游戏进程已有 TCP 连接，已主动断开以触发游戏自动重连"
+                f" | 后端={backend} | 数量={process_reset_count}",
+            )
+            for message in process_messages[:6]:
+                _print_line("status", message)
+            return
+        reset_count, messages = _reset_windows_ipv4_tcp_connections_for_port(port)
+        if reset_count > 0:
+            _print_line(
+                "warning",
+                "检测到 monitor 启动时已有参考 realtime 端口上的 TCP 连接，已主动断开以触发游戏自动重连"
+                f" | 端口={port} | 后端={backend} | 数量={reset_count}",
+            )
+            for message in messages[:4]:
+                _print_line("status", message)
+            return
+        candidates = _describe_windows_rf4_tcp_candidates()
+        if candidates or process_messages or messages:
+            _print_line(
+                "warning",
+                "晚启动重连尝试：找到 RF4/端口连接，但 SetTcpEntry 未成功调用，"
+                "请以管理员身份运行后重试。",
+            )
+            for message in tuple(process_messages)[:6]:
+                _print_line("warning", message)
+            for message in tuple(messages)[:4]:
+                _print_line("warning", message)
+            for candidate in candidates:
+                _print_line("status", "RF4 TCP 候选 | " + candidate)
+            return
+        _print_line(
+            "warning",
+            "晚启动重连尝试：未发现可断开的 RF4 已有 TCP 连接，也未发现参考端口连接"
+            f" | 参考端口={port} | 后端={backend}",
+        )
+
+    threading.Thread(
+        target=reset_after_capture_ready,
+        name="rf4-late-start-reconnect",
+        daemon=True,
+    ).start()
+
+
 @dataclass
 class Rc4Handoff:
     token: str
@@ -1230,6 +1542,25 @@ class Rc4Handoff:
     fishing_state: dict[str, object] = field(default_factory=dict)
     client_cursor_valid: bool = False
     server_cursor_valid: bool = False
+
+
+@dataclass
+class LateStartFlow:
+    """监控晚启动时观察到的疑似 realtime 加密流。"""
+
+    endpoints: FlowKey
+    first_seen: float
+    updated_at: float
+    packets: int = 0
+    bytes_seen: int = 0
+    reset_attempted_at: Optional[float] = None
+    sources: set[Endpoint] = field(default_factory=set)
+
+    def record(self, source: Endpoint, payload_size: int) -> None:
+        self.updated_at = time.monotonic()
+        self.packets += 1
+        self.bytes_seen += payload_size
+        self.sources.add(source)
 
 
 @dataclass
@@ -1276,11 +1607,15 @@ class PacketObserver:
         realtime_port: int,
         realtime_host: str = "",
         bridge: core.RF4ChatBridge,
+        late_start_reconnect: bool = True,
+        late_start_reconnect_port: int = 0,
     ) -> None:
         self.realtime_port = realtime_port
         self.realtime_host = (realtime_host or "").strip()
         self.realtime_hosts = {value.strip() for value in self.realtime_host.replace(",", ";").split(";") if value.strip()}
         self.bridge = bridge
+        self.late_start_reconnect = bool(late_start_reconnect)
+        self.late_start_reconnect_port = int(late_start_reconnect_port or realtime_port or 0)
         self.sessions: dict[tuple[str, int, str, int], PassiveSession] = {}
         self._auto_sessions: dict[FlowKey, tuple[PassiveSession, Endpoint]] = {}
         self._candidates: dict[FlowKey, DiscoveryCandidate] = {}
@@ -1293,6 +1628,72 @@ class PacketObserver:
         self.total_packets = 0
         self._diag_deadline: Optional[float] = None
         self._diag_flows: dict[FlowKey, _DiagFlow] = {}
+        self._late_start_flows: dict[FlowKey, LateStartFlow] = {}
+        self._late_start_reset_keys: set[FlowKey] = set()
+
+    def _has_validated_duplex_session(self) -> bool:
+        active_sessions = [active[0] for active in self._auto_sessions.values()]
+        active_sessions.extend(self.sessions.values())
+        return any(
+            session.valid_client_frames > 0 and session.valid_server_frames > 0
+            for session in active_sessions
+        )
+
+    def _maybe_reset_late_start_flow(
+        self,
+        *,
+        key: FlowKey,
+        source: Endpoint,
+        destination: Endpoint,
+        payload: bytes,
+    ) -> None:
+        """监控晚启动时，对无法解密的疑似 realtime 流观察足够样本后强制重连。"""
+        if not self.late_start_reconnect or self.realtime_port != 0:
+            return
+        if self._has_validated_duplex_session():
+            return
+        if not payload or payload[:2] in (b"\x01\x00", b"\x01\x01"):
+            return
+        if key in self._auto_sessions or key in self._candidates:
+            return
+        if not self._looks_like_handoff_stream(payload):
+            return
+
+        now = time.monotonic()
+        flow = self._late_start_flows.get(key)
+        if flow is None:
+            if len(self._late_start_flows) >= LATE_START_MAX_FLOWS:
+                return
+            flow = LateStartFlow(key, now, now)
+            self._late_start_flows[key] = flow
+        flow.record(source, len(payload))
+
+        if flow.reset_attempted_at is not None:
+            return
+        if key in self._late_start_reset_keys:
+            return
+        if now - flow.first_seen < LATE_START_RECONNECT_OBSERVE_SECONDS:
+            return
+        if len(flow.sources) < 2:
+            return
+        if flow.packets < LATE_START_RECONNECT_MIN_PACKETS:
+            return
+        if flow.bytes_seen < LATE_START_RECONNECT_MIN_BYTES:
+            return
+
+        flow.reset_attempted_at = now
+        self._late_start_reset_keys.add(key)
+        _print_line(
+            "warning",
+            "检测到 monitor 启动前已存在的 realtime 连接，但监听未捕获认证握手；"
+            "正在主动断开该 TCP 连接以触发游戏自动重连",
+        )
+        ok, message = _reset_windows_ipv4_tcp_connection(key[0], key[1])
+        category = "status" if ok else "warning"
+        _print_line(
+            category,
+            message + f" | 会话={key[0][0]}:{key[0][1]} <-> {key[1][0]}:{key[1][1]}",
+        )
 
     def handle_packet(self, packet) -> None:
         try:
@@ -1525,6 +1926,14 @@ class PacketObserver:
             looks_like_auth = bool(payload[:1] == b"\x01")
             force_retry = key in self._retry_candidate_keys
             if not (syn and not ack) and not looks_like_auth and not force_retry:
+                # 监控晚启动（游戏已在线）：错过 auth 握手就无法解密。观察双向
+                # 加密业务流足够样本后强制断开该连接，游戏会自动重连重新握手。
+                self._maybe_reset_late_start_flow(
+                    key=key,
+                    source=source,
+                    destination=destination,
+                    payload=payload,
+                )
                 return
             self._make_candidate_room()
             now = time.monotonic()
@@ -1758,6 +2167,14 @@ class PacketObserver:
         ]
         for key in expired_retries:
             self._retry_candidate_keys.pop(key, None)
+        expired_late_start = [
+            key
+            for key, flow in self._late_start_flows.items()
+            if flow.updated_at < now - LATE_START_FLOW_TTL_SECONDS
+        ]
+        for key in expired_late_start:
+            self._late_start_flows.pop(key, None)
+            self._late_start_reset_keys.discard(key)
 
     def _add_retry_candidate_key(self, key: FlowKey) -> None:
         self._retry_candidate_keys[key] = time.monotonic() + RETRY_CANDIDATE_TTL_SECONDS
@@ -2612,6 +3029,8 @@ def _run_npcap_raw_capture(
     for interface in _interface_list(initial_interfaces):
         spawn(interface)
 
+    _schedule_late_start_port_reset(observer, backend="npcap")
+
     try:
         while True:
             try:
@@ -2810,6 +3229,8 @@ def _run_windivert_capture(args, observer: PacketObserver, *, default_port: int)
                 "status",
                 f"WinDivert 抓包已打开 | 驱动队列={queue_mode} | 尝试#{attempt}",
             )
+            if attempt == 1:
+                _schedule_late_start_port_reset(observer, backend="windivert")
         except (OSError, RuntimeError) as exc:
             _print_line(
                 "error",
@@ -2857,6 +3278,9 @@ def run_capture(args, *, default_port: int = 0) -> int:
         realtime_port=realtime_port,
         realtime_host=args.capture_host,
         bridge=bridge,
+        late_start_reconnect=bool(getattr(args, "late_start_reconnect", True))
+        and not bool(args.pcap_file),
+        late_start_reconnect_port=realtime_port or default_port,
     )
 
     requested_backend = getattr(args, "capture_backend", "auto")
@@ -2985,6 +3409,7 @@ def run_capture(args, *, default_port: int = 0) -> int:
         sniff_kwargs["iface"] = selected_interfaces
         sniff_kwargs["filter"] = packet_filter
         sniff_kwargs["promisc"] = args.capture_promiscuous
+        _schedule_late_start_port_reset(observer, backend="scapy")
 
     try:
         try:
@@ -3129,6 +3554,12 @@ def parse_passive_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--plain-frames", action="store_true", help="Show decrypted frame hex/ascii details.")
     parser.add_argument("--verbose", action="store_true", help="Show capture and parser diagnostics.")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument(
+        "--no-late-start-reconnect",
+        action="store_false",
+        dest="late_start_reconnect",
+        help="Disable forcing the game to reconnect when the monitor starts after the session is already up.",
+    )
     parser.add_argument(
         "--set",
         action="append",
