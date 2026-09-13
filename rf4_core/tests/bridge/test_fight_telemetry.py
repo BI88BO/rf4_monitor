@@ -326,7 +326,8 @@ class PositionReportDepthTests(unittest.TestCase):
         bridge_mod.ctx = SimpleNamespace(options=options)
         self.bridge = RF4ChatBridge()
         self.session = FlowSession(profile=get_profile("4.0.24799"))
-        self.bridge._log_telemetry = lambda cat, text: None
+        self.emitted: list[tuple[str, str]] = []
+        self.bridge._log_telemetry = lambda cat, text: self.emitted.append((cat, text))
 
     def tearDown(self) -> None:
         import rf4_core.bridge as bridge_mod
@@ -362,9 +363,31 @@ class PositionReportDepthTests(unittest.TestCase):
         )
         self.assertIsNone(self.session.fight_depth_by_gear.get(self.gear))
 
+    def test_waiting_depth_line_emitted_after_cast(self) -> None:
+        # 抛竿后咬钩前位置上报就带深度，浮窗该竿应显示"已抛竿 深X.X米"。
+        self.session.slot_items[3] = self.gear
+        self.bridge._handle_client_frame(self.session, self._report(-1.53))
+        self.assertEqual(
+            self.emitted, [("fight_status", "3号杆 已抛竿 深1.5米")]
+        )
+
+    def test_waiting_depth_line_throttled_to_rounded_change(self) -> None:
+        # 深度只有 1 位小数变化时才发新行，避免位置上报抖动刷屏。
+        self.session.slot_items[3] = self.gear
+        self.bridge._handle_client_frame(self.session, self._report(-1.53))
+        self.bridge._handle_client_frame(self.session, self._report(-1.54))
+        self.bridge._handle_client_frame(self.session, self._report(-1.72))
+        self.assertEqual(
+            self.emitted,
+            [
+                ("fight_status", "3号杆 已抛竿 深1.5米"),
+                ("fight_status", "3号杆 已抛竿 深1.7米"),
+            ],
+        )
+
 
 class CastStageLineTests(unittest.TestCase):
-    """抛竿阶段回显：浮窗搏鱼状态行显示"准备抛竿/等待中"，不再停留待机。"""
+    """抛竿阶段回显：浮窗搏鱼状态行显示"准备抛竿/已抛竿"，不再停留待机。"""
 
     def setUp(self) -> None:
         from types import SimpleNamespace
@@ -406,18 +429,18 @@ class CastStageLineTests(unittest.TestCase):
         )
         self.assertEqual(self.emitted, [("fight_status", "1号杆 准备抛竿")])
 
-    def test_cast_emits_waiting_line(self) -> None:
+    def test_cast_emits_cast_done_line(self) -> None:
         self.session.slot_items[2] = self.gear
         self.bridge._handle_client_frame(
             self.session, self._cast(self.session.profile.cast_sub_cmd)
         )
-        self.assertEqual(self.emitted, [("fight_status", "2号杆 等待中")])
+        self.assertEqual(self.emitted, [("fight_status", "2号杆 已抛竿")])
 
     def test_handheld_gear_falls_back_to_label(self) -> None:
         self.bridge._handle_client_frame(
             self.session, self._cast(self.session.profile.cast_sub_cmd)
         )
-        self.assertEqual(self.emitted, [("fight_status", "手持竿 等待中")])
+        self.assertEqual(self.emitted, [("fight_status", "手持竿 已抛竿")])
 
 
 class FightStageInitialLineTests(unittest.TestCase):

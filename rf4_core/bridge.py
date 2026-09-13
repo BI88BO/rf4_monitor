@@ -2928,13 +2928,13 @@ class RF4ChatBridge:
             if cast_gear and cast_gear.fishing_gear_id:
                 # 新一竿开始：清掉上一竿的深度，避免显示陈旧数值。
                 session.fight_depth_by_gear.pop(cast_gear.fishing_gear_id, None)
-                # 抛竿阶段回显：搏鱼状态行显示该竿进入"准备抛竿/等待中"，
+                # 抛竿阶段回显：搏鱼状态行显示该竿进入"准备抛竿/已抛竿"，
                 # 否则浮窗在抛竿后静默期一直停在"待机中"，看不出竿已抛出。
                 gear_slot = self._gear_slot_text(session, cast_gear.fishing_gear_id) or "手持竿"
                 stage = (
                     "准备抛竿"
                     if envelope.sub_cmd == session.profile.cast_prepare_sub_cmd
-                    else "等待中"
+                    else "已抛竿"
                 )
                 self._log_telemetry("fight_status", f"{gear_slot} {stage}")
                 if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
@@ -2951,7 +2951,16 @@ class RF4ChatBridge:
             groups = self._scan_float_groups(envelope.payload, limit=8)
             depth = self._fight_depth(groups)
             if depth is not None:
-                session.fight_depth_by_gear[position_report.fishing_gear_id] = depth
+                gear_id = position_report.fishing_gear_id
+                previous = session.fight_depth_by_gear.get(gear_id)
+                session.fight_depth_by_gear[gear_id] = depth
+                # 抛竿后等待咬钩期间同步回显深度（搏鱼期游戏停发位置上报，
+                # 不会盖掉搏鱼主行）。深度保留 1 位小数，跳变才发新行避免刷屏。
+                if previous is None or f"{previous:.1f}" != f"{depth:.1f}":
+                    gear_slot = self._gear_slot_text(session, gear_id) or "手持竿"
+                    self._log_telemetry(
+                        "fight_status", f"{gear_slot} 已抛竿 深{depth:.1f}米"
+                    )
 
         # 搏鱼拉力(14/8)：记录该钓组当前出线距离(过滤瞬时负值/超限)，供拉线动作/搏鱼关联展示。
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
