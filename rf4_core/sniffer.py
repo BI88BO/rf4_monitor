@@ -1477,8 +1477,10 @@ def _schedule_late_start_port_reset(observer: "PacketObserver", *, backend: str)
     """捕获就绪后若仍未识别到会话，强制断开已存在的 realtime 连接触发游戏重连。"""
     late_start_reconnect = bool(getattr(observer, "late_start_reconnect", False))
     port = int(getattr(observer, "late_start_reconnect_port", 0) or 0)
-    if not late_start_reconnect or port <= 0:
+    if not late_start_reconnect:
         return
+    # port 只用于 RF4 进程识别失败时的按端口回退；没有参考端口（托盘启动未传
+    # 参考路径）时仍按 RF4 进程断连，否则"先开游戏再监控"的快路径永远不生效。
     if sys.platform != "win32":
         return
 
@@ -1520,11 +1522,14 @@ def _schedule_late_start_port_reset(observer: "PacketObserver", *, backend: str)
             for candidate in candidates:
                 _print_line("status", "RF4 TCP 候选 | " + candidate)
             return
-        _print_line(
-            "warning",
-            "晚启动重连尝试：未发现可断开的 RF4 已有 TCP 连接，也未发现参考端口连接"
-            f" | 参考端口={port} | 后端={backend}",
-        )
+        # 没有参考端口时找不到连接是正常情况（监控先启动、游戏尚未建连），
+        # 不打印警告避免每次正常启动都误报。
+        if port > 0:
+            _print_line(
+                "warning",
+                "晚启动重连尝试：未发现可断开的 RF4 已有 TCP 连接，也未发现参考端口连接"
+                f" | 参考端口={port} | 后端={backend}",
+            )
 
     threading.Thread(
         target=reset_after_capture_ready,

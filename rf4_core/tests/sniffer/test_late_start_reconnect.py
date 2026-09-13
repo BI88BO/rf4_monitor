@@ -98,5 +98,63 @@ class LateStartReconnectTests(unittest.TestCase):
         self.assertEqual(reset_calls, [])
 
 
+class LateStartStartupResetTests(unittest.TestCase):
+    """启动快路径：捕获就绪 1 秒后无会话即按 RF4 进程断连。"""
+
+    def _run_schedule(self, observer, process_result, port_result):
+        import threading
+
+        process_calls = []
+        port_calls = []
+        printed = []
+
+        with (
+            patch.object(capture.sys, "platform", "win32"),
+            patch.object(
+                capture,
+                "_reset_windows_rf4_process_tcp_connections",
+                lambda: (process_calls.append(True), process_result)[1],
+            ),
+            patch.object(
+                capture,
+                "_reset_windows_ipv4_tcp_connections_for_port",
+                lambda port: (port_calls.append(port), port_result)[1],
+            ),
+            patch.object(capture, "_describe_windows_rf4_tcp_candidates", lambda: ()),
+            patch.object(capture.time, "sleep", lambda seconds: None),
+            patch.object(capture, "_print_line", lambda *args, **kwargs: printed.append(args)),
+        ):
+            capture._schedule_late_start_port_reset(observer, backend="test")
+            for thread in threading.enumerate():
+                if thread.name == "rf4-late-start-reconnect":
+                    thread.join(timeout=2.0)
+        return process_calls, port_calls, printed
+
+    def test_startup_reset_runs_without_reference_port(self) -> None:
+        # 回归：托盘启动没传参考端口(port=0)时，快路径也必须按 RF4 进程断连，
+        # 否则"先开游戏再监控"只能等运行时路径(24包/16KB)慢慢触发。
+        _ctx()
+        observer = _make_observer()
+        self.assertEqual(observer.late_start_reconnect_port, 0)
+
+        process_calls, port_calls, _printed = self._run_schedule(
+            observer, (1, ("已断开 TCP 连接",)), (0, ())
+        )
+
+        self.assertEqual(process_calls, [True])
+        # 进程断连成功后直接返回，不再走端口回退。
+        self.assertEqual(port_calls, [])
+
+    def test_startup_reset_silent_when_nothing_found_without_port(self) -> None:
+        # 正常启动（监控先开、游戏未连）找不到连接时不再打警告，避免误报。
+        _ctx()
+        observer = _make_observer()
+
+        _process, _port, printed = self._run_schedule(observer, (0, ()), (0, ()))
+
+        messages = [str(args) for args in printed]
+        self.assertFalse(any("晚启动重连尝试" in message for message in messages))
+
+
 if __name__ == "__main__":
     unittest.main()
