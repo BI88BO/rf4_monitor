@@ -8,7 +8,7 @@ from rf4_core import sniffer
 from rf4_core.protocol import RC4Stream, build_frame, build_request_envelope
 from rf4_core.sniffer import PassiveSession, TcpStreamReassembler
 
-from rf4_core.tests.sniffer.helpers import _ctx, _make_bridge, _make_ready_session
+from rf4_core.tests.sniffer.helpers import _ctx, _make_bridge, _make_observer, _make_ready_session
 
 
 class TcpStreamReassemblerGapRecoveryTests(unittest.TestCase):
@@ -194,10 +194,12 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
             session.protocol.server_read_rc4, pending_data, gap_bytes
         )
         self.assertIsNotNone(result)
-        lost, fpos = result
+        assert result is not None
+        lost, fpos, encrypted_before = result
         # 缺口 25 字节里只有 12 字节是密文 payload（帧头 13 字节不进 RC4）。
         self.assertEqual(lost, 12)
         self.assertEqual(fpos, 0)
+        self.assertEqual(encrypted_before, 0)
 
     def test_recovers_when_gap_inside_frame_header_and_payload(self) -> None:
         """缺口吃掉了帧头(13字节)+部分payload，帧2的残留密文会混在缺口后数据里。
@@ -374,3 +376,70 @@ class ResyncWarnThrottleTests(unittest.TestCase):
             self.assertEqual(len(msgs), 3)
             self.assertIn("已连续失败 2 次", msgs[1])
             self.assertIn("163 字节", msgs[2])
+
+
+class DownlinkReconnectRequestTests(unittest.TestCase):
+    """下行缺口持续无法恢复时，主动请求断开连接触发游戏自动重连。"""
+
+    def _stalled_session(self, callback=None) -> PassiveSession:
+        from rf4_core.protocol import build_ack_frame
+
+        _ctx()
+        session = PassiveSession.create(
+            "s-stall",
+            _make_bridge(),
+            on_tcp_reconnect_requested=callback,
+        )
+        session.protocol.token = "user|server|nonce|secret"
+        session.protocol.auth_seen = True
+        session.protocol.uuid_seen = True
+        session.protocol.hermes_seen = True
+        session.protocol.ensure_rc4()
+        ref = RC4Stream(session.protocol.token.encode())
+        body = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        raw1 = build_frame(0, 101, ref.crypt(body))
+        ack = build_ack_frame(1)
+        session.feed_tcp(from_client=False, seq=1000, payload=raw1, syn=False)
+        # 缺口后只有一个无 payload 的 ACK 帧：无法通过信封校验重同步。
+        session.feed_tcp(
+            from_client=False, seq=1000 + len(raw1) + 13, payload=ack, syn=False
+        )
+        session.server_tcp.gap_started_at = 0.0
+        return session
+
+    def test_stall_requests_reconnect_once(self) -> None:
+        requests: list[str] = []
+        session = self._stalled_session(
+            lambda _s, reason: requests.append(reason)
+        )
+
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+
+        self.assertTrue(session.downlink_stalled)
+        self.assertEqual(len(requests), 1)
+        # 只请求一次，后续 tick 不重复触发。
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+        self.assertEqual(len(requests), 1)
+
+    def test_observer_resets_connection_and_retires_session(self) -> None:
+        observer = _make_observer()
+        session = self._stalled_session(observer._request_reconnect_for_session)
+        client = ("192.168.2.8", 50000)
+        server = ("91.132.228.133", 9000)
+        key = observer._flow_key(client, server)
+        oriented = (client[0], client[1], server[0], server[1])
+        observer._auto_sessions[key] = (session, client)
+        observer.sessions[oriented] = session
+        reset_calls: list[tuple] = []
+
+        with mock.patch.object(
+            sniffer,
+            "_reset_windows_ipv4_tcp_connection",
+            lambda left, right: (reset_calls.append((left, right)), (True, "已断开 TCP 连接"))[1],
+        ):
+            session._request_downlink_tcp_reconnect("服务器下行 TCP 序号缺口失步")
+
+        self.assertEqual(reset_calls, [(client, server)])
+        self.assertNotIn(key, observer._auto_sessions)
+        self.assertNotIn(oriented, observer.sessions)
+        self.assertTrue(session.tcp_reconnect_requested)

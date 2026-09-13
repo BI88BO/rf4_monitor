@@ -67,7 +67,9 @@ TCP_GAP_WARNING_SECONDS = 2.0
 # 缺口出现后优先等待 TCP 重传补齐（游戏客户端会一直等数据包重新到位），
 # 超过该阈值才跳过缺口继续解析；重传慢时缺口内帧内容可能丢失。
 TCP_GAP_RECOVERY_SECONDS = 15.0
-MAX_RECOVERABLE_TCP_GAP_BYTES = 4096
+MAX_RECOVERABLE_TCP_GAP_BYTES = 64 * 1024
+# 缺口重同步单次搜索时间预算：大缓冲区里候选过多时按预算截断，下个新片段再试。
+TCP_GAP_RESYNC_TIME_BUDGET_SECONDS = 0.05
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
 TCP_GAP_STALL_SECONDS = 45.0
@@ -790,16 +792,40 @@ class PassiveSession:
     warned_tcp_gaps: set[str] = field(default_factory=set)
     # 缺口重同步失败限频状态：direction -> (上次告警时间, 连续失败次数)。
     resync_fail_warn: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # 重复扫描抑制：direction -> (上次扫描的 pending 字节数, 扫描时间)。
+    resync_scan_marker: dict[str, tuple[int, float]] = field(default_factory=dict)
     # 最近收到 TCP 包的时间（mirrored session 去重/退役用）。
     last_packet_at: float = field(default_factory=time.monotonic)
+    # 下行缺口持续无法恢复时请求 observer 强制断连触发游戏自动重连（一次性）。
+    tcp_reconnect_requested: bool = False
+    on_tcp_reconnect_requested: Optional[object] = None
 
     @classmethod
-    def create(cls, session_id: str, bridge: core.RF4ChatBridge) -> "PassiveSession":
+    def create(
+        cls,
+        session_id: str,
+        bridge: core.RF4ChatBridge,
+        on_tcp_reconnect_requested: Optional[object] = None,
+    ) -> "PassiveSession":
         return cls(
             session_id=session_id,
             bridge=bridge,
             protocol=core.FlowSession(profile=bridge._profile),
+            on_tcp_reconnect_requested=on_tcp_reconnect_requested,
         )
+
+    def _request_downlink_tcp_reconnect(self, reason: str) -> None:
+        """下行缺口持续无法恢复：请求 observer 主动断开该 realtime 连接。
+
+        游戏检测到断连会自动重连；新连接带 auth 握手，监控可重新正常解密，
+        避免"必须重新登录游戏"。
+        """
+        if self.tcp_reconnect_requested:
+            return
+        if self.on_tcp_reconnect_requested is None:
+            return
+        self.tcp_reconnect_requested = True
+        self.on_tcp_reconnect_requested(self, reason)
 
     @property
     def flow(self):
@@ -836,7 +862,7 @@ class PassiveSession:
                 )
         if not from_client and not self.downlink_stalled:
             # 下行序号缺口持续超阈值仍未填补 = 真丢包（非乱序），RC4 流不可恢复。
-            # 冻结该会话下行解析，避免来鱼推送被静默吞掉；等下次 realtime 重连自动恢复。
+            # 冻结该会话下行解析，并主动断开连接触发游戏自动重连（新连接重新握手）。
             if (
                 reassembler.pending_bytes
                 and reassembler.gap_age() >= TCP_GAP_STALL_SECONDS
@@ -849,8 +875,9 @@ class PassiveSession:
                     f" | 等待序号={reassembler.next_seq}"
                     f" 已见后续序号={reassembler.first_pending_seq()}"
                     f" | 会话={self.session_id}"
-                    f" | 提示：请重新登录游戏，下次 realtime 重连将自动恢复",
+                    f" | 正在主动断开 realtime TCP 连接以触发游戏自动重连",
                 )
+                self._request_downlink_tcp_reconnect("服务器下行 TCP 序号缺口失步")
         if not chunk:
             return
         if from_client:
@@ -899,17 +926,28 @@ class PassiveSession:
         # 这些 payload 字节游戏已经消耗了密钥流，只是本端没解出来。恢复时
         # 会丢弃该残帧，因此跳过量必须把它们算进去，否则永远对不齐。
         buffer = session.client_buffer if from_client else session.server_buffer
-        buffered_encrypted = max(0, len(buffer) - 13)
-        resync = self._resync_gap_cipher(
-            cipher, pending_data, gap_bytes, buffered_encrypted
-        )
+        buffered_encrypted = self._buffered_ciphertext_bytes(buffer)
+        # 重复扫描抑制：同一 pending 数据（没有新片段到达）不再重扫，
+        # 避免缺口长时间存在时每个新包都做一遍重搜索。
+        now = time.monotonic()
+        marker = self.resync_scan_marker.get(direction)
+        if marker is not None and marker[0] == len(pending_data) and now - marker[1] < 1.0:
+            return 0, b""
+        self.resync_scan_marker[direction] = (len(pending_data), now)
+        # 搜索用的 probe 先按缓冲区残帧密文推进，使校验位置与真实密钥流对齐；
+        # 命中后真实 cipher 再一次性按 buffered+lost+encrypted_before 推进。
+        resync_cipher = cipher.clone()
+        if buffered_encrypted:
+            resync_cipher.keystream(buffered_encrypted)
+        resync = self._resync_gap_cipher(resync_cipher, pending_data, gap_bytes)
         if resync is None:
             self._warn_resync_failure(direction, gap_bytes)
             return 0, b""
-        advance, fpos = resync
-        cipher.keystream(advance)
+        lost, fpos, encrypted_before = resync
+        cipher.keystream(buffered_encrypted + lost + encrypted_before)
         buffer.clear()
         gap_bytes, chunk = reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
+        self.resync_scan_marker.pop(direction, None)
         return gap_bytes, chunk[fpos:]
 
     def _warn_resync_failure(self, direction: str, gap_bytes: int) -> None:
@@ -931,61 +969,186 @@ class PassiveSession:
         )
 
     @staticmethod
+    def _buffered_ciphertext_bytes(buffer: bytearray) -> int:
+        """统计缺口前方向缓冲区里已送达但未解码的密文字节数。
+
+        take_complete_frames 会留下一个不完整的帧：完整帧头(13B)是明文不消耗
+        密钥流，但已送达的 payload 前缀游戏端已推进 RC4；恢复会丢弃该残帧，
+        因此这部分必须计入跳过量（参考版同名函数）。
+        """
+        offset = 0
+        encrypted = 0
+        while offset < len(buffer):
+            try:
+                frame = PacketObserver._try_parse_frame_at(buffer, offset)
+            except ValueError:
+                return encrypted
+            if frame is not None:
+                encrypted += len(frame.payload)
+                offset += len(frame.raw)
+                continue
+            remaining = len(buffer) - offset
+            if remaining >= 13:
+                body_len = u32(buffer, offset)
+                if 9 <= body_len <= CACHED_TOKEN_RESYNC_MAX_BYTES - 4:
+                    # 合法明文帧头 + 不完整的密文 payload
+                    encrypted += remaining - 13
+                else:
+                    # 前 4 字节不是合法 body_len：整段视为密文续段
+                    encrypted += remaining
+            # 不足一个帧头：纯明文，不消耗密钥流，不计入
+            return encrypted
+        return encrypted
+
+    @staticmethod
     def _resync_gap_cipher(
         cipher: object,
         pending_data: bytes,
         gap_bytes: int,
-        buffered_encrypted: int = 0,
-    ) -> Optional[tuple[int, int]]:
-        """在缺口后数据里找第一个完整帧边界，对候选密文跳过量逐一信封校验。
+        *,
+        preferred_frame_offset: Optional[int] = None,
+    ) -> Optional[tuple[int, int, int]]:
+        """在缺口后数据里找完整帧边界与 RC4 跳过量，返回信封校验通过的对齐。
 
-        返回 (解密该帧 payload 前需推进的密钥流字节数, 帧边界偏移)。
+        返回 (缺口内密文字节数 delta, 帧边界偏移 frame_offset, 该帧 payload 前
+        已消耗的密文字节数 encrypted_before)；调用方按
+        ``buffered_ciphertext + delta + encrypted_before`` 推进密钥流。
 
         RC4 流密码下只有业务帧 payload 消耗密钥流，明文帧头(13B)与 ACK(5B)不消耗。
-        跳过量 = 缓冲区残帧密文（缺口落在帧中间时游戏已消耗的部分）
-        + 缺口内密文字节 + 候选帧之前的密文字节；帧头必须从后者中扣除，
-        否则高估跳过量、永远校验不过——这是小缺口反复"无法重同步"的根因。
+        候选帧之前的明文帧链要扣除，但只能扣除"紧邻候选帧的完整明文帧链"：
+        把随机密文误认成帧会让 RC4 错扣 13 字节、候选永远校验不过。
         """
-        candidates: list[int] = []
-        for fpos in range(len(pending_data)):
-            if fpos + 4 > len(pending_data):
-                break
-            body_len = u32(pending_data, fpos)
-            if body_len == 1 or body_len < 9:
+        deadline = time.monotonic() + TCP_GAP_RESYNC_TIME_BUDGET_SECONDS
+        data = pending_data
+        data_len = len(data)
+        candidates: list[tuple[int, int, int]] = []
+        # 扫描时记录出现过的帧总长，反向链只匹配这些长度，避免误扣。
+        observed_raws: list[int] = []
+        observed_raw_set: set[int] = set()
+        for frame_offset in range(0, max(0, data_len - 4)):
+            if time.monotonic() >= deadline:
+                return None
+            body_len = u32(data, frame_offset)
+            if body_len == 0 or body_len == 1 or body_len < 9:
                 continue
-            if fpos + 4 + body_len > len(pending_data):
+            total = 4 + body_len
+            if frame_offset + total > data_len:
                 continue
-            candidates.append(fpos)
+            if data[frame_offset + 4] not in (0, 1):
+                continue
+            if total not in observed_raw_set and len(observed_raw_set) < 64:
+                observed_raw_set.add(total)
+                observed_raws.append(total)
+
+            # 候选帧之前的字节通常是被损帧的密文续段。只扣除紧邻其前的完整
+            # 明文帧链；把随机密文当帧解析会错扣 13 字节导致候选校验不过。
+            chain_end = frame_offset
+            clear_chain_bytes = 0
+            while chain_end > 0:
+                matched_raw: Optional[int] = None
+                if (
+                    chain_end >= 5
+                    and data[chain_end - 5:chain_end - 1] == b"\x01\x00\x00\x00"
+                    and data[chain_end - 1] == 1
+                ):
+                    matched_raw = 5
+                else:
+                    for raw in observed_raws:
+                        if raw < 13 or chain_end - raw < 0:
+                            continue
+                        header_start = chain_end - raw
+                        if u32(data, header_start) != raw - 4:
+                            continue
+                        if data[header_start + 4] not in (0, 1):
+                            continue
+                        matched_raw = raw
+                        break
+                if matched_raw is None:
+                    break
+                clear_chain_bytes += 5 if matched_raw == 5 else 13
+                chain_end -= matched_raw
+            encrypted_before = (
+                frame_offset - clear_chain_bytes if clear_chain_bytes else frame_offset
+            )
+            score = 4 if frame_offset == preferred_frame_offset else 1
+            if (
+                frame_offset >= 13
+                and data[frame_offset - 13:frame_offset - 9] == b"\x09\x00\x00\x00"
+                and data[frame_offset - 9] == 1
+            ):
+                score = 3
+            next_offset = frame_offset + total
+            if (
+                next_offset + 5 <= data_len
+                and data[next_offset:next_offset + 4] == b"\x09\x00\x00\x00"
+                and data[next_offset + 4] == 1
+            ):
+                score = max(score, 2)
+            candidates.append((frame_offset, encrypted_before, score))
+
+        candidates.sort(key=lambda candidate: candidate[2], reverse=True)
+        # 限制候选数，避免在大缓冲区里被误报拖爆时间预算。
+        candidates = candidates[:30]
         if not candidates:
             return None
-        raw = bytearray(pending_data)
-        for fpos in candidates:
-            body_len = u32(pending_data, fpos)
-            payload = pending_data[fpos + 13 : fpos + 13 + body_len - 9]
-            encrypted_before = fpos
-            cursor = 0
-            while cursor < fpos:
-                try:
-                    preceding = PacketObserver._try_parse_frame_at(raw, cursor)
-                except ValueError:
-                    preceding = None
-                if preceding is None or cursor + len(preceding.raw) > fpos:
-                    break
-                encrypted_before -= len(preceding.raw) - len(preceding.payload)
-                cursor += len(preceding.raw)
-            encrypted_before = max(0, encrypted_before)
-            # 缺口起点可能截断帧头：pending 开头最多 12 字节是明文帧头尾巴，
-            # 被上面按密文统计了。因此在 [-12, +gap] 范围内回补，覆盖
-            # "残帧头明文被多算" 与 "缺口内明文帧头少算" 两种情况。
-            base = buffered_encrypted + encrypted_before
-            for delta in range(-12, gap_bytes + 1):
-                advance = base + delta
-                if advance < 0:
+
+        # 缺口大多由整数个 13 字节明文帧头组成：先试"干净"取值。
+        clean = [gap_bytes - 13 * n for n in range(gap_bytes // 13 + 1)]
+        clean_set = set(clean)
+        # 缺口还可能截断明文帧头（-1..-12），需向下回补。
+        all_values = list(range(-12, gap_bytes + 1))
+        lost_order = clean + [v for v in all_values if v not in clean_set]
+
+        for frame_offset, encrypted_before, _score in candidates:
+            if time.monotonic() >= deadline:
+                return None
+            body_len = u32(data, frame_offset)
+            payload = data[frame_offset + 13:frame_offset + 4 + body_len]
+            if len(payload) < CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES:
+                continue
+            # 一次性派生整段密钥流，用信封首字节 0x01 做 1/256 预筛，
+            # 避免每个候选都完整解密一遍 payload。
+            keystream = cipher.clone().keystream(
+                encrypted_before + gap_bytes + CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES + 1
+            )
+            for lost in lost_order:
+                position = encrypted_before + lost
+                if position < 0 or payload[0] ^ keystream[position] != 0x01:
                     continue
-                probe = copy.deepcopy(cipher)
-                probe.keystream(advance)
-                if parse_envelope(probe.crypt(payload)) is not None:
-                    return advance, fpos
+                plain_prefix = bytes(
+                    payload[i] ^ keystream[position + i]
+                    for i in range(CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES)
+                )
+                if parse_envelope(plain_prefix) is None:
+                    continue
+                probe = cipher.clone()
+                probe.keystream(position + CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES)
+                remainder = payload[CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES:]
+                if remainder:
+                    # 信封头之后的 body 是任意二进制，只用于对齐游标。
+                    probe.crypt(remainder)
+                # 候选帧之后若还有完整业务帧，要求它们也能解出信封（最多验 2 个），
+                # 进一步压掉 1/2^31 之外的误报。
+                next_data = data[frame_offset + 4 + body_len:]
+                follow_probe = probe.clone()
+                try:
+                    follow_frames = take_complete_frames(bytearray(next_data))
+                except (ValueError, IndexError):
+                    follow_frames = []
+                business_follows = 0
+                follow_valid = 0
+                for following in follow_frames:
+                    if following.frame_type == 1 or not following.payload:
+                        continue
+                    business_follows += 1
+                    if parse_envelope(follow_probe.crypt(following.payload)) is None:
+                        break
+                    follow_valid += 1
+                    if follow_valid >= 2:
+                        break
+                if business_follows > 0 and follow_valid == 0:
+                    continue
+                return lost, frame_offset, encrypted_before
         return None
 
     def _print_once_reset(self) -> None:
@@ -1732,6 +1895,67 @@ class PacketObserver:
             message + f" | 会话={key[0][0]}:{key[0][1]} <-> {key[1][0]}:{key[1][1]}",
         )
 
+    def _session_flow_endpoints(
+        self,
+        session: PassiveSession,
+    ) -> Optional[tuple[FlowKey, Endpoint, Endpoint]]:
+        for key, active in self._auto_sessions.items():
+            active_session, client_endpoint = active
+            if active_session is session:
+                server_endpoint = key[1] if key[0] == client_endpoint else key[0]
+                return key, client_endpoint, server_endpoint
+        for oriented_key, active_session in self.sessions.items():
+            if active_session is not session:
+                continue
+            client_endpoint = (oriented_key[0], oriented_key[1])
+            server_endpoint = (oriented_key[2], oriented_key[3])
+            return self._flow_key(client_endpoint, server_endpoint), client_endpoint, server_endpoint
+        return None
+
+    def _remove_session_mapping(self, key: FlowKey, session: PassiveSession) -> None:
+        """仅摘除会话映射（不做 FIN/兜底统计），供强制重连后清场。"""
+        active = self._auto_sessions.get(key)
+        if active is not None and active[0] is session:
+            self._auto_sessions.pop(key, None)
+        for oriented_key, active_session in list(self.sessions.items()):
+            if active_session is session:
+                self.sessions.pop(oriented_key, None)
+        self._candidates.pop(key, None)
+
+    def _request_reconnect_for_session(self, session: PassiveSession, reason: str) -> None:
+        """下行缺口持续无法恢复：主动断开 realtime TCP，触发游戏自动重连。
+
+        游戏重连后新连接带 auth 握手，监控重新正常解密；避免"必须重新登录游戏"。
+        """
+        match = self._session_flow_endpoints(session)
+        if match is None:
+            return
+        key, client_endpoint, server_endpoint = match
+        ok, message = _reset_windows_ipv4_tcp_connection(client_endpoint, server_endpoint)
+        connection_already_gone = message.startswith("TCP 表中未找到")
+        if not ok and not connection_already_gone:
+            self._remember_rc4_handoff(session)
+            self._remove_session_mapping(key, session)
+            self._closed_realtime_hosts.discard(server_endpoint[0])
+            self._reconnect_notified_hosts.discard(server_endpoint[0])
+            _print_line(
+                "warning",
+                message
+                + f" | 已退役失步会话，等待后续 realtime 包重新识别 | 会话={session.session_id}",
+            )
+            return
+        if ok:
+            _print_line(
+                "warning",
+                f"{reason}，已主动重置旧 realtime TCP 连接以触发游戏自动重连"
+                f" | 服务器={server_endpoint[0]}:{server_endpoint[1]} | 会话={session.session_id}",
+            )
+            _print_line("status", message + f" | 会话={session.session_id}")
+        self._remember_rc4_handoff(session)
+        self._remove_session_mapping(key, session)
+        self._closed_realtime_hosts.discard(server_endpoint[0])
+        self._reconnect_notified_hosts.discard(server_endpoint[0])
+
     def handle_packet(self, packet) -> None:
         try:
             parsed = self._packet_fields(packet)
@@ -1759,7 +1983,11 @@ class PacketObserver:
             session = self.sessions.get(key)
             if session is None:
                 session_id = f"{key[0]}:{key[1]} -> {key[2]}:{key[3]}"
-                session = PassiveSession.create(session_id, self.bridge)
+                session = PassiveSession.create(
+                    session_id,
+                    self.bridge,
+                    on_tcp_reconnect_requested=self._request_reconnect_for_session,
+                )
                 self.sessions[key] = session
                 _print_line("session", f"发现 realtime 连接 | {session_id}")
 
@@ -2086,7 +2314,11 @@ class PacketObserver:
             f"{client_endpoint[0]}:{client_endpoint[1]} -> "
             f"{server_endpoint[0]}:{server_endpoint[1]}"
         )
-        session = PassiveSession.create(session_id, self.bridge)
+        session = PassiveSession.create(
+            session_id,
+            self.bridge,
+            on_tcp_reconnect_requested=self._request_reconnect_for_session,
+        )
         server_data = bytes(candidate.buffers.get(server_endpoint, b""))
         client_payload = self._first_business_payload(client_data, from_client=True)
         server_payload = self._first_business_payload(server_data, from_client=False)
@@ -2348,7 +2580,11 @@ class PacketObserver:
         session_id = (
             f"{source[0]}:{source[1]} -> {destination[0]}:{destination[1]}"
         )
-        session = PassiveSession.create(session_id, self.bridge)
+        session = PassiveSession.create(
+            session_id,
+            self.bridge,
+            on_tcp_reconnect_requested=self._request_reconnect_for_session,
+        )
         session.protocol.token = handoff.token
         session.protocol.auth_seen = True
         session.protocol.uuid_seen = True
