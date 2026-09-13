@@ -131,7 +131,7 @@ class OverlayFightStatusTests(unittest.TestCase):
         self.assertEqual(ov._rows.get("3号杆"), "3号杆 78% 12.3米")
 
     def test_fight_status_category_updates_rod_row(self) -> None:
-        # 三档拆分后搏鱼状态行走 fight_status 类别，仍按号杆前缀就地更新。
+        # 搏鱼状态行（fight_status 类别）按竿号前缀就地更新。
         ov = self._overlay()
         payload = json.dumps(
             {"event": "telemetry", "category": "fight_status", "text": "1号杆 | 体力 100% 出线 33.486米"},
@@ -139,6 +139,16 @@ class OverlayFightStatusTests(unittest.TestCase):
         )
         ov._handle_event_payload(payload)
         self.assertEqual(ov._rows.get("1号杆"), "1号杆 100% 33.486米")
+
+    def test_cast_waiting_line_updates_rod_row(self) -> None:
+        # 抛竿阶段回显：无"|"的简行也要能落到对应竿行，替换"待机中"。
+        ov = self._overlay()
+        payload = json.dumps(
+            {"event": "telemetry", "category": "fight_status", "text": "2号杆 等待中"},
+            ensure_ascii=False,
+        )
+        ov._handle_event_payload(payload)
+        self.assertEqual(ov._rows.get("2号杆"), "2号杆 等待中")
 
     def test_handheld_fight_status_gets_own_row(self) -> None:
         # 手持竿搏鱼状态独立成行就地更新，不进遥测区闪现。
