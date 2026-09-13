@@ -38,6 +38,7 @@ CONFIG_FILE = PACKAGE_DIR / "rf4_overlay_config.json"
 
 DEFAULT_DB_PATH = PACKAGE_DIR / "rf4_overlay_events.sqlite3"
 WINDOW_WIDTH = 260
+WINDOW_MAX_WIDTH = 340
 WINDOW_HEIGHT = 42
 
 # 字体族解析缓存：首次真实查询后复用，避免每次重绘都调 tkfont.families()
@@ -339,6 +340,14 @@ class Overlay:
         return value + "g"
 
     @classmethod
+    def _fmt_meter(cls, value: str) -> str:
+        """深度/出线统一保留 1 位小数：20.482→20.5，2.473→2.5。"""
+        try:
+            return f"{float(value):.1f}"
+        except ValueError:
+            return value
+
+    @classmethod
     def _compact_fight_line(cls, text: str) -> str:
         """把搏鱼状态行压缩成单行：`1号杆 ★黑线鳕444g 78% 12.3米`。
 
@@ -366,10 +375,10 @@ class Overlay:
             out.append(sm.group(1) + "%")
         depth_m = re.search(r"深\s*([\d.]+)米", body)
         if depth_m:
-            out.append("深" + depth_m.group(1) + "米")
+            out.append("深" + cls._fmt_meter(depth_m.group(1)) + "米")
         dm = re.search(r"出线\s*([\d.]+)米", body)
         if dm:
-            out.append(dm.group(1) + "米")
+            out.append(cls._fmt_meter(dm.group(1)) + "米")
         if len(out) == 1:
             return text
         return " ".join(out)
@@ -436,13 +445,28 @@ class Overlay:
 
     def _refresh_display(self):
         lines = self._lines_for_display()
-        need_h = self._content_height(lines)
+        width = self._content_width(lines)
+        need_h = self._content_height(lines, width)
         # 只设置尺寸、不带位置：Tk 会保留当前/已请求的位置。若在这里读
         # winfo_x/y 重新拼 geometry，窗口首次映射前它们还是 (0,0)，会把
         # 配置里记住的位置覆盖成屏幕左上角。
-        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}")
-        self._draw(width=WINDOW_WIDTH, height=need_h)
+        self.root.geometry(f"{width}x{need_h}")
+        self._draw(width=width, height=need_h)
         self._show()
+
+    def _content_width(self, lines):
+        """按最长行计算窗口宽度：待机保持紧凑，长搏鱼行最多加宽到上限，
+        让鱼名/体力/深度/出线尽量在两行内显示完。"""
+        try:
+            import tkinter.font as tkfont
+
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=self.FONT_SIZE, weight="bold")
+            longest = max((f.measure(line) for line in lines if line), default=0)
+            # +4 余量：Tk 换行按词边界判断，宽度贴边时可能多折一行。
+            needed = longest + self.PAD_X * 2 + 4
+            return max(WINDOW_WIDTH, min(WINDOW_MAX_WIDTH, needed))
+        except Exception:
+            return WINDOW_WIDTH
 
     def _lines_for_display(self):
         lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
@@ -524,12 +548,12 @@ class Overlay:
                 justify="left",
             )
 
-    def _content_height(self, lines):
+    def _content_height(self, lines, width=None):
         """按换行数估算需求高度：长消息按实际换行行数计算，避免被裁切。"""
         try:
             import tkinter.font as tkfont
 
-            wrap_px = WINDOW_WIDTH - self.PAD_X * 2
+            wrap_px = (width or WINDOW_WIDTH) - self.PAD_X * 2
             f = tkfont.Font(self.root, family=Overlay.font_family(), size=self.FONT_SIZE, weight="bold")
             row_h = f.metrics("linespace") + 3
             total = 0

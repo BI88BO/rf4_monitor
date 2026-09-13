@@ -200,7 +200,7 @@ class OverlayGeometryTests(unittest.TestCase):
         calls = []
         ov.root = SimpleNamespace(geometry=lambda spec: calls.append(spec))
         ov._lines_for_display = lambda: ["来鱼提示 · 待机中"]
-        ov._content_height = lambda lines: 42
+        ov._content_height = lambda lines, width: 42
         ov._draw = lambda **kwargs: None
         ov._show = lambda: None
 
@@ -208,6 +208,29 @@ class OverlayGeometryTests(unittest.TestCase):
 
         self.assertEqual(calls, [f"{overlay_mod.WINDOW_WIDTH}x42"])
         self.assertNotIn("+", calls[0])
+
+    def test_content_width_keeps_min_for_short_and_clamps_long(self) -> None:
+        # 待机短句保持最小宽度；超长搏鱼行加宽但不超过上限。
+        import tkinter.font as tkfont
+
+        class _FakeFont:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def measure(self, text):
+                return len(text) * 20
+
+        ov = object.__new__(Overlay)
+        ov.root = SimpleNamespace()
+        prev = tkfont.Font
+        tkfont.Font = _FakeFont
+        try:
+            short = ov._content_width(["短句"])
+            long = ov._content_width(["x" * 100])
+        finally:
+            tkfont.Font = prev
+        self.assertEqual(short, overlay_mod.WINDOW_WIDTH)
+        self.assertEqual(long, overlay_mod.WINDOW_MAX_WIDTH)
 
 
 class OverlayCompactTests(unittest.TestCase):
@@ -238,7 +261,7 @@ class OverlayCompactTests(unittest.TestCase):
         text = "3号杆 | [超级稀有◆] 鱼=蓝鳃太阳鱼 重量=6.030 公斤 体力 55% 出线 40.02米"
         self.assertEqual(
             Overlay._compact_fight_line(text),
-            "3号杆 [超级稀有◆] 蓝鳃太阳鱼6.03kg 55% 40.02米",
+            "3号杆 [超级稀有◆] 蓝鳃太阳鱼6.03kg 55% 40.0米",
         )
 
     def test_compact_fight_without_fish_meta(self) -> None:
