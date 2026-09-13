@@ -37,8 +37,8 @@ if getattr(sys, "frozen", False):
 CONFIG_FILE = PACKAGE_DIR / "rf4_overlay_config.json"
 
 DEFAULT_DB_PATH = PACKAGE_DIR / "rf4_overlay_events.sqlite3"
-WINDOW_WIDTH = 320
-WINDOW_HEIGHT = 70
+WINDOW_WIDTH = 260
+WINDOW_HEIGHT = 42
 
 # 字体族解析缓存：首次真实查询后复用，避免每次重绘都调 tkfont.families()
 _FONT_FAMILY_CACHE = None
@@ -88,13 +88,17 @@ class Overlay:
         STYLE_TRANSPARENT: {"bg": "#101418"},
     }
 
-    CANVAS_BG = "#0F1916"
+    CANVAS_BG = "#151B23"
+    CANVAS_BORDER = "#2C3542"
     CANVAS_TEXT = "#ffd166"
     CANVAS_DIM = "#b39a5a"
     CANVAS_RED = "#FF5252"
-    CANVAS_GRAY = "#5c6b64"
+    CANVAS_GRAY = "#6B7684"
     TRANSPARENT_KEY = "#0000FF"
-    CORNER_RADIUS = 12
+    CORNER_RADIUS = 10
+    FONT_SIZE = 11
+    PAD_X = 12
+    PAD_Y = 10
     # 反外挂警告红字状态：object.__new__ 构造(测试)时默认为 False
     _anticheat_red = False
     # 反外挂红字恢复定时器：同一时刻至多一个，新事件会先取消旧的
@@ -360,6 +364,9 @@ class Overlay:
         sm = re.search(r"体力\s*(\d+)\s*%", body)
         if sm:
             out.append(sm.group(1) + "%")
+        depth_m = re.search(r"深\s*([\d.]+)米", body)
+        if depth_m:
+            out.append("深" + depth_m.group(1) + "米")
         dm = re.search(r"出线\s*([\d.]+)米", body)
         if dm:
             out.append(dm.group(1) + "米")
@@ -430,9 +437,10 @@ class Overlay:
     def _refresh_display(self):
         lines = self._lines_for_display()
         need_h = self._content_height(lines)
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
-        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}+{x}+{y}")
+        # 只设置尺寸、不带位置：Tk 会保留当前/已请求的位置。若在这里读
+        # winfo_x/y 重新拼 geometry，窗口首次映射前它们还是 (0,0)，会把
+        # 配置里记住的位置覆盖成屏幕左上角。
+        self.root.geometry(f"{WINDOW_WIDTH}x{need_h}")
         self._draw(width=WINDOW_WIDTH, height=need_h)
         self._show()
 
@@ -463,20 +471,20 @@ class Overlay:
         try:
             import tkinter.font as tkfont
 
-            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13, weight="bold")
-            return f.metrics("linespace") + 4
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=self.FONT_SIZE, weight="bold")
+            return f.metrics("linespace") + 3
         except Exception:
-            return 28
+            return 20
 
     def _draw(self, *, width, height):
         canvas = self._ensure_canvas()
         canvas.delete("all")
-        # 非透明模式画玻璃卡(圆角背景+内侧描边+HUD 装饰线)；透明模式跳过，
+        # 非透明模式画玻璃卡(圆角背景+描边)；透明模式跳过，
         # 画布背景是透明键 #0000FF，只有文字浮于桌面。
         if not self._is_transparent():
             r = self.CORNER_RADIUS
             Overlay._round_rect(canvas, 1, 1, width - 2, height - 2, r,
-                                fill=self.CANVAS_BG)
+                                fill=self.CANVAS_BG, outline=self.CANVAS_BORDER)
         # 第一块：竿号/搏鱼行(按竿号排序，主色)；第二块：遥测/待机行(降暗色)。
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())
@@ -497,22 +505,22 @@ class Overlay:
             rod_color = self.CANVAS_RED if self._any_exhausted(rod_lines) else self.CANVAS_TEXT
         if rod_lines:
             canvas.create_text(
-                16, 14,
+                self.PAD_X, self.PAD_Y,
                 text="\n".join(rod_lines),
                 anchor="nw",
-                font=(Overlay.font_family(), 13, "bold"),
+                font=(Overlay.font_family(), self.FONT_SIZE, "bold"),
                 fill=rod_color,
-                width=width - 32,
+                width=width - self.PAD_X * 2,
                 justify="left",
             )
         if dim_lines:
             canvas.create_text(
-                16, 14 + len(rod_lines) * self._row_height(),
+                self.PAD_X, self.PAD_Y + len(rod_lines) * self._row_height(),
                 text="\n".join(dim_lines),
                 anchor="nw",
-                font=(Overlay.font_family(), 13, "bold"),
+                font=(Overlay.font_family(), self.FONT_SIZE),
                 fill=self.CANVAS_GRAY if not self._capture_active else self.CANVAS_DIM,
-                width=width - 32,
+                width=width - self.PAD_X * 2,
                 justify="left",
             )
 
@@ -521,17 +529,17 @@ class Overlay:
         try:
             import tkinter.font as tkfont
 
-            wrap_px = WINDOW_WIDTH - 32
-            f = tkfont.Font(self.root, family=Overlay.font_family(), size=13, weight="bold")
-            row_h = f.metrics("linespace") + 4
+            wrap_px = WINDOW_WIDTH - self.PAD_X * 2
+            f = tkfont.Font(self.root, family=Overlay.font_family(), size=self.FONT_SIZE, weight="bold")
+            row_h = f.metrics("linespace") + 3
             total = 0
             for line in lines:
                 visual = max(1, math.ceil(f.measure(line) / max(wrap_px, 1)))
                 total += visual * row_h
             # 顶部 + 底部 padding(padx/pady) + 边框余量
-            return max(40, total + 40)
+            return max(38, total + self.PAD_Y * 2)
         except Exception:
-            return 40 + 28 * len(lines)
+            return 38 + 20 * len(lines)
 
     def _show_self_event(self, gear_slot, text, clear_after=0):
         # 直接使用与日志一致的整行文本（已含【我自己】与等级前缀），按竿号分行。

@@ -2256,16 +2256,12 @@ class PacketObserver:
                 name: copy.deepcopy(getattr(protocol, name))
                 for name in (
                     "fish_setup_cache",
-                    "active_fish_setup_ids_by_gear",
-                    "shortcut_items",
-                    "shortcut_request_calls",
-                    "shortcut_request_slots",
-                    "shortcut_request_gears",
-                    "inferred_gear_rod_numbers",
-                    "anonymous_gear_id",
-                    "anonymous_rod_number",
-                    "fallback_unknown_rod_number",
-                    "fish_setup_rod_numbers",
+                    "fish_setup_by_gear",
+                    "fight_fish_by_gear",
+                    "fight_distance_by_gear",
+                    "fight_depth_by_gear",
+                    "slot_items",
+                    "slot_request_calls",
                 )
                 if hasattr(protocol, name)
             },

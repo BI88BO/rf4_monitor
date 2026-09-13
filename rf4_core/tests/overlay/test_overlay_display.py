@@ -29,10 +29,11 @@ class OverlayFightColorTests(unittest.TestCase):
 
 class OverlayGlassStyleTests(unittest.TestCase):
     def test_glass_style_constants_defined(self) -> None:
-        self.assertEqual(Overlay.CANVAS_BG, "#0F1916")
+        self.assertEqual(Overlay.CANVAS_BG, "#151B23")
+        self.assertEqual(Overlay.CANVAS_BORDER, "#2C3542")
         self.assertEqual(Overlay.CANVAS_TEXT, "#ffd166")
         self.assertEqual(Overlay.CANVAS_DIM, "#b39a5a")
-        self.assertEqual(Overlay.CORNER_RADIUS, 12)
+        self.assertEqual(Overlay.CORNER_RADIUS, 10)
 
     def test_font_family_falls_back_when_missing(self) -> None:
         import tkinter.font as tkfont
@@ -135,11 +136,11 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         ov._draw(width=320, height=60)
         kinds = [c[0] for c in ov.created]
         self.assertIn("polygon", kinds)  # 圆角卡片背景
-        self.assertNotIn("line", kinds)  # 无描边/装饰线
+        self.assertNotIn("line", kinds)  # 无独立描边/装饰线
         self.assertIn("text", kinds)     # 文本
         bg = [k for k in ov.created if k[0] == "polygon"]
-        self.assertTrue(all(k[1].get("fill") == "#0F1916" for k in bg))
-        self.assertTrue(all("outline" not in k[1] for k in bg))
+        self.assertTrue(all(k[1].get("fill") == "#151B23" for k in bg))
+        self.assertTrue(all(k[1].get("outline") == Overlay.CANVAS_BORDER for k in bg))
 
     def test_exhausted_row_uses_red_text(self) -> None:
         ov = self._overlay()
@@ -159,8 +160,8 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         self.assertEqual(texts[0][1]["text"], "1号杆 | 体力 78% 出线 12.3米")
         self.assertEqual(texts[1][1]["fill"], Overlay.CANVAS_DIM)
         self.assertEqual(texts[1][1]["text"], "商店折扣\n装备已修复")
-        # 第二块 y = 14 + 竿行数 × 行高(测试环境无 Tk，行高回退 28)
-        self.assertEqual(texts[1][1]["y"], 14 + 1 * 28)
+        # 第二块 y = 顶部内边距 + 竿行数 × 行高(测试环境无 Tk，行高回退 20)
+        self.assertEqual(texts[1][1]["y"], Overlay.PAD_Y + 1 * 20)
 
     def test_idle_fallback_line_is_dim(self) -> None:
         ov = self._overlay()
@@ -191,6 +192,24 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_RED)
 
 
+class OverlayGeometryTests(unittest.TestCase):
+    def test_refresh_display_sets_size_without_position(self) -> None:
+        # 回归：窗口首次映射前 winfo_x/y 返回 (0,0)，若 _refresh_display 拼上
+        # "+x+y" 会把记住的位置覆盖成屏幕左上角。必须只设尺寸。
+        ov = object.__new__(Overlay)
+        calls = []
+        ov.root = SimpleNamespace(geometry=lambda spec: calls.append(spec))
+        ov._lines_for_display = lambda: ["来鱼提示 · 待机中"]
+        ov._content_height = lambda lines: 42
+        ov._draw = lambda **kwargs: None
+        ov._show = lambda: None
+
+        ov._refresh_display()
+
+        self.assertEqual(calls, [f"{overlay_mod.WINDOW_WIDTH}x42"])
+        self.assertNotIn("+", calls[0])
+
+
 class OverlayCompactTests(unittest.TestCase):
     """浮窗紧凑化：搏鱼行单行化 + 事件短句化，三竿同开不再满屏折行。"""
 
@@ -199,6 +218,13 @@ class OverlayCompactTests(unittest.TestCase):
         self.assertEqual(
             Overlay._compact_fight_line(text),
             "1号杆 [稀有★] 黑线鳕444g 78% 12.3米",
+        )
+
+    def test_compact_fight_keeps_depth(self) -> None:
+        text = "1号杆 | [稀有★] 鱼=黑线鳕 重量=444 克 体力 78% 深4.5米 出线 12.3米"
+        self.assertEqual(
+            Overlay._compact_fight_line(text),
+            "1号杆 [稀有★] 黑线鳕444g 78% 深4.5米 12.3米",
         )
 
     def test_compact_fight_kilograms_trim_zeros(self) -> None:

@@ -55,6 +55,16 @@ class GearSlotTextTests(unittest.TestCase):
         bridge, session = _session_with_slots({4: "gear-c"})
         self.assertEqual(bridge._gear_slot_text(session, "gear-c"), "")
 
+    def test_active_slot_noise_does_not_shadow_real_slot(self) -> None:
+        # 回归：同一把竿的 GUID 同时出现在 slot_type=4(当前活动位，噪声)和
+        # slot_type=1(真实快捷键槽)时，若 dict 顺序先命中 4，旧逻辑直接返回
+        # ""，导致有竿号的竿被判成"手持竿"。必须跳过未收录槽位继续找。
+        gear = "11111111-1111-1111-1111-111111111111"
+        bridge, session = _session_with_slots({4: gear, 1: gear})
+        self.assertEqual(bridge._gear_slot_text(session, gear), "1号杆")
+        bridge, session = _session_with_slots({1: gear, 4: gear})
+        self.assertEqual(bridge._gear_slot_text(session, gear), "1号杆")
+
     def test_missing_gear_returns_empty(self) -> None:
         bridge, session = _session_with_slots({1: "gear-a"})
         self.assertEqual(bridge._gear_slot_text(session, None), "")

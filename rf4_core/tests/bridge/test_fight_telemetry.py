@@ -93,6 +93,17 @@ class FightStaminaHelpersTests(unittest.TestCase):
         self.assertEqual(self.bridge._sanitize_distance(None, 26.2), 26.2)
         self.assertIsNone(self.bridge._sanitize_distance(-1.0, None))
 
+    def test_depth_from_position_report(self) -> None:
+        # 位置上报浮点组(x, y, z)：y<0 为水下，深度取 abs(y)。
+        groups = ((1.25, -8.5, 3.75),)
+        self.assertEqual(self.bridge._fight_depth(groups), 8.5)
+
+    def test_depth_above_water_returns_none(self) -> None:
+        self.assertIsNone(self.bridge._fight_depth(((1.25, 2.5, 3.75),)))
+
+    def test_depth_missing_position_group_returns_none(self) -> None:
+        self.assertIsNone(self.bridge._fight_depth(((1.0, 2.0),)))
+
 
 class FightLoadSlimLineTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -214,6 +225,16 @@ class FightLoadSlimLineTests(unittest.TestCase):
         text = self.bridge._format_fight_load_payload(self.session, self._payload(-10.7))
         self.assertIn("出线 26.2米", text)
 
+    def test_slim_line_includes_depth(self) -> None:
+        gear = "5a43c383-1111-1111-1111-111111111111"
+        self.session.fight_depth_by_gear[gear] = 4.5
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertIn("深4.5米", text)
+
+    def test_slim_line_omits_depth_when_unknown(self) -> None:
+        text = self.bridge._format_fight_load_payload(self.session, self._payload(26.2))
+        self.assertNotIn("深", text)
+
     def test_handheld_gear_still_shows_fight_status(self) -> None:
         # 不挂槽位(从背包直接拿出的竿)没有竿号，但搏鱼状态不能丢：
         # 用"手持竿"前缀兜底，体力/出线照常显示。
@@ -282,6 +303,64 @@ class FightLoadRecordDistanceTests(unittest.TestCase):
         self.bridge._handle_client_frame(self.session, self._frame(26.2))
         self.bridge._handle_client_frame(self.session, self._frame(-10.7))
         self.assertAlmostEqual(self.session.fight_distance_by_gear.get(self.gear), 26.2, places=1)
+
+
+class PositionReportDepthTests(unittest.TestCase):
+    """14/7 位置上报：提取深度供搏鱼主行显示。"""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+        self.pack_arg_header = pack_arg_header
+        self.pack_guid_marker = pack_guid_marker
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.bridge._log_telemetry = lambda cat, text: None
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _report(self, y: float, sub_cmd: int | None = None) -> bytes:
+        payload = (
+            self.pack_arg_header(b"507", 1)
+            + self.pack_guid_marker(self.gear)
+            + struct.pack("<fff", 123.0, y, 456.0)
+        )
+        return build_request_envelope(
+            call_id=11,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=sub_cmd or self.session.profile.fight_step_sub_cmd,
+            payload=payload,
+        )
+
+    def test_underwater_depth_recorded(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._report(-8.5))
+        self.assertAlmostEqual(self.session.fight_depth_by_gear.get(self.gear), 8.5, places=2)
+
+    def test_above_water_depth_not_recorded(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._report(2.5))
+        self.assertIsNone(self.session.fight_depth_by_gear.get(self.gear))
+
+    def test_new_cast_clears_stale_depth(self) -> None:
+        self.session.fight_depth_by_gear[self.gear] = 8.5
+        self.bridge._handle_client_frame(
+            self.session,
+            self._report(1.0, sub_cmd=self.session.profile.cast_prepare_sub_cmd),
+        )
+        self.assertIsNone(self.session.fight_depth_by_gear.get(self.gear))
 
 
 class FightStageInitialLineTests(unittest.TestCase):

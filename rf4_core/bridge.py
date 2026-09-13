@@ -164,6 +164,7 @@ class FlowSession:
     fish_setup_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
     fight_fish_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
     fight_distance_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
+    fight_depth_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
     fishing_end_requests: Dict[int, FishingEndRequest] = field(default_factory=lambda: BoundedDict(128))
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
@@ -2449,6 +2450,9 @@ class RF4ChatBridge:
                 parts.append(f"重量={weight}")
         if stamina is not None:
             parts.append(f"体力 {stamina}%")
+        depth = session.fight_depth_by_gear.get(gear)
+        if depth is not None:
+            parts.append(f"深{self._format_float(depth)}米")
         if distance is not None:
             parts.append(f"出线 {self._format_float(distance)}米")
         if len(parts) == 1:
@@ -2691,6 +2695,18 @@ class RF4ChatBridge:
         return int(max(0, min(100, round(percent))))
 
     @staticmethod
+    def _fight_depth(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
+        # 位置上报(14/7)：首个 >=3 浮点组的中位是垂直坐标 y，水下为负，
+        # 深度 = abs(y)。水面以上(y>=0)不显示。
+        for group in groups:
+            if len(group) >= 3:
+                y = group[1]
+                if y < 0.0:
+                    return abs(y)
+                return None
+        return None
+
+    @staticmethod
     def _is_valid_distance(value: float) -> bool:
         # 出线无上限；0/负值为搏鱼起始阶段的瞬时抖动，NaN 为解析失败，应过滤。
         return not (value != value) and value > 0
@@ -2910,11 +2926,23 @@ class RF4ChatBridge:
         ):
             cast_gear = parse_fishing_gear_and_setup(envelope, session.profile, envelope.sub_cmd)
             if cast_gear and cast_gear.fishing_gear_id:
+                # 新一竿开始：清掉上一竿的深度，避免显示陈旧数值。
+                session.fight_depth_by_gear.pop(cast_gear.fishing_gear_id, None)
                 if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
                     self._log(
                         f"cast 钓组={self._short_id(cast_gear.fishing_gear_id)} "
                         f"sub={envelope.sub_cmd}"
                     )
+
+        # 位置上报(14/7)：记录钓组/鱼当前深度(y 轴，水下为负)，供搏鱼状态行显示。
+        position_report = parse_fishing_gear_and_setup(
+            envelope, session.profile, session.profile.fight_step_sub_cmd
+        )
+        if position_report and position_report.fishing_gear_id:
+            groups = self._scan_float_groups(envelope.payload, limit=8)
+            depth = self._fight_depth(groups)
+            if depth is not None:
+                session.fight_depth_by_gear[position_report.fishing_gear_id] = depth
 
         # 搏鱼拉力(14/8)：记录该钓组当前出线距离(过滤瞬时负值/超限)，供拉线动作/搏鱼关联展示。
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
@@ -3242,18 +3270,21 @@ class RF4ChatBridge:
             return ""
         # 竿号来自 slot_items 映射（11/1 完整映射 + 11/2 单槽增量更新）。
         # slot_type 经 profile.shortcut_slot_numbers 翻译成竿号；
-        # 未收录的类型不显示竿号，并记 verbose 日志便于补全映射。
+        # 未收录的类型（如 4=当前活动位）可能保存同一把竿的 GUID，必须跳过
+        # 继续找已收录槽位，不能一碰到未收录槽位就放弃——否则同一把竿会
+        # 因 dict 顺序不同被判成"手持竿"。
         for slot_type, item_guid in session.slot_items.items():
-            if item_guid == fishing_gear_id:
-                rod_number = session.profile.shortcut_slot_numbers.get(slot_type)
-                if rod_number is None:
-                    if ctx.options.rf4_verbose_logging:
-                        self._log(
-                            f"未收录槽位类型 slot_type={slot_type} "
-                            f"gear={self._short_id(fishing_gear_id)}"
-                        )
-                    return ""
-                return f"{rod_number}号杆"
+            if item_guid != fishing_gear_id:
+                continue
+            rod_number = session.profile.shortcut_slot_numbers.get(slot_type)
+            if rod_number is None:
+                if ctx.options.rf4_verbose_logging:
+                    self._log(
+                        f"未收录槽位类型 slot_type={slot_type} "
+                        f"gear={self._short_id(fishing_gear_id)}"
+                    )
+                continue
+            return f"{rod_number}号杆"
         return ""
 
     def _build_synthetic_broadcast(

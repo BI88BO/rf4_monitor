@@ -43,6 +43,30 @@ class Rc4HandoffCaptureTests(unittest.TestCase):
         observer._remember_rc4_handoff(session)
         self.assertNotIn(TOKEN, observer._rc4_handoffs)
 
+    def test_handoff_preserves_slot_items_mapping(self) -> None:
+        # 回归：切服承接必须保留槽位→钓组映射，否则重启/切服后所有竿都
+        # 反查不到竿号，搏鱼行全部回落"手持竿"。字段名必须与 FlowSession
+        # 实际字段一致（slot_items），不能沿用参考版的 shortcut_items。
+        _ctx()
+        observer = _make_observer()
+        session = PassiveSession.create("s3", observer.bridge)
+        session.protocol.token = TOKEN
+        session.protocol.auth_seen = True
+        session.protocol.uuid_seen = True
+        session.protocol.hermes_seen = True
+        session.protocol.ensure_rc4()
+        gear = "11111111-1111-1111-1111-111111111111"
+        session.protocol.slot_items[1] = gear
+        session.valid_business_frames = 3
+        session.valid_client_frames = 1
+        session.valid_server_frames = 1
+
+        observer._remember_rc4_handoff(session)
+        handoff = observer._rc4_handoffs.get(TOKEN)
+        self.assertIsNotNone(handoff)
+        assert handoff is not None
+        self.assertEqual(handoff.fishing_state.get("slot_items"), {1: gear})
+
     def test_find_auth_endpoint_accepts_x0101_prefix(self) -> None:
         # 切服新连接若带 \x01\x01 开头的 auth 包（游戏钓鱼站重连场景），
         # find_auth_endpoint 必须能识别，否则会漏掉 auth 掉进 bootstrap 探测。
