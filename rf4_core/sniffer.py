@@ -895,13 +895,19 @@ class PassiveSession:
         )
         if not pending_data:
             return 0, b""
-        resync = self._resync_gap_cipher(cipher, pending_data, gap_bytes)
+        # 缺口落在帧中间时，缓冲区里还留着该帧已送达但未解码的前半截：
+        # 这些 payload 字节游戏已经消耗了密钥流，只是本端没解出来。恢复时
+        # 会丢弃该残帧，因此跳过量必须把它们算进去，否则永远对不齐。
+        buffer = session.client_buffer if from_client else session.server_buffer
+        buffered_encrypted = max(0, len(buffer) - 13)
+        resync = self._resync_gap_cipher(
+            cipher, pending_data, gap_bytes, buffered_encrypted
+        )
         if resync is None:
             self._warn_resync_failure(direction, gap_bytes)
             return 0, b""
-        lost, fpos = resync
-        cipher.keystream(lost + fpos)
-        buffer = session.client_buffer if from_client else session.server_buffer
+        advance, fpos = resync
+        cipher.keystream(advance)
         buffer.clear()
         gap_bytes, chunk = reassembler.recover_gap(max_gap_bytes=MAX_RECOVERABLE_TCP_GAP_BYTES)
         return gap_bytes, chunk[fpos:]
@@ -929,10 +935,16 @@ class PassiveSession:
         cipher: object,
         pending_data: bytes,
         gap_bytes: int,
+        buffered_encrypted: int = 0,
     ) -> Optional[tuple[int, int]]:
         """在缺口后数据里找第一个完整帧边界，对候选密文跳过量逐一信封校验。
 
-        返回 (缺口内密文字节数, 帧边界前的残留密文字节数)，找不到可验证帧返回 None。
+        返回 (解密该帧 payload 前需推进的密钥流字节数, 帧边界偏移)。
+
+        RC4 流密码下只有业务帧 payload 消耗密钥流，明文帧头(13B)与 ACK(5B)不消耗。
+        跳过量 = 缓冲区残帧密文（缺口落在帧中间时游戏已消耗的部分）
+        + 缺口内密文字节 + 候选帧之前的密文字节；帧头必须从后者中扣除，
+        否则高估跳过量、永远校验不过——这是小缺口反复"无法重同步"的根因。
         """
         candidates: list[int] = []
         for fpos in range(len(pending_data)):
@@ -946,14 +958,34 @@ class PassiveSession:
             candidates.append(fpos)
         if not candidates:
             return None
+        raw = bytearray(pending_data)
         for fpos in candidates:
             body_len = u32(pending_data, fpos)
             payload = pending_data[fpos + 13 : fpos + 13 + body_len - 9]
-            for lost in range(gap_bytes + 1):
+            encrypted_before = fpos
+            cursor = 0
+            while cursor < fpos:
+                try:
+                    preceding = PacketObserver._try_parse_frame_at(raw, cursor)
+                except ValueError:
+                    preceding = None
+                if preceding is None or cursor + len(preceding.raw) > fpos:
+                    break
+                encrypted_before -= len(preceding.raw) - len(preceding.payload)
+                cursor += len(preceding.raw)
+            encrypted_before = max(0, encrypted_before)
+            # 缺口起点可能截断帧头：pending 开头最多 12 字节是明文帧头尾巴，
+            # 被上面按密文统计了。因此在 [-12, +gap] 范围内回补，覆盖
+            # "残帧头明文被多算" 与 "缺口内明文帧头少算" 两种情况。
+            base = buffered_encrypted + encrypted_before
+            for delta in range(-12, gap_bytes + 1):
+                advance = base + delta
+                if advance < 0:
+                    continue
                 probe = copy.deepcopy(cipher)
-                probe.keystream(lost + fpos)
+                probe.keystream(advance)
                 if parse_envelope(probe.crypt(payload)) is not None:
-                    return lost, fpos
+                    return advance, fpos
         return None
 
     def _print_once_reset(self) -> None:

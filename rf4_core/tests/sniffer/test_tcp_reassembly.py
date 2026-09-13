@@ -276,6 +276,40 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
         self.assertFalse(session.downlink_stalled)
         self.assertEqual(session.server_tcp.pending_bytes, 0)
 
+    def test_recovers_when_gap_inside_payload_with_buffered_prefix(self) -> None:
+        """回归：缺口落在帧 payload 中间时，缓冲区里已送达未解码的帧前缀密文
+        必须计入密钥流跳过量；缺口内的帧头明文不消耗密钥流。修复前这条链路
+        （真实场景：下行丢 13 字节）反复重同步失败、下行永久失步。"""
+        session = _make_ready_session()
+        received: list[bytes] = []
+        session.bridge._handle_server_frame = lambda _session, plain: received.append(plain)
+        ref = RC4Stream(session.protocol.token.encode())
+        plain1 = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        raw1 = build_frame(0, 101, ref.crypt(plain1))
+        plain2 = build_request_envelope(call_id=2, main_cmd=14, sub_cmd=4, payload=b"P" * 60)
+        raw2 = build_frame(0, 102, ref.crypt(plain2))
+        plain3 = build_request_envelope(call_id=3, main_cmd=14, sub_cmd=4, payload=b"z")
+        raw3 = build_frame(0, 103, ref.crypt(plain3))
+
+        seq = 1000
+        session.feed_tcp(from_client=False, seq=seq, payload=raw1, syn=False)
+        seq += len(raw1)
+        # 帧2 前缀（帧头13 + 40字节payload）先到且留在缓冲区；随后 13 字节
+        # payload 丢失（缺口），再接帧2剩余密文与帧3。
+        head = raw2[:53]
+        session.feed_tcp(from_client=False, seq=seq, payload=head, syn=False)
+        seq += 53
+        session.feed_tcp(
+            from_client=False, seq=seq + 13, payload=raw2[66:] + raw3, syn=False
+        )
+        session.server_tcp.gap_started_at = 0.0
+        session.feed_tcp(from_client=False, seq=0, payload=b"", syn=False)
+
+        # 帧1、帧3 到达，帧2（缺中间）被跳过，不 stall。
+        self.assertFalse(session.downlink_stalled)
+        self.assertEqual(received, [plain1, plain3])
+        self.assertEqual(session.server_tcp.pending_bytes, 0)
+
     def test_waits_for_tcp_retransmission_before_recovery(self) -> None:
         """游戏端会等数据包重新到位：缺口出现后若 TCP 重传在恢复阈值内补齐，
         帧2 必须无缝续上且不被跳过，缺口内帧内容不丢。"""

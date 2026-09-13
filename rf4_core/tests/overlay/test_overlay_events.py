@@ -57,7 +57,7 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
         )
         ov._handle_event_payload(payload)
         # 事件短句化 + 来鱼保持到下一条事件覆盖(不再 8 秒自动消失)。
-        self.assertEqual(ov.calls, [("self", "2", "鱼 来鱼", 0)])
+        self.assertEqual(ov.calls, [("self", "2", "来鱼", 0)])
 
     def test_kept_events_clear_after_three_seconds(self) -> None:
         ov = _empty_overlay()

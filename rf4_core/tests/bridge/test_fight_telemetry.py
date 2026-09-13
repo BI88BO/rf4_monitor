@@ -443,6 +443,70 @@ class CastStageLineTests(unittest.TestCase):
         self.assertEqual(self.emitted, [("fight_status", "手持竿 已抛竿")])
 
 
+class SelfEventLineTests(unittest.TestCase):
+    """自我事件文本：鱼信息缺失时不能显示 "0 克" 这类误导数值。"""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import RF4ChatBridge
+
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _event(self, phase: str, fish_key: str = "", weight_raw: int = 0) -> object:
+        from rf4_core.bridge import SyntheticChatEvent
+
+        return SyntheticChatEvent(
+            event_id=1,
+            fish_key=fish_key,
+            weight_raw=weight_raw,
+            location_id="",
+            users_count=0,
+            phase=phase,
+            gear_slot_text="3号杆",
+        )
+
+    def test_bitten_without_fish_info_omits_weight(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        text = self.bridge._format_self_event_log_line(
+            self._event(RF4ChatBridge.SELF_EVENT_PHASE_BITTEN)
+        )
+        self.assertEqual(text, "【我自己】：[3号杆] 咬钩了")
+        self.assertNotIn("0", text.replace("3号杆", ""))
+
+    def test_bitten_with_fish_info_keeps_details(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        text = self.bridge._format_self_event_log_line(
+            self._event(RF4ChatBridge.SELF_EVENT_PHASE_BITTEN, "piksha", 444)
+        )
+        self.assertIn("黑线鳕", text)
+        self.assertIn("444 克", text)
+        self.assertTrue(text.endswith("咬钩了"))
+
+    def test_kept_without_fish_info_omits_weight(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        text = self.bridge._format_self_event_log_line(
+            self._event(RF4ChatBridge.SELF_EVENT_PHASE_KEPT)
+        )
+        self.assertEqual(text, "【我自己】：[3号杆] 有鱼入护了")
+
+
 class FightStageInitialLineTests(unittest.TestCase):
     def setUp(self) -> None:
         from types import SimpleNamespace

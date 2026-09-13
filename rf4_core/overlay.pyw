@@ -413,7 +413,10 @@ class Overlay:
                 phase = "放生"
                 body = body[len("放生了"):].lstrip()
         body = body.strip()
-        if body.startswith("有"):
+        # 信息缺失的兜底句（有鱼过来了/有鱼入护了）整体去掉"有鱼"前缀。
+        if body.startswith("有鱼"):
+            body = body[2:].strip()
+        elif body.startswith("有"):
             body = body[1:].strip()
         wm = cls._BARE_WEIGHT_RE.search(body)
         name, wtxt = body.strip(), ""

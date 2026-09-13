@@ -305,6 +305,18 @@ class OverlayCompactTests(unittest.TestCase):
     def test_compact_self_event_plain_release(self) -> None:
         self.assertEqual(Overlay._compact_self_event("【我自己】：放生了"), "放生")
 
+    def test_compact_self_event_without_fish_info(self) -> None:
+        # 下行丢包只剩客户端上报时没有鱼信息：竿号保留、不显示"0g"。
+        self.assertEqual(
+            Overlay._compact_self_event("【我自己】：[3号杆] 咬钩了"), "[3号杆] 咬钩"
+        )
+        self.assertEqual(
+            Overlay._compact_self_event("【我自己】：[3号杆] 有鱼入护了"), "[3号杆] 入护"
+        )
+        self.assertEqual(
+            Overlay._compact_self_event("【我自己】：[3号杆] 有鱼过来了"), "[3号杆] 来鱼"
+        )
+
     def test_compact_self_event_fallback_keeps_original(self) -> None:
         text = "完全不是事件格式的文本"
         self.assertEqual(Overlay._compact_self_event(text), text)

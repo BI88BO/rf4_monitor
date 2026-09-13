@@ -3554,17 +3554,22 @@ class RF4ChatBridge:
 
     def _format_self_event_log_line(self, event: SyntheticChatEvent) -> str:
         fish_name = self._format_graded_fish_name(event.fish_key, event.grade_enum)
-        weight = self._format_chat_weight(event.weight_raw)
+        # 鱼信息可能缺失（如下行丢包时只看到客户端咬钩上报）：缺什么不显示什么，
+        # 不能显示 "0 克" 这种误导数值。
+        weight = self._format_chat_weight(event.weight_raw) if event.weight_raw else ""
         prefix = f"[{event.gear_slot_text}]" if event.gear_slot_text else ""
+        details = " ".join(part for part in (fish_name, weight) if part)
         if event.phase == self.SELF_EVENT_PHASE_INCOMING:
-            return f"【我自己】：{prefix} 有{fish_name} {weight} 过来了"
-        if event.phase == self.SELF_EVENT_PHASE_BITTEN:
-            return f"【我自己】：{prefix} {fish_name} {weight} 咬钩了"
-        if event.phase == self.SELF_EVENT_PHASE_ESCAPED:
-            return f"【我自己】：{prefix} {fish_name} {weight} 挣脱跑了（脱钩）"
-        if event.phase == self.SELF_EVENT_PHASE_RELEASED:
-            return f"【我自己】：{prefix} 放生了 {fish_name}" if fish_name else f"【我自己】：{prefix} 放生了"
-        return f"【我自己】：{prefix} 有{fish_name} {weight} 入护了"
+            body = f"有{details} 过来了" if details else "有鱼过来了"
+        elif event.phase == self.SELF_EVENT_PHASE_BITTEN:
+            body = f"{details} 咬钩了" if details else "咬钩了"
+        elif event.phase == self.SELF_EVENT_PHASE_ESCAPED:
+            body = f"{details} 挣脱跑了（脱钩）" if details else "挣脱跑了（脱钩）"
+        elif event.phase == self.SELF_EVENT_PHASE_RELEASED:
+            body = f"放生了 {fish_name}" if fish_name else "放生了"
+        else:
+            body = f"有{details} 入护了" if details else "有鱼入护了"
+        return f"【我自己】：{prefix} {body}"
 
     def _format_record_chat_line(self, sender_name: str, broadcast: RoomBroadcast) -> str:
         fish_name = self._format_fish_name(broadcast.fish_key or "")
