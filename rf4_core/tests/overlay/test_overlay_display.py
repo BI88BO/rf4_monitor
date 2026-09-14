@@ -192,6 +192,63 @@ class OverlayGlassDrawFullTests(unittest.TestCase):
         self.assertEqual(texts[0][1]["fill"], Overlay.CANVAS_RED)
 
 
+class OverlayRowPersistenceTests(unittest.TestCase):
+    """竿行持久化与重置：重启浮窗/会话重置后已抛竿的空闲竿不消失。"""
+
+    def test_reset_keeps_waiting_rows_and_clears_others(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows_file = Path(tmp) / "rows.json"
+            ov = object.__new__(Overlay)
+            ov._rows = {
+                "1号杆": "1号杆 已抛竿 深1.1米",
+                "2号杆": "2号杆 [达标] 鱼=鲤鲫 重量=1.047 公斤 体力 100%",
+                "3号杆": "3号杆 准备抛竿",
+            }
+            ov._telemetry_rows = {1: "商店折扣"}
+            ov._refresh_display = lambda: None
+            with mock.patch.object(overlay_mod, "ROWS_FILE", rows_file):
+                ov._reset_to_idle()
+            self.assertEqual(
+                ov._rows,
+                {"1号杆": "1号杆 已抛竿 深1.1米", "3号杆": "3号杆 准备抛竿"},
+            )
+            self.assertEqual(ov._telemetry_rows, {})
+
+    def test_rows_roundtrip_within_ttl(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows_file = Path(tmp) / "rows.json"
+            with mock.patch.object(overlay_mod, "ROWS_FILE", rows_file):
+                overlay_mod.save_rows({"1号杆": "1号杆 已抛竿 深1.1米"})
+                self.assertEqual(
+                    overlay_mod.load_rows(), {"1号杆": "1号杆 已抛竿 深1.1米"}
+                )
+
+    def test_rows_not_restored_after_ttl(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows_file = Path(tmp) / "rows.json"
+            rows_file.write_text(
+                json.dumps(
+                    {
+                        "saved_at": 0.0,
+                        "rows": {"1号杆": "1号杆 已抛竿 深1.1米"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(overlay_mod, "ROWS_FILE", rows_file):
+                self.assertEqual(overlay_mod.load_rows(), {})
+
+
 class OverlayGeometryTests(unittest.TestCase):
     def test_refresh_display_sets_size_without_position(self) -> None:
         # 回归：窗口首次映射前 winfo_x/y 返回 (0,0)，若 _refresh_display 拼上

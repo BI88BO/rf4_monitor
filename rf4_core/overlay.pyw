@@ -37,6 +37,9 @@ if getattr(sys, "frozen", False):
 CONFIG_FILE = PACKAGE_DIR / "rf4_overlay_config.json"
 
 DEFAULT_DB_PATH = PACKAGE_DIR / "rf4_overlay_events.sqlite3"
+ROWS_FILE = PACKAGE_DIR / "rf4_overlay_rows.json"
+# 重启浮窗后恢复竿行的最大间隔：太久之前的竿行不再可信（可能已收竿）。
+ROWS_RESTORE_MAX_AGE_SECONDS = 10 * 60.0
 WINDOW_WIDTH = 260
 WINDOW_MAX_WIDTH = 340
 WINDOW_HEIGHT = 42
@@ -58,6 +61,31 @@ def save_config(data):
     existing.update(data)
     try:
         CONFIG_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_rows():
+    """恢复上次退出时的竿行（限期内有效），避免重启浮窗后空闲竿从浮窗消失。"""
+    try:
+        data = json.loads(ROWS_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    saved_at = data.get("saved_at")
+    if not isinstance(saved_at, (int, float)) or time.time() - saved_at > ROWS_RESTORE_MAX_AGE_SECONDS:
+        return {}
+    rows = data.get("rows")
+    if not isinstance(rows, dict):
+        return {}
+    return {str(key): value for key, value in rows.items() if isinstance(value, str)}
+
+
+def save_rows(rows):
+    try:
+        ROWS_FILE.write_text(
+            json.dumps({"saved_at": time.time(), "rows": rows}, ensure_ascii=False),
+            encoding="utf-8",
+        )
     except OSError:
         pass
 
@@ -170,8 +198,9 @@ class Overlay:
         self.labels = load_fish_labels()
         self.visible = False
         self._drag_offset = None
-        # 按竿号分行显示：key=竿号文本, value=该竿最新状态行
-        self._rows = {}
+        # 按竿号分行显示：key=竿号文本, value=该竿最新状态行。
+        # 启动时恢复上次的竿行，否则重启浮窗后已抛竿的空闲竿会消失。
+        self._rows = load_rows()
         # 遥测信息区：多条(商店/装备等)，有序，最多保留 MAX_TELEMETRY_ROWS 条
         self._telemetry_rows = {}
         self._telemetry_seq = 0
@@ -300,6 +329,7 @@ class Overlay:
             self._rows[gear_slot] = text
         else:
             self._rows[""] = text
+        save_rows(self._rows)
         self._refresh_display()
         if clear_after > 0:
             self.root.after(clear_after, lambda: self._clear_row(gear_slot, text))
@@ -312,6 +342,7 @@ class Overlay:
                 self._rows.pop(gear_slot, None)
             else:
                 self._rows.pop("", None)
+            save_rows(self._rows)
             self._refresh_display()
 
     @staticmethod
@@ -596,9 +627,22 @@ class Overlay:
             self._anticheat_red = False
             self._refresh_display()
 
+    _WAITING_ROW_RE = re.compile(r"^(\d+号杆|手持竿) (已抛竿|准备抛竿)")
+
+    @classmethod
+    def _is_waiting_row(cls, text: str) -> bool:
+        return bool(cls._WAITING_ROW_RE.match(text or ""))
+
     def _reset_to_idle(self):
+        # 会话重置（重连/重启监控）只清理过期状态：已抛竿/准备抛竿的竿行保留，
+        # 否则空闲竿会从浮窗消失直到下次抛竿或事件（用户会遇到"竿不见了"）。
+        waiting = {
+            key: text for key, text in self._rows.items() if self._is_waiting_row(text)
+        }
         self._rows.clear()
+        self._rows.update(waiting)
         self._telemetry_rows.clear()
+        save_rows(self._rows)
         self._refresh_display()
 
     def _hide(self):
