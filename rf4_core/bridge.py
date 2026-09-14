@@ -165,6 +165,11 @@ class FlowSession:
     fight_fish_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
     fight_distance_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
     fight_depth_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
+    # 每根竿的显示阶段：waiting/incoming/bitten/fighting/result。
+    # 深度行只在 waiting（或无状态）时刷新，避免覆盖来鱼/咬钩/搏鱼/结算显示。
+    rod_phase_by_gear: Dict[str, str] = field(default_factory=lambda: BoundedDict(512))
+    # result 阶段的展示截止时间（monotonic），期间不用深度覆盖结算结果。
+    rod_result_until_by_gear: Dict[str, float] = field(default_factory=lambda: BoundedDict(512))
     fishing_end_requests: Dict[int, FishingEndRequest] = field(default_factory=lambda: BoundedDict(128))
     keep_requests: Dict[int, KeepFishRequest] = field(default_factory=lambda: BoundedDict(128))
     rpc_request_commands: Dict[int, Tuple[int, int, float]] = field(default_factory=lambda: BoundedDict(512))
@@ -237,6 +242,12 @@ class RF4ChatBridge:
     SELF_EVENT_PHASE_KEPT = "kept"
     SELF_EVENT_PHASE_ESCAPED = "escaped"
     SELF_EVENT_PHASE_RELEASED = "released"
+    # 竿行显示阶段：等待咬钩时才允许深度行刷新，其余阶段保持高优先级显示。
+    ROD_PHASE_WAITING = "waiting"
+    ROD_PHASE_FIGHTING = "fighting"
+    ROD_PHASE_RESULT = "result"
+    # 结算结果（入护/脱钩/放生）在竿行的展示时长，期间不被深度行覆盖。
+    ROD_RESULT_HOLD_SECONDS = 3.0
     TELEMETRY_CATEGORY_LABELS = {
         "fish": "钓鱼",
         "player": "人物",
@@ -2931,10 +2942,10 @@ class RF4ChatBridge:
                 # 抛竿阶段回显：搏鱼状态行显示该竿进入"准备抛竿/已抛竿"，
                 # 否则浮窗在抛竿后静默期一直停在"待机中"，看不出竿已抛出。
                 gear_slot = self._gear_slot_text(session, cast_gear.fishing_gear_id) or "手持竿"
-                stage = (
-                    "准备抛竿"
-                    if envelope.sub_cmd == session.profile.cast_prepare_sub_cmd
-                    else "已抛竿"
+                preparing = envelope.sub_cmd == session.profile.cast_prepare_sub_cmd
+                stage = "准备抛竿" if preparing else "已抛竿"
+                session.rod_phase_by_gear[cast_gear.fishing_gear_id] = (
+                    "preparing" if preparing else self.ROD_PHASE_WAITING
                 )
                 self._log_telemetry("fight_status", f"{gear_slot} {stage}")
                 if self._room_protocol_details_enabled() or ctx.options.rf4_verbose_logging:
@@ -2954,9 +2965,15 @@ class RF4ChatBridge:
                 gear_id = position_report.fishing_gear_id
                 previous = session.fight_depth_by_gear.get(gear_id)
                 session.fight_depth_by_gear[gear_id] = depth
-                # 抛竿后等待咬钩期间同步回显深度（搏鱼期游戏停发位置上报，
-                # 不会盖掉搏鱼主行）。深度保留 1 位小数，跳变才发新行避免刷屏。
-                if previous is None or f"{previous:.1f}" != f"{depth:.1f}":
+                # 抛竿后等待咬钩期间同步回显深度。来鱼/咬钩/搏鱼/结算阶段有
+                # 更高优先级的显示，不能被深度覆盖（否则"来鱼"一闪就变回
+                # 已抛竿，看不出是脱钩还是咬钩）。结算结果超过展示时长后恢复。
+                phase = session.rod_phase_by_gear.get(gear_id)
+                if phase == self.ROD_PHASE_RESULT and time.monotonic() >= session.rod_result_until_by_gear.get(gear_id, 0.0):
+                    phase = None
+                if phase in (None, "", self.ROD_PHASE_WAITING) and (
+                    previous is None or f"{previous:.1f}" != f"{depth:.1f}"
+                ):
                     gear_slot = self._gear_slot_text(session, gear_id) or "手持竿"
                     self._log_telemetry(
                         "fight_status", f"{gear_slot} 已抛竿 深{depth:.1f}米"
@@ -2965,6 +2982,7 @@ class RF4ChatBridge:
         # 搏鱼拉力(14/8)：记录该钓组当前出线距离(过滤瞬时负值/超限)，供拉线动作/搏鱼关联展示。
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
         if fight_load and fight_load.fishing_gear_id:
+            session.rod_phase_by_gear[fight_load.fishing_gear_id] = self.ROD_PHASE_FIGHTING
             groups = self._scan_float_groups(envelope.payload, limit=8)
             distance = self._sanitize_distance(
                 self._fight_distance(groups),
@@ -3417,8 +3435,26 @@ class RF4ChatBridge:
         except Exception:
             pass
 
+    def _set_rod_phase_for_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> None:
+        """记录该竿当前显示阶段：来鱼/咬钩/搏鱼/结算期间，深度行不得覆盖。"""
+        gear = synthetic.fishing_gear_id
+        if not gear:
+            return
+        if synthetic.phase == self.SELF_EVENT_PHASE_INCOMING:
+            session.rod_phase_by_gear[gear] = self.SELF_EVENT_PHASE_INCOMING
+            return
+        if synthetic.phase == self.SELF_EVENT_PHASE_BITTEN:
+            session.rod_phase_by_gear[gear] = self.SELF_EVENT_PHASE_BITTEN
+            return
+        # 入护/脱钩/放生：结算结果展示期内保持，超时后深度行可恢复。
+        session.rod_phase_by_gear[gear] = self.ROD_PHASE_RESULT
+        session.rod_result_until_by_gear[gear] = (
+            time.monotonic() + self.ROD_RESULT_HOLD_SECONDS
+        )
+
     def _emit_self_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
-        # 日志始终全量输出；只有浮窗广播受勾选开关控制。
+        self._set_rod_phase_for_event(session, synthetic)
+        # 日志始终全量输出；只有个播广播受显示开关控制。
         self._write_emit_probe(
             f"{synthetic.phase}|{synthetic.fish_key}|bridge={self.__class__.__module__}.{self.__class__.__qualname__}"
         )

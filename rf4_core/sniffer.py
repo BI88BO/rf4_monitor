@@ -2529,6 +2529,7 @@ class PacketObserver:
                     "fight_fish_by_gear",
                     "fight_distance_by_gear",
                     "fight_depth_by_gear",
+                    "rod_phase_by_gear",
                     "slot_items",
                     "slot_request_calls",
                 )

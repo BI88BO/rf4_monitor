@@ -298,6 +298,7 @@ class FightLoadRecordDistanceTests(unittest.TestCase):
     def test_valid_distance_recorded(self) -> None:
         self.bridge._handle_client_frame(self.session, self._frame(26.2))
         self.assertAlmostEqual(self.session.fight_distance_by_gear.get(self.gear), 26.2, places=1)
+        self.assertEqual(self.session.rod_phase_by_gear.get(self.gear), "fighting")
 
     def test_glitch_keeps_last_valid(self) -> None:
         self.bridge._handle_client_frame(self.session, self._frame(26.2))
@@ -385,6 +386,27 @@ class PositionReportDepthTests(unittest.TestCase):
             ],
         )
 
+    def test_depth_line_suppressed_after_incoming(self) -> None:
+        # 来鱼/咬钩期间深度行不得覆盖高优先级显示（否则看不出是脱钩还是咬钩）。
+        self.session.slot_items[3] = self.gear
+        self.session.rod_phase_by_gear[self.gear] = "incoming"
+        self.bridge._handle_client_frame(self.session, self._report(-1.5))
+        self.assertEqual(self.emitted, [])
+
+    def test_depth_line_suppressed_during_result_hold(self) -> None:
+        self.session.slot_items[3] = self.gear
+        self.session.rod_phase_by_gear[self.gear] = "result"
+        self.session.rod_result_until_by_gear[self.gear] = 10**12
+        self.bridge._handle_client_frame(self.session, self._report(-1.5))
+        self.assertEqual(self.emitted, [])
+
+    def test_depth_line_resumes_after_result_hold_expires(self) -> None:
+        self.session.slot_items[3] = self.gear
+        self.session.rod_phase_by_gear[self.gear] = "result"
+        self.session.rod_result_until_by_gear[self.gear] = 0.0
+        self.bridge._handle_client_frame(self.session, self._report(-1.5))
+        self.assertEqual(self.emitted, [("fight_status", "3号杆 已抛竿 深1.5米")])
+
 
 class CastStageLineTests(unittest.TestCase):
     """抛竿阶段回显：浮窗搏鱼状态行显示"准备抛竿/已抛竿"，不再停留待机。"""
@@ -435,6 +457,7 @@ class CastStageLineTests(unittest.TestCase):
             self.session, self._cast(self.session.profile.cast_sub_cmd)
         )
         self.assertEqual(self.emitted, [("fight_status", "2号杆 已抛竿")])
+        self.assertEqual(self.session.rod_phase_by_gear.get(self.gear), "waiting")
 
     def test_handheld_gear_falls_back_to_label(self) -> None:
         self.bridge._handle_client_frame(
@@ -505,6 +528,74 @@ class SelfEventLineTests(unittest.TestCase):
             self._event(RF4ChatBridge.SELF_EVENT_PHASE_KEPT)
         )
         self.assertEqual(text, "【我自己】：[3号杆] 有鱼入护了")
+
+
+class RodPhaseTests(unittest.TestCase):
+    """竿行显示阶段：来鱼/咬钩/搏鱼/结算期间深度行不得覆盖。"""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def _event(self, phase: str, gear: str | None = None) -> object:
+        from rf4_core.bridge import SyntheticChatEvent
+
+        return SyntheticChatEvent(
+            event_id=1,
+            fish_key="",
+            weight_raw=0,
+            location_id="",
+            users_count=0,
+            phase=phase,
+            fishing_gear_id=self.gear if gear is None else gear,
+        )
+
+    def test_incoming_and_bitten_phases_recorded(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_INCOMING)
+        )
+        self.assertEqual(self.session.rod_phase_by_gear[self.gear], "incoming")
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_BITTEN)
+        )
+        self.assertEqual(self.session.rod_phase_by_gear[self.gear], "bitten")
+
+    def test_result_phase_sets_hold_deadline(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_KEPT)
+        )
+        self.assertEqual(self.session.rod_phase_by_gear[self.gear], "result")
+        self.assertGreater(self.session.rod_result_until_by_gear[self.gear], 0.0)
+
+    def test_event_without_gear_is_ignored(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_INCOMING, gear="")
+        )
+        self.assertEqual(len(self.session.rod_phase_by_gear), 0)
 
 
 class FightStageInitialLineTests(unittest.TestCase):
