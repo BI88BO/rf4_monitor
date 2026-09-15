@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import struct
 import unittest
+from unittest import mock
 
 from rf4_core.bridge import FlowSession, RF4ChatBridge
 from rf4_core.protocol import (
@@ -596,6 +597,58 @@ class RodPhaseTests(unittest.TestCase):
             self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_INCOMING, gear="")
         )
         self.assertEqual(len(self.session.rod_phase_by_gear), 0)
+
+
+class SessionResetRowTests(unittest.TestCase):
+    """会话开始补发等待竿行 / 会话结束清空通知（切服不丢行、小退不残留）。"""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+
+        from rf4_core import bridge as bridge_mod
+        from rf4_core.bridge import FlowSession, RF4ChatBridge
+
+        self.gear = "5a43c383-1111-1111-1111-111111111111"
+        options = SimpleNamespace(
+            rf4_verbose_logging=False,
+            rf4_log_telemetry=True,
+            rf4_telemetry_categories="all",
+        )
+        self.prev_ctx = bridge_mod.ctx
+        bridge_mod.ctx = SimpleNamespace(options=options)
+        self.bridge = RF4ChatBridge()
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.session.slot_items[3] = self.gear
+        self.emitted: list[tuple[str, str]] = []
+        self.bridge._log_telemetry = lambda cat, text: self.emitted.append((cat, text))
+
+    def tearDown(self) -> None:
+        import rf4_core.bridge as bridge_mod
+
+        bridge_mod.ctx = self.prev_ctx
+
+    def test_reset_reemits_waiting_rod_rows(self) -> None:
+        self.session.rod_phase_by_gear[self.gear] = "waiting"
+        self.session.fight_depth_by_gear[self.gear] = 1.53
+        with mock.patch.object(self.bridge, "_broadcast_generic_event") as reset_event:
+            self.bridge.broadcast_reset(self.session)
+        reset_event.assert_called_once_with("reset", "")
+        self.assertEqual(self.emitted, [("fight_status", "3号杆 已抛竿 深1.5米")])
+
+    def test_reset_skips_non_waiting_rods(self) -> None:
+        self.session.rod_phase_by_gear[self.gear] = "fighting"
+        self.session.fight_depth_by_gear[self.gear] = 1.53
+        with mock.patch.object(self.bridge, "_broadcast_generic_event"):
+            self.bridge.broadcast_reset(self.session)
+        self.assertEqual(self.emitted, [])
+
+    def test_session_end_writes_clear_event(self) -> None:
+        with mock.patch.object(self.bridge, "_write_overlay_event") as write:
+            self.bridge.broadcast_session_end()
+        write.assert_called_once()
+        event_name, payload = write.call_args[0][0], write.call_args[0][1]
+        self.assertEqual(event_name, "session_end")
+        self.assertIn("session_end", payload)
 
 
 class FightStageInitialLineTests(unittest.TestCase):

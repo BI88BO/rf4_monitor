@@ -3523,14 +3523,40 @@ class RF4ChatBridge:
         self._write_overlay_event(event_name, payload)
         self._log(f"[广播]已写入 {event_name} -> {self._overlay_db_path().name}")
 
-    def broadcast_reset(self) -> None:
-        """Broadcast a session-start reset so the overlay clears stale rows.
+    def _emit_waiting_rod_rows(self, session: FlowSession) -> None:
+        """会话开始后补发仍在等待咬钩的竿行（切服承接的竿不因 reset 消失）。"""
+        for gear, phase in list(session.rod_phase_by_gear.items()):
+            if phase != self.ROD_PHASE_WAITING:
+                continue
+            slot = self._gear_slot_text(session, gear)
+            if not slot:
+                continue
+            depth = session.fight_depth_by_gear.get(gear)
+            text = f"{slot} 已抛竿"
+            if isinstance(depth, (int, float)):
+                text += f" 深{depth:.1f}米"
+            self._log_telemetry("fight_status", text)
 
-        Called once per new realtime handshake; the overlay responds by
-        dropping every gear/telemetry row so old fishing state does not
-        survive a reconnect (小退/重连).
+    def broadcast_reset(self, session: Optional[FlowSession] = None) -> None:
+        """会话开始：浮窗清掉过期状态，并恢复仍在等待咬钩的竿行。
+
+        切服/重连承接时 handoff 状态里带着各竿阶段与深度，重发后空闲竿不会
+        从浮窗消失；全新登录（无承接状态）则没有可恢复的竿行。
         """
         self._broadcast_generic_event("reset", "")
+        if session is not None:
+            self._emit_waiting_rod_rows(session)
+
+    def broadcast_session_end(self) -> None:
+        """会话结束（小退/断连）：连等待中的竿行一起清空，避免残留旧状态。"""
+        self._write_overlay_event(
+            "session_end",
+            json.dumps(
+                {"event": "session_end", "text": ""},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
 
     def _broadcast_generic_event(self, event_name: str, text: str) -> None:
         """广播其他事件(频道鱼获/公共聊天等)到浮窗，受显示设置勾选控制。"""

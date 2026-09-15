@@ -633,12 +633,19 @@ class Overlay:
     def _is_waiting_row(cls, text: str) -> bool:
         return bool(cls._WAITING_ROW_RE.match(text or ""))
 
-    def _reset_to_idle(self):
-        # 会话重置（重连/重启监控）只清理过期状态：已抛竿/准备抛竿的竿行保留，
-        # 否则空闲竿会从浮窗消失直到下次抛竿或事件（用户会遇到"竿不见了"）。
-        waiting = {
-            key: text for key, text in self._rows.items() if self._is_waiting_row(text)
-        }
+    def _reset_to_idle(self, preserve_waiting: bool = True):
+        # 会话重置（重连/切服/重启监控）只清理过期状态：已抛竿/准备抛竿的竿行
+        # 保留，否则空闲竿会从浮窗消失直到下次抛竿或事件（用户会遇到"竿不见了"）。
+        # 会话结束（小退/断连）时 preserve_waiting=False，连等待行一起清空。
+        waiting = (
+            {
+                key: text
+                for key, text in self._rows.items()
+                if self._is_waiting_row(text)
+            }
+            if preserve_waiting
+            else {}
+        )
         self._rows.clear()
         self._rows.update(waiting)
         self._telemetry_rows.clear()
@@ -798,7 +805,11 @@ class Overlay:
         else:
             clear_after = 0
         if name == "reset":
-            self._reset_to_idle()
+            # 会话开始（含切服承接）：保留已抛竿的竿行，由引擎补发确认。
+            self._reset_to_idle(preserve_waiting=True)
+        elif name == "session_end":
+            # 会话结束（小退/断连）：连等待中的竿行一起清空。
+            self._reset_to_idle(preserve_waiting=False)
         elif name in ("fish_incoming", "fish_bitten", "fish_kept", "fish_escaped", "fish_released"):
             self._show_self_event(gear_slot, self._compact_self_event(text), clear_after)
         elif name in ("fish_catch", "chat"):

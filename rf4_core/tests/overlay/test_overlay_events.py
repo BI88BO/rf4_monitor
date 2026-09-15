@@ -30,8 +30,8 @@ def _empty_overlay() -> Overlay:
     def record_anticheat(text: str) -> None:
         calls.append(("anticheat", text))
 
-    def record_reset() -> None:
-        calls.append(("reset",))
+    def record_reset(preserve_waiting: bool = True) -> None:
+        calls.append(("reset", preserve_waiting))
 
     def record_show(gear_slot: str = "", text: str = "") -> None:
         calls.append(("self", gear_slot, text, 0))
@@ -77,7 +77,13 @@ class OverlayDatagramRoutingTests(unittest.TestCase):
     def test_reset_routes_to_reset_to_idle(self) -> None:
         ov = _empty_overlay()
         ov._handle_event_payload('{"event": "reset", "text": ""}')
-        self.assertEqual(ov.calls, [("reset",)])
+        self.assertEqual(ov.calls, [("reset", True)])
+
+    def test_session_end_clears_waiting_rows_too(self) -> None:
+        # 小退/断连：会话结束事件必须连等待咬钩的竿行一起清空。
+        ov = _empty_overlay()
+        ov._handle_event_payload('{"event": "session_end", "text": ""}')
+        self.assertEqual(ov.calls, [("reset", False)])
 
     def test_anticheat_routes_to_show_anticheat(self) -> None:
         ov = _empty_overlay()

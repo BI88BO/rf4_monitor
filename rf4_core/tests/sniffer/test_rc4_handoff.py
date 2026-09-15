@@ -57,6 +57,8 @@ class Rc4HandoffCaptureTests(unittest.TestCase):
         session.protocol.ensure_rc4()
         gear = "11111111-1111-1111-1111-111111111111"
         session.protocol.slot_items[1] = gear
+        session.protocol.rod_phase_by_gear[gear] = "waiting"
+        session.protocol.fight_depth_by_gear[gear] = 1.53
         session.valid_business_frames = 3
         session.valid_client_frames = 1
         session.valid_server_frames = 1
@@ -66,6 +68,9 @@ class Rc4HandoffCaptureTests(unittest.TestCase):
         self.assertIsNotNone(handoff)
         assert handoff is not None
         self.assertEqual(handoff.fishing_state.get("slot_items"), {1: gear})
+        # 切服承接也要带竿阶段与深度：新会话 reset 后才能补发"已抛竿"行。
+        self.assertEqual(handoff.fishing_state.get("rod_phase_by_gear"), {gear: "waiting"})
+        self.assertEqual(handoff.fishing_state.get("fight_depth_by_gear"), {gear: 1.53})
 
     def test_find_auth_endpoint_accepts_x0101_prefix(self) -> None:
         # 切服新连接若带 \x01\x01 开头的 auth 包（游戏钓鱼站重连场景），

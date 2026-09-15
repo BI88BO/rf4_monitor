@@ -1160,7 +1160,7 @@ class PassiveSession:
             return
         seen.add("overlay-reset")
         try:
-            self.bridge.broadcast_reset()
+            self.bridge.broadcast_reset(self.protocol)
         except Exception:
             pass
 
@@ -2422,6 +2422,12 @@ class PacketObserver:
         if flags is not None and from_client is not None:
             close_detail = f" | {self._describe_tcp_close(flags, from_client)}"
         _print_line("session", f"realtime 连接已关闭{close_detail} | 会话={session.session_id}")
+        # 会话结束（小退/断连）：通知浮窗清空（含等待咬钩的竿行），避免残留旧状态；
+        # 若是切服/重连，新会话开始时会用承接状态把等待中的竿行补发回来。
+        try:
+            self.bridge.broadcast_session_end()
+        except Exception:
+            pass
 
     def _expire_candidates(self) -> None:
         now = time.monotonic()
