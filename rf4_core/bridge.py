@@ -251,6 +251,7 @@ class RF4ChatBridge:
     ROD_PHASE_WAITING = "waiting"
     ROD_PHASE_FIGHTING = "fighting"
     ROD_PHASE_RESULT = "result"
+    ROD_PHASE_ENDED = "ended"
     # 结算结果（入护/脱钩/放生）在竿行的展示时长，期间不被深度行覆盖。
     ROD_RESULT_HOLD_SECONDS = 3.0
     TELEMETRY_CATEGORY_LABELS = {
@@ -2933,6 +2934,13 @@ class RF4ChatBridge:
                     fish_setup_id=meta.fish_setup_id,
                 )
             session.fishing_end_requests[fishing_end_request.call_id] = fishing_end_request
+            # 收竿回显：14/4 代表竿已离开水面（提竿结算或空竿收回），
+            # 不处理的话浮窗会一直停在"已抛竿 深X.X米"。
+            self._mark_rod_retrieved(
+                session,
+                fishing_end_request.fishing_gear_id
+                or (meta.fishing_gear_id if meta else None),
+            )
             return plain_body, []
 
         # 记录抛竿动作：用钓组ID反查快捷键槽位，便于后续显示竿号。
@@ -3527,6 +3535,21 @@ class RF4ChatBridge:
         )
         self._write_overlay_event(event_name, payload)
         self._log(f"[广播]已写入 {event_name} -> {self._overlay_db_path().name}")
+
+    def _mark_rod_retrieved(
+        self,
+        session: FlowSession,
+        gear_id: Optional[str],
+    ) -> None:
+        """收竿（14/4）后清掉等待阶段：浮窗该竿显示"已收竿"而不是"已抛竿"。"""
+        if not gear_id:
+            return
+        session.rod_phase_by_gear[gear_id] = self.ROD_PHASE_ENDED
+        session.fight_depth_by_gear.pop(gear_id, None)
+        session.fight_distance_by_gear.pop(gear_id, None)
+        session.rod_result_until_by_gear.pop(gear_id, None)
+        gear_slot = self._gear_slot_text(session, gear_id) or "手持竿"
+        self._log_telemetry("fight_status", f"{gear_slot} 已收竿")
 
     def _emit_waiting_rod_rows(self, session: FlowSession) -> None:
         """会话开始后补发仍在等待咬钩的竿行（切服承接的竿不因 reset 消失）。"""

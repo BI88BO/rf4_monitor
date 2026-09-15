@@ -476,6 +476,48 @@ class CastStageLineTests(unittest.TestCase):
         )
         self.assertEqual(self.emitted, [("fight_status", "手持竿 已抛竿")])
 
+    def _retrieve(self, call_id: int = 21) -> bytes:
+        payload = pack_arg_header(b"507", 1) + pack_guid_marker(self.gear)
+        return build_request_envelope(
+            call_id=call_id,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=self.session.profile.fishing_end_sub_cmd,
+            payload=payload,
+        )
+
+    def test_retrieve_emits_reeled_line(self) -> None:
+        # 收竿(14/4)后浮窗该竿不能继续显示"已抛竿"。
+        self.session.slot_items[2] = self.gear
+        self.bridge._handle_client_frame(
+            self.session, self._cast(self.session.profile.cast_sub_cmd)
+        )
+        self.emitted.clear()
+        self.bridge._handle_client_frame(self.session, self._retrieve())
+        self.assertEqual(self.emitted, [("fight_status", "2号杆 已收竿")])
+        self.assertEqual(self.session.rod_phase_by_gear.get(self.gear), "ended")
+
+    def test_retrieve_stops_waiting_depth_line(self) -> None:
+        # 收竿后的位置上报不能把行刷回"已抛竿 深X.X米"。
+        self.session.slot_items[2] = self.gear
+        self.bridge._handle_client_frame(
+            self.session, self._cast(self.session.profile.cast_sub_cmd)
+        )
+        self.bridge._handle_client_frame(self.session, self._retrieve())
+        self.emitted.clear()
+        report = (
+            pack_arg_header(b"507", 1)
+            + pack_guid_marker(self.gear)
+            + struct.pack("<fff", 123.0, -1.5, 456.0)
+        )
+        envelope = build_request_envelope(
+            call_id=22,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=self.session.profile.fight_step_sub_cmd,
+            payload=report,
+        )
+        self.bridge._handle_client_frame(self.session, envelope)
+        self.assertEqual(self.emitted, [])
+
 
 class SelfEventLineTests(unittest.TestCase):
     """自我事件文本：鱼信息缺失时不能显示 "0 克" 这类误导数值。"""
