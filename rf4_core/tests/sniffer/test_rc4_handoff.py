@@ -1,6 +1,8 @@
 """rf4_core.sniffer：RC4 交接捕获与 bootstrap 恢复测试。"""
 from __future__ import annotations
 
+import struct
+import time
 import unittest
 
 from rf4_core.protocol import (
@@ -9,7 +11,7 @@ from rf4_core.protocol import (
     build_frame,
     build_request_envelope,
 )
-from rf4_core.sniffer import DiscoveryCandidate, PassiveSession
+from rf4_core.sniffer import DiscoveryCandidate, PassiveSession, Rc4Handoff
 
 from rf4_core.tests.sniffer.helpers import TOKEN, _ctx, _make_observer
 
@@ -178,3 +180,58 @@ class HandoffBootstrapTests(unittest.TestCase):
             seq=9001, payload=encrypted, flags=0x18,
         )
         self.assertNotIn(new_key, observer._auto_sessions)
+
+
+class SilentReconnectPromotionTests(unittest.TestCase):
+    """静默重连承接：无旧游标时用新鲜 token 流兜底，且剥离 auth 字节。"""
+
+    def _promote(self) -> object:
+        _ctx()
+        observer = _make_observer()
+        # 手头没有旧游标（旧会话该方向从未验证成功）：承接时必须兜底初始化，
+        # 否则握手完成后 _decode_frames 抛 "RC4 状态尚未初始化" 判死会话。
+        observer._rc4_handoffs[TOKEN] = Rc4Handoff(
+            token=TOKEN,
+            client_read_rc4=None,
+            server_read_rc4=None,
+            saved_at=time.monotonic(),
+        )
+        client = ("192.168.2.8", 34000)
+        server = ("91.132.228.133", 9568)
+        token_bytes = TOKEN.encode()
+        auth = b"\x01\x01" + struct.pack("<I", len(token_bytes)) + token_bytes
+        ref = RC4Stream(token_bytes)
+        plain = build_request_envelope(call_id=1, main_cmd=14, sub_cmd=4, payload=b"x")
+        frame = build_frame(0, 800, ref.crypt(plain))
+
+        observer._handle_auto_packet(
+            src=client[0], sport=client[1], dst=server[0], dport=server[1],
+            seq=8000, payload=b"", flags=0x02,
+        )
+        # 服务器先来一个无 payload 的 ACK：server_data 非空但没有业务帧可校验，
+        # 旧游标为 None 时 _select_reconnect_cipher 返回 None（崩溃场景）。
+        observer._handle_auto_packet(
+            src=server[0], sport=server[1], dst=client[0], dport=client[1],
+            seq=9000, payload=build_ack_frame(1), flags=0x18,
+        )
+        # 客户端 auth variant 1 + 一个业务帧（新鲜 token 流加密）。
+        observer._handle_auto_packet(
+            src=client[0], sport=client[1], dst=server[0], dport=server[1],
+            seq=8001, payload=auth + frame, flags=0x18,
+        )
+        return observer, client, server, frame
+
+    def test_promotion_survives_without_saved_cursor(self) -> None:
+        observer, client, server, _frame = self._promote()
+        key = observer._flow_key(client, server)
+        self.assertIn(key, observer._auto_sessions)
+        session = observer._auto_sessions[key][0]
+        self.assertIsNotNone(session.protocol.client_read_rc4)
+        self.assertIsNotNone(session.protocol.server_read_rc4)
+
+    def test_promotion_strips_auth_bytes(self) -> None:
+        observer, client, server, frame = self._promote()
+        key = observer._flow_key(client, server)
+        session = observer._auto_sessions[key][0]
+        # auth 字节被剥离：客户端缓冲里只剩业务帧（不是 auth 头 + 帧）。
+        self.assertEqual(bytes(session.protocol.client_buffer), frame)

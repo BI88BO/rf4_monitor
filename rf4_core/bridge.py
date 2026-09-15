@@ -195,11 +195,16 @@ class FlowSession:
     def ensure_rc4(self) -> None:
         if not self.token:
             raise ValueError("cannot initialize RC4 without token")
+        key = self.token.encode("utf-8")
+        # 逐个补齐：承接静默重连时可能只有一个方向有旧游标，另一个方向需要
+        # 用新鲜 token 流兜底，不能因为某个方向已存在就跳过缺失方向。
         if self.client_read_rc4 is None:
-            key = self.token.encode("utf-8")
             self.client_read_rc4 = RC4Stream(key)
+        if self.client_write_rc4 is None:
             self.client_write_rc4 = RC4Stream(key)
+        if self.server_read_rc4 is None:
             self.server_read_rc4 = RC4Stream(key)
+        if self.server_write_rc4 is None:
             self.server_write_rc4 = RC4Stream(key)
 
     def build_client_forward_frame(self, frame_type: int, wire_id: int, plain_body: bytes) -> bytes:

@@ -2445,6 +2445,13 @@ class PacketObserver:
                 )
                 + f" | 会话={session_id}",
                 )
+        # 承接时某一方向可能没有可用旧游标（旧会话该方向从未验证成功）：
+        # 用新鲜 token 流兜底初始化，避免握手完成后 _decode_frames 因
+        # RC4 未初始化直接判死会话；偏移不准由解密重同步自愈。
+        if session.reused_handoff_rc4:
+            if session.protocol.token is None and handoff is not None:
+                session.protocol.token = handoff.token
+            session.protocol.ensure_rc4()
         session.client_tcp = candidate.streams.setdefault(client_endpoint, TcpStreamReassembler())
         session.server_tcp = candidate.streams.setdefault(server_endpoint, TcpStreamReassembler())
         # 自动识别已重组成完整握手，只有 TCP 序号游标属于新会话；复制 discovery
@@ -2470,7 +2477,7 @@ class PacketObserver:
         # 保存 token 到磁盘缓存，供后续无 auth 切服/重启后重建 RC4 使用。
         auth_parsed = core.try_parse_auth_packet(client_data)
         if auth_parsed is not None:
-            auth_token = auth_parsed[0]
+            auth_token, auth_consumed = auth_parsed
             # auth variant 1（01 01）是静默重连：token 相同但流位置可能重排，
             # 下行解不开时按 token 初始流搜索偏移。
             if len(client_data) >= 2 and client_data[1] == 0x01:
@@ -2481,6 +2488,10 @@ class PacketObserver:
                     f"已保存本地 token 缓存 | token={core.mask_secret(auth_token)}"
                     f" | 服务器={server_endpoint[0]}:{server_endpoint[1]}",
                 )
+            if session.reused_handoff_rc4:
+                # 承接路径 auth_seen 已置位，_process_client_bytes 不会再消费
+                # auth 字节；不剥离会把 auth 头当成帧长、卡死客户端缓冲。
+                client_data = client_data[auth_consumed:]
         try:
             if server_data:
                 session._process_server_bytes(server_data)
