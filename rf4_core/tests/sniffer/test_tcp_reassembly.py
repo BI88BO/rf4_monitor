@@ -415,6 +415,34 @@ class DecryptOffsetResyncTests(unittest.TestCase):
             PassiveSession._try_decrypt_resync = original
         self.assertFalse(called["resync"])
 
+    def test_wide_marker_resync_finds_far_stream_offset(self) -> None:
+        # 晚启动监控错过登录后的全部密钥流消耗：静默重连延续旧流，偏移可能
+        # 远超有限搜索范围，宽范围标记扫描要能找到（模拟已消耗 300KB）。
+        from rf4_core.tests.sniffer.helpers import TOKEN
+
+        _ctx()
+        session = _make_ready_session()
+        session.reused_handoff_rc4 = True
+        received: list[bytes] = []
+        session.bridge._handle_server_frame = lambda _s, plain: received.append(plain)
+        ref = RC4Stream(TOKEN.encode())
+        ref.keystream(300_000)
+        plains = [
+            build_request_envelope(call_id=i, main_cmd=14, sub_cmd=4, payload=b"x" * 20)
+            for i in range(5)
+        ]
+        frames = [
+            build_frame(0, 700 + i, ref.crypt(plain))
+            for i, plain in enumerate(plains)
+        ]
+        session.protocol.server_buffer.extend(b"".join(frames))
+
+        session._decode_frames(from_client=False)
+
+        valid = [plain for plain in received if parse_envelope(plain) is not None]
+        self.assertEqual(valid, plains)
+        self.assertEqual(session.invalid_server_streak, 0)
+
 
 class ResyncWarnThrottleTests(unittest.TestCase):
     def test_resync_failure_warning_throttled_per_direction(self) -> None:

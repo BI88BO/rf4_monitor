@@ -74,6 +74,9 @@ TCP_GAP_RESYNC_TIME_BUDGET_SECONDS = 0.05
 DECRYPT_RESYNC_STREAK = 4
 DECRYPT_RESYNC_MAX_BYTES = 64 * 1024
 DECRYPT_RESYNC_SCAN_BUDGET = 65536
+# 有限搜索够不到时的宽范围标记扫描范围与时间预算（晚启动+静默重连延续旧流）。
+WIDE_RESYNC_SKIP_BYTES = 4 * 1024 * 1024
+WIDE_RESYNC_TIME_BUDGET_SECONDS = 3.0
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
 TCP_GAP_STALL_SECONDS = 45.0
@@ -1415,6 +1418,108 @@ class PassiveSession:
             )
             self._decode_frames(from_client=from_client)
             return True
+        # 有限搜索够不到（如晚启动监控 + 游戏静默重连延续旧流，位置可能很远）：
+        # 宽范围标记扫描兜底。
+        if self._try_wide_marker_resync(from_client=from_client):
+            buffer.clear()
+            buffer.extend(data)
+            self._decode_frames(from_client=from_client)
+            return True
+        return False
+
+    def _try_wide_marker_resync(self, *, from_client: bool) -> bool:
+        """宽范围标记扫描：用长密钥流 + 信封首字节预筛找正确 RC4 位置。
+
+        静默重连的隧道可能离新旧游标都很远（晚启动监控错过登录后的全部
+        密钥流消耗）。生成一段长密钥流，对每个候选帧按 0x01 标记预筛，
+        命中后校验完整帧链再提交游标。
+        """
+        session = self.protocol
+        direction = "客户端上行" if from_client else "服务器下行"
+        invalid = self.invalid_frame_buffers.get(direction)
+        if not invalid:
+            return False
+        try:
+            frames = core.take_complete_frames(bytearray(invalid))
+        except (ValueError, IndexError):
+            return False
+        if not frames:
+            return False
+        deadline = time.monotonic() + WIDE_RESYNC_TIME_BUDGET_SECONDS
+        limit = WIDE_RESYNC_SKIP_BYTES
+        prefix_lengths = [0]
+        total_pre = 0
+        for frame in frames[:-1]:
+            total_pre += len(frame.payload)
+            prefix_lengths.append(total_pre)
+        anchors: list[tuple[str, object]] = []
+        if session.token:
+            anchors.append(("token", RC4Stream(session.token.encode("utf-8"))))
+        saved = self.invalid_frame_ciphers.get(direction)
+        if saved is None:
+            saved = (
+                session.last_valid_client_rc4
+                if from_client
+                else session.last_valid_server_rc4
+            )
+        if saved is not None:
+            anchors.append(("旧游标", saved.clone()))
+        seen_states: set[bytes] = set()
+        for label, anchor in anchors:
+            state_probe = anchor.clone().keystream(16)
+            if state_probe in seen_states:
+                continue
+            seen_states.add(state_probe)
+            if time.monotonic() >= deadline:
+                break
+            ks = anchor.clone().keystream(
+                limit + total_pre + CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES + 8
+            )
+            for index, candidate in enumerate(frames):
+                if time.monotonic() >= deadline:
+                    return False
+                payload = candidate.payload
+                prefix_len = min(
+                    CACHED_TOKEN_RESYNC_ENVELOPE_PREFIX_BYTES, len(payload)
+                )
+                pre = prefix_lengths[index]
+                for pos in range(pre, pre + limit + 1):
+                    if pos + prefix_len > len(ks):
+                        break
+                    if payload[0] ^ ks[pos] != 0x01:
+                        continue
+                    plain_prefix = bytes(
+                        payload[i] ^ ks[pos + i] for i in range(prefix_len)
+                    )
+                    if parse_envelope(plain_prefix) is None:
+                        continue
+                    # 命中后校验后续帧链：只有真正对齐才能连续解出信封。
+                    # 注意用 clone 校验，提交的必须是"帧起点位置"的 cipher，
+                    # 否则会把已推进过帧的游标提交、重解码再次失败形成死循环。
+                    start_cipher = anchor.clone()
+                    start_cipher.keystream(pos)
+                    probe = start_cipher.clone()
+                    aligned = True
+                    for following in frames[index:]:
+                        if parse_envelope(probe.crypt(following.payload)) is None:
+                            aligned = False
+                            break
+                    if not aligned:
+                        continue
+                    if from_client:
+                        session.client_read_rc4 = start_cipher
+                        self.invalid_client_streak = 0
+                    else:
+                        session.server_read_rc4 = start_cipher
+                        self.invalid_server_streak = 0
+                    self.invalid_frame_buffers.pop(direction, None)
+                    self.invalid_frame_ciphers.pop(direction, None)
+                    _print_line(
+                        "session",
+                        f"{direction} 已按{label}流宽范围对齐 RC4"
+                        f"（跳过 {pos - pre} 字节） | 会话={self.session_id}",
+                    )
+                    return True
         return False
 
     @staticmethod
