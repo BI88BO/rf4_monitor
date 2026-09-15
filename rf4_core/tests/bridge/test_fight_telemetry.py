@@ -102,6 +102,16 @@ class FightStaminaHelpersTests(unittest.TestCase):
     def test_depth_above_water_returns_none(self) -> None:
         self.assertIsNone(self.bridge._fight_depth(((1.25, 2.5, 3.75),)))
 
+    def test_depth_skips_surface_reference_group(self) -> None:
+        # 回归：底钓竿的位置上报带前置参考点 (921.23,0,0)，真实位置在第二组；
+        # 只检查第一组会漏掉这些竿的深度（浮窗只显示"已抛竿"没有深度）。
+        groups = (
+            (921.23, 0.0, -0.0),
+            (56.4, -1.48, 232.8),
+            (0.0, 0.34, 0.34, 0.48),
+        )
+        self.assertEqual(self.bridge._fight_depth(groups), 1.48)
+
     def test_depth_missing_position_group_returns_none(self) -> None:
         self.assertIsNone(self.bridge._fight_depth(((1.0, 2.0),)))
 

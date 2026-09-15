@@ -2712,14 +2712,14 @@ class RF4ChatBridge:
 
     @staticmethod
     def _fight_depth(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
-        # 位置上报(14/7)：首个 >=3 浮点组的中位是垂直坐标 y，水下为负，
-        # 深度 = abs(y)。水面以上(y>=0)不显示。
+        # 位置上报(14/7)：钓组位置组的 y 轴在水下为负，深度 = abs(y)。
+        # 注意部分竿（如带前置参考点 (921.23,0,0) 的底钓）位置组不在第一组，
+        # 必须跳过 y>=0 的组继续找，只取第一组会漏掉这些竿的深度。
         for group in groups:
             if len(group) >= 3:
                 y = group[1]
                 if y < 0.0:
                     return abs(y)
-                return None
         return None
 
     @staticmethod
