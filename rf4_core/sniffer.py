@@ -70,6 +70,10 @@ TCP_GAP_RECOVERY_SECONDS = 15.0
 MAX_RECOVERABLE_TCP_GAP_BYTES = 64 * 1024
 # 缺口重同步单次搜索时间预算：大缓冲区里候选过多时按预算截断，下个新片段再试。
 TCP_GAP_RESYNC_TIME_BUDGET_SECONDS = 0.05
+# 承接旧 RC4 游标的重连：某方向连续 N 个业务帧解不开就搜索正确偏移。
+DECRYPT_RESYNC_STREAK = 4
+DECRYPT_RESYNC_MAX_BYTES = 64 * 1024
+DECRYPT_RESYNC_SCAN_BUDGET = 65536
 # 下行序号缺口持续超过该值时判定为真丢包（非乱序），RC4 流已不可恢复，
 # 冻结下行解析并提示用户重新登录游戏；等待下次 realtime 重连自动恢复。
 TCP_GAP_STALL_SECONDS = 45.0
@@ -799,6 +803,13 @@ class PassiveSession:
     # 下行缺口持续无法恢复时请求 observer 强制断连触发游戏自动重连（一次性）。
     tcp_reconnect_requested: bool = False
     on_tcp_reconnect_requested: Optional[object] = None
+    # 静默重连承接了旧 RC4 游标（variant 1/无 auth）：新连接某一方向可能从
+    # 新鲜 token 流开始，需要在下行解不开时主动搜索正确偏移。
+    reused_handoff_rc4: bool = False
+    reconnect_token_offset_resync: bool = False
+    # 解密失败帧的密文累计（含失败前的 cipher 快照），供偏移重同步搜索。
+    invalid_frame_buffers: dict[str, bytearray] = field(default_factory=dict)
+    invalid_frame_ciphers: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -1249,12 +1260,20 @@ class PassiveSession:
         cipher = session.client_read_rc4 if from_client else session.server_read_rc4
         if cipher is None:
             raise ValueError("RC4 状态尚未初始化")
+        direction = "客户端上行" if from_client else "服务器下行"
 
-        for frame in frames:
+        for index, frame in enumerate(frames):
             if frame.frame_type == 1 or not frame.payload:
                 continue
+            streak = (
+                self.invalid_client_streak if from_client else self.invalid_server_streak
+            )
+            # 首个失败帧前的游标快照：偏移重同步的候选锚点。
+            cipher_before = cipher.clone() if streak == 0 else None
             plain_body = cipher.crypt(frame.payload)
             if core.parse_envelope(plain_body) is not None:
+                self.invalid_frame_buffers.pop(direction, None)
+                self.invalid_frame_ciphers.pop(direction, None)
                 self.valid_business_frames += 1
                 if from_client:
                     self.valid_client_frames += 1
@@ -1300,6 +1319,14 @@ class PassiveSession:
                     direction_valid = self.valid_server_frames
                     direction_label = "服务器下行"
                     message_key = "decryption-invalid-server"
+                if cipher_before is not None:
+                    self.invalid_frame_ciphers[direction] = cipher_before
+                    self.invalid_frame_buffers[direction] = bytearray()
+                invalid_buf = self.invalid_frame_buffers.setdefault(
+                    direction, bytearray()
+                )
+                if len(invalid_buf) < DECRYPT_RESYNC_MAX_BYTES:
+                    invalid_buf.extend(frame.raw)
                 if direction_invalid >= 8 and direction_valid == 0:
                     _print_line_once(
                         self,
@@ -1309,6 +1336,18 @@ class PassiveSession:
                         "可能丢失了数据包或加速器已切换流量接口"
                         f" | 会话={self.session_id}",
                     )
+                # 静默重连承接过旧游标：连续失败说明该方向实际从别的流位置
+                # 开始（如服务器用新鲜 token 流），主动搜索正确偏移。
+                needs_resync = (
+                    self.reused_handoff_rc4 or self.reconnect_token_offset_resync
+                )
+                if needs_resync and direction_valid == 0 and (streak + 1) % DECRYPT_RESYNC_STREAK == 0:
+                    for later in frames[index + 1:]:
+                        if len(invalid_buf) >= DECRYPT_RESYNC_MAX_BYTES:
+                            break
+                        invalid_buf.extend(later.raw)
+                    if self._try_decrypt_resync(from_client=from_client):
+                        return
             self.bridge._maybe_log_telemetry_frame(self.flow, session, from_client, plain_body)
             if bool(getattr(core.ctx.options, "rf4_log_plain_frames", False)):
                 self.bridge._log(
@@ -1325,6 +1364,58 @@ class PassiveSession:
                 self.bridge._handle_client_frame(session, plain_body)
             else:
                 self.bridge._handle_server_frame(session, plain_body)
+
+    def _try_decrypt_resync(self, *, from_client: bool) -> bool:
+        """承接旧游标后某方向解不开：搜索正确的 RC4 偏移并重新对齐。
+
+        静默重连（auth variant 1/无 auth 承接）时，一个方向可能延续旧流，
+        另一个方向却从新鲜 token 流重开（加速器也可能重排隧道）。先试 token
+        初始流，再试失败前的旧游标；用帧边界+信封校验找到真实偏移后重新喂入。
+        """
+        session = self.protocol
+        direction = "客户端上行" if from_client else "服务器下行"
+        buffer = session.client_buffer if from_client else session.server_buffer
+        invalid = self.invalid_frame_buffers.get(direction, bytearray())
+        data = bytes(invalid) + bytes(buffer)
+        if len(data) < 13:
+            return False
+        anchors: list[tuple[str, object]] = []
+        if session.token:
+            anchors.append(("token", RC4Stream(session.token.encode("utf-8"))))
+        saved = self.invalid_frame_ciphers.get(direction)
+        if saved is None:
+            saved = (
+                session.last_valid_client_rc4
+                if from_client
+                else session.last_valid_server_rc4
+            )
+        if saved is not None:
+            anchors.append(("旧游标", saved.clone()))
+        for label, anchor in anchors:
+            alignment = PacketObserver._align_handoff_cipher(
+                anchor, data, budget=DECRYPT_RESYNC_SCAN_BUDGET
+            )
+            if alignment is None:
+                continue
+            offset, encrypted_before = alignment
+            committed = anchor.clone()
+            committed.keystream(encrypted_before)
+            if from_client:
+                session.client_read_rc4 = committed
+            else:
+                session.server_read_rc4 = committed
+            self.invalid_frame_buffers.pop(direction, None)
+            self.invalid_frame_ciphers.pop(direction, None)
+            buffer.clear()
+            buffer.extend(data[offset:])
+            _print_line(
+                "session",
+                f"{direction} 已按{label}流重新对齐 RC4 偏移，继续解析"
+                f" | 会话={self.session_id}",
+            )
+            self._decode_frames(from_client=from_client)
+            return True
+        return False
 
     @staticmethod
     def _check_handshake_buffer(buffer: bytearray, stage: str) -> None:
@@ -2326,6 +2417,9 @@ class PacketObserver:
             # Auth variant 0 包含 Hermes 握手、从新鲜 RC4 状态开始；variant 1
             # 是静默重连，延续旧 RC4 流。无 auth 的切服也用 handoff 恢复。
             if parsed is None or client_data[1] == 0x01:
+                # 承接旧 RC4 游标：新连接某一方向可能实际从新鲜 token 流开始，
+                # 下行连续解不开时走偏移重同步搜索（见 _try_decrypt_resync）。
+                session.reused_handoff_rc4 = True
                 reconnect_token = parsed[0] if parsed is not None else handoff.token
                 session.protocol.client_read_rc4 = self._select_reconnect_cipher(
                     reconnect_token,
@@ -2377,6 +2471,10 @@ class PacketObserver:
         auth_parsed = core.try_parse_auth_packet(client_data)
         if auth_parsed is not None:
             auth_token = auth_parsed[0]
+            # auth variant 1（01 01）是静默重连：token 相同但流位置可能重排，
+            # 下行解不开时按 token 初始流搜索偏移。
+            if len(client_data) >= 2 and client_data[1] == 0x01:
+                session.reconnect_token_offset_resync = True
             if _save_cached_token(_token_cache_key(*server_endpoint), auth_token):
                 _print_line(
                     "session",
@@ -2596,6 +2694,8 @@ class PacketObserver:
         session.protocol.auth_seen = True
         session.protocol.uuid_seen = True
         session.protocol.hermes_seen = True
+        # 承接旧 RC4 状态：若某方向对齐不准，连续解密失败时走偏移重同步搜索。
+        session.reused_handoff_rc4 = True
         # 切服后新连接 RC4 由同一 token 独立派生、从位置 0 开始（与登录时一致）；
         # 旧连接的密文位置只用于跨服务器的会话身份关联。首帧对齐所需的密钥流推进
         # 由调用方按 encrypted_before 完成，这里只用重建的 RC4 流即可。

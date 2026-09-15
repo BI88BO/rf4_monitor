@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from rf4_core import sniffer
-from rf4_core.protocol import RC4Stream, build_frame, build_request_envelope
+from rf4_core.protocol import RC4Stream, build_frame, build_request_envelope, parse_envelope
 from rf4_core.sniffer import PassiveSession, TcpStreamReassembler
 
 from rf4_core.tests.sniffer.helpers import _ctx, _make_bridge, _make_observer, _make_ready_session
@@ -351,6 +351,69 @@ class PassiveSessionEnvelopeResyncTests(unittest.TestCase):
             session.server_tcp.next_seq,
             1000 + 25 + 25 + 25,
         )
+
+
+class DecryptOffsetResyncTests(unittest.TestCase):
+    """静默重连承接旧游标后某方向解不开：按 token 初始流搜索正确偏移。"""
+
+    def _session_with_stale_server_cursor(self) -> PassiveSession:
+        from rf4_core.tests.sniffer.helpers import TOKEN, _make_ready_session
+
+        _ctx()
+        session = _make_ready_session()
+        # 模拟承接的旧服务器游标：已推进若干字节，与新鲜 token 流错位。
+        session.protocol.server_read_rc4.keystream(50)
+        session.reused_handoff_rc4 = True
+        return session
+
+    def test_decrypt_resync_realigns_from_token_stream(self) -> None:
+        from rf4_core.tests.sniffer.helpers import TOKEN
+
+        session = self._session_with_stale_server_cursor()
+        received: list[bytes] = []
+        session.bridge._handle_server_frame = lambda _s, plain: received.append(plain)
+        # 服务器实际从新鲜 token 流发送 5 个业务帧。
+        ref = RC4Stream(TOKEN.encode())
+        plains = [
+            build_request_envelope(call_id=i, main_cmd=14, sub_cmd=4, payload=b"x" * 20)
+            for i in range(5)
+        ]
+        frames = [build_frame(0, 900 + i, ref.crypt(plain)) for i, plain in enumerate(plains)]
+        session.protocol.server_buffer.extend(b"".join(frames))
+
+        session._decode_frames(from_client=False)
+
+        # 失败尝试的垃圾明文也会进入 handler，这里只校验成功解出的帧。
+        valid = [plain for plain in received if parse_envelope(plain) is not None]
+        self.assertEqual(valid, plains)
+        self.assertEqual(session.invalid_server_streak, 0)
+
+    def test_no_resync_without_handoff_reuse_flag(self) -> None:
+        from rf4_core.tests.sniffer.helpers import TOKEN
+
+        session = self._session_with_stale_server_cursor()
+        session.reused_handoff_rc4 = False
+        session.reconnect_token_offset_resync = False
+        session.bridge._handle_server_frame = lambda _s, plain: None
+        called = {"resync": False}
+        original = PassiveSession._try_decrypt_resync
+
+        def patched(self, *, from_client):
+            called["resync"] = True
+            return original(self, from_client=from_client)
+
+        ref = RC4Stream(TOKEN.encode())
+        frames = [
+            build_frame(0, 950 + i, ref.crypt(build_request_envelope(call_id=i, main_cmd=14, sub_cmd=4, payload=b"y")))
+            for i in range(5)
+        ]
+        session.protocol.server_buffer.extend(b"".join(frames))
+        PassiveSession._try_decrypt_resync = patched
+        try:
+            session._decode_frames(from_client=False)
+        finally:
+            PassiveSession._try_decrypt_resync = original
+        self.assertFalse(called["resync"])
 
 
 class ResyncWarnThrottleTests(unittest.TestCase):
