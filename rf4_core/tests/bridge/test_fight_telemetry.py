@@ -110,34 +110,13 @@ class FightStaminaHelpersTests(unittest.TestCase):
         self.assertIsNone(self.bridge._fight_depth(((1.25, 2.5, 3.75),)))
 
     def test_depth_skips_surface_reference_group(self) -> None:
-        # 回归：底钓竿的位置上报带前置参考点 (921.23,0,0)，真实位置在第二组；
-        # 只检查第一组会漏掉这些竿的深度（浮窗只显示"已抛竿"没有深度）。
-        groups = (
-            (921.23, 0.0, -0.0),
-            (56.4, -1.48, 232.8),
-            (0.0, 0.34, 0.34, 0.48),
-        )
+        # 浮点扫描已跳过参数头/GUID（见 fishing_frame_float_offset），第一组就是
+        # 钓组位置；与参考版一致，不再往后找负 y，避免误取别的组的深度。
+        groups = ((56.4, -1.48, 232.8), (0.0, -9.9, 0.0))
         self.assertEqual(self.bridge._fight_depth(groups), 1.48)
 
     def test_depth_missing_position_group_returns_none(self) -> None:
         self.assertIsNone(self.bridge._fight_depth(((1.0, 2.0),)))
-
-    def test_depth_skips_spurious_leading_group(self) -> None:
-        # 实测 1 号杆：滑动扫描在钓组组之前命中伪组 (29171.637,-18.41,0)
-        # (z=0，来自同帧的距离字段)，直接取第一组会得到恒定 18.41 米。
-        groups = (
-            (29171.637, -18.41, 0.0),
-            (437.436, -5.533, 542.522),
-            (0.0, 0.0, 0.0, 18.227),
-            (420.804, 0.166, 537.711, -20.75),
-        )
-        self.assertEqual(self.bridge._fight_depth(groups), 5.533)
-
-    def test_depth_falls_back_to_first_group_without_world_coordinates(self) -> None:
-        # 钓组尚未离开原点(x、z 均为 0)时没有世界坐标组，退回第一组，
-        # 与参考版行为一致（参考版就是直接取第一组）。
-        groups = ((-0.0, -3.5, -0.0), (0.0, 0.0, 0.0, 12.5))
-        self.assertEqual(self.bridge._fight_depth(groups), 3.5)
 
 
 class FightLoadSlimLineTests(unittest.TestCase):
@@ -390,6 +369,32 @@ class PositionReportDepthTests(unittest.TestCase):
     def test_above_water_depth_not_recorded(self) -> None:
         self.bridge._handle_client_frame(self.session, self._report(2.5))
         self.assertIsNone(self.session.fight_depth_by_gear.get(self.gear))
+
+    def test_depth_ignores_guid_derived_group(self) -> None:
+        # 真实帧（1 号杆 e74679d9）：GUID 的 16 字节恰好能拼出伪组
+        # (29171.64,-18.41,3.07e-05)；真实钓组位置 (419.909,-1.464,702.104)
+        # 紧跟 GUID 之后。浮点扫描不跳过 GUID 就会恒定显示 18.41 米。
+        payload = bytes.fromhex(
+            "030335323403000c"
+            "d97946e7e346ca4693c1f2b100383f51"
+            "011400000058f4d1436d6bbbbfa8862f44076c766c395f31398b07000000000000"
+            "dba1583ef0c7073ff12e123f167b7641a090bd3f01ab624c440145010000baa4d243"
+            "4653243f55533344008007c20000d4c000000000103203000001"
+        )
+        envelope = build_request_envelope(
+            call_id=203,
+            main_cmd=self.session.profile.fishing_main_cmd,
+            sub_cmd=self.session.profile.fight_step_sub_cmd,
+            payload=payload,
+        )
+        self.bridge._handle_client_frame(self.session, envelope)
+        self.assertAlmostEqual(
+            self.session.fight_depth_by_gear.get(
+                "e74679d9-46e3-46ca-93c1-f2b100383f51"
+            ),
+            1.4642,
+            places=3,
+        )
 
     def test_new_cast_clears_stale_depth(self) -> None:
         self.session.fight_depth_by_gear[self.gear] = 8.5

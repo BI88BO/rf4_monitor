@@ -1307,6 +1307,24 @@ def parse_contact_left(envelope: RpcEnvelope, profile: RF4ProtocolProfile) -> Op
     return parse_fishing_gear_and_setup(envelope, profile, profile.contact_left_sub_cmd)
 
 
+def fishing_frame_float_offset(payload: bytes) -> int:
+    """跳过参数头与钓组/鱼编号 GUID，返回业务浮点组的起始偏移。
+
+    逐字节浮点扫描若从 0 开始，会从 GUID 的 16 字节里扫出伪组：实测 1 号杆
+    的 GUID 恰好拼出 (29171.64,-18.41,3.07e-05)，被当成钓组位置后深度恒定
+    显示 18.41 米、出线显示 29171.637 米。跳过 GUID 区域即可根治。
+    """
+    try:
+        _, pos = read_arg_header(payload, 0)
+        for _ in range(2):
+            if pos >= len(payload) or payload[pos] != 0x0C:
+                break
+            _, pos = read_guid(payload, pos, marker=True)
+    except (ValueError, IndexError):
+        return 0
+    return pos
+
+
 @dataclass(frozen=True)
 class FightPullRequest:
     call_id: int

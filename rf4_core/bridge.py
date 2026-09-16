@@ -78,6 +78,7 @@ from .protocol import (
     build_room_ack_response_body,
     build_room_message_push_body,
     extract_catch_summary_from_response,
+    fishing_frame_float_offset,
     get_profile,
     guid_le,
     is_complete_but_invalid_auth_packet,
@@ -2715,21 +2716,13 @@ class RF4ChatBridge:
     @staticmethod
     def _fight_depth(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
         # 位置上报(14/7)：钓组位置组的 y 轴在水下为负，深度 = abs(y)。
-        # 逐字节滑动扫描偶尔会在钓组组之前命中一个伪组——实测 1 号杆的帧里
-        # 第一组是 (29171.637,-18.41,0)，x 来自同帧的距离字段、z=0，直接取
-        # 第一组会得到恒定不变的错误深度 18.41 米。
-        # 钓组位置组的特征是真实世界坐标：x、z 都非 0。没有这样的组时
-        # （钓组还停在原点）退回第一组，与参考版行为一致。
-        first: Optional[Tuple[float, ...]] = None
+        # 调用方已跳过参数头/GUID（见 fishing_frame_float_offset），第一组就是
+        # 钓组位置，与参考版一致；水面以上(y>=0)不显示深度。
         for group in groups:
-            if len(group) < 3:
-                continue
-            if first is None:
-                first = group
-            if group[0] != 0.0 and group[2] != 0.0 and group[1] < 0.0:
-                return abs(group[1])
-        if first is not None and first[1] < 0.0:
-            return abs(first[1])
+            if len(group) >= 3:
+                if group[1] < 0.0:
+                    return abs(group[1])
+                return None
         return None
 
     # 出线距离合理上限（米）。实测 1200 个采样：真实值 1.6~120.4，
@@ -2991,7 +2984,8 @@ class RF4ChatBridge:
             envelope, session.profile, session.profile.fight_step_sub_cmd
         )
         if position_report and position_report.fishing_gear_id:
-            groups = self._scan_float_groups(envelope.payload, limit=8)
+            offset = fishing_frame_float_offset(envelope.payload)
+            groups = self._scan_float_groups(envelope.payload[offset:], limit=8)
             depth = self._fight_depth(groups)
             if depth is not None:
                 gear_id = position_report.fishing_gear_id
@@ -3015,7 +3009,8 @@ class RF4ChatBridge:
         fight_load = parse_fishing_gear_and_setup(envelope, session.profile, session.profile.fight_load_sub_cmd)
         if fight_load and fight_load.fishing_gear_id:
             session.rod_phase_by_gear[fight_load.fishing_gear_id] = self.ROD_PHASE_FIGHTING
-            groups = self._scan_float_groups(envelope.payload, limit=8)
+            offset = fishing_frame_float_offset(envelope.payload)
+            groups = self._scan_float_groups(envelope.payload[offset:], limit=8)
             distance = self._sanitize_distance(
                 self._fight_distance(groups),
                 session.fight_distance_by_gear.get(fight_load.fishing_gear_id),
