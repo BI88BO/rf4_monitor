@@ -2715,19 +2715,37 @@ class RF4ChatBridge:
     @staticmethod
     def _fight_depth(groups: Tuple[Tuple[float, ...], ...]) -> Optional[float]:
         # 位置上报(14/7)：钓组位置组的 y 轴在水下为负，深度 = abs(y)。
-        # 注意部分竿（如带前置参考点 (921.23,0,0) 的底钓）位置组不在第一组，
-        # 必须跳过 y>=0 的组继续找，只取第一组会漏掉这些竿的深度。
+        # 逐字节滑动扫描偶尔会在钓组组之前命中一个伪组——实测 1 号杆的帧里
+        # 第一组是 (29171.637,-18.41,0)，x 来自同帧的距离字段、z=0，直接取
+        # 第一组会得到恒定不变的错误深度 18.41 米。
+        # 钓组位置组的特征是真实世界坐标：x、z 都非 0。没有这样的组时
+        # （钓组还停在原点）退回第一组，与参考版行为一致。
+        first: Optional[Tuple[float, ...]] = None
         for group in groups:
-            if len(group) >= 3:
-                y = group[1]
-                if y < 0.0:
-                    return abs(y)
+            if len(group) < 3:
+                continue
+            if first is None:
+                first = group
+            if group[0] != 0.0 and group[2] != 0.0 and group[1] < 0.0:
+                return abs(group[1])
+        if first is not None and first[1] < 0.0:
+            return abs(first[1])
         return None
+
+    # 出线距离合理上限（米）。实测 1200 个采样：真实值 1.6~120.4，
+    # 伪组会给出 921.23 / 29171.637 这类荒谬值。留足余量仍能全部过滤。
+    MAX_PLAUSIBLE_DISTANCE = 500.0
 
     @staticmethod
     def _is_valid_distance(value: float) -> bool:
-        # 出线无上限；0/负值为搏鱼起始阶段的瞬时抖动，NaN 为解析失败，应过滤。
-        return not (value != value) and value > 0
+        # 0/负值为搏鱼起始阶段的瞬时抖动，NaN 为解析失败，应过滤。
+        # 逐字节滑动扫描偶尔会命中伪组 (0,0,1,921.23)/(0,0,1,29171.637)：
+        # 实测 1200 个采样里真实出线全部落在 1.6~120.4 米，超过
+        # MAX_PLAUSIBLE_DISTANCE 一律按解析失败处理，保留上一次有效值。
+        return (
+            not (value != value)
+            and 0.0 < value <= RF4ChatBridge.MAX_PLAUSIBLE_DISTANCE
+        )
 
     @staticmethod
     def _sanitize_distance(value: Optional[float], last: Optional[float]) -> Optional[float]:

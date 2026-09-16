@@ -88,6 +88,13 @@ class FightStaminaHelpersTests(unittest.TestCase):
         self.assertFalse(self.bridge._is_valid_distance(-10.7))
         self.assertFalse(self.bridge._is_valid_distance(float("nan")))
 
+    def test_distance_rejects_spurious_group_values(self) -> None:
+        # 实测伪组：滑动扫描偶发命中 (0,0,1,921.23) / (0,0,1,29171.637)；
+        # 1200 个真实采样全部落在 1.6~120.4 米，这种荒谬值按解析失败处理。
+        self.assertFalse(self.bridge._is_valid_distance(921.23))
+        self.assertFalse(self.bridge._is_valid_distance(29171.637))
+        self.assertTrue(self.bridge._is_valid_distance(120.4))
+
     def test_sanitize_distance_falls_back_to_last(self) -> None:
         self.assertEqual(self.bridge._sanitize_distance(-10.7, 26.2), 26.2)
         self.assertEqual(self.bridge._sanitize_distance(12.3, 26.2), 12.3)
@@ -114,6 +121,23 @@ class FightStaminaHelpersTests(unittest.TestCase):
 
     def test_depth_missing_position_group_returns_none(self) -> None:
         self.assertIsNone(self.bridge._fight_depth(((1.0, 2.0),)))
+
+    def test_depth_skips_spurious_leading_group(self) -> None:
+        # 实测 1 号杆：滑动扫描在钓组组之前命中伪组 (29171.637,-18.41,0)
+        # (z=0，来自同帧的距离字段)，直接取第一组会得到恒定 18.41 米。
+        groups = (
+            (29171.637, -18.41, 0.0),
+            (437.436, -5.533, 542.522),
+            (0.0, 0.0, 0.0, 18.227),
+            (420.804, 0.166, 537.711, -20.75),
+        )
+        self.assertEqual(self.bridge._fight_depth(groups), 5.533)
+
+    def test_depth_falls_back_to_first_group_without_world_coordinates(self) -> None:
+        # 钓组尚未离开原点(x、z 均为 0)时没有世界坐标组，退回第一组，
+        # 与参考版行为一致（参考版就是直接取第一组）。
+        groups = ((-0.0, -3.5, -0.0), (0.0, 0.0, 0.0, 12.5))
+        self.assertEqual(self.bridge._fight_depth(groups), 3.5)
 
 
 class FightLoadSlimLineTests(unittest.TestCase):
