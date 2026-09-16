@@ -510,6 +510,7 @@ class RF4ChatBridge:
         self._overlay_con: Optional[sqlite3.Connection] = None
         self._overlay_con_path: Optional[Path] = None
         self._overlay_write_lock = threading.Lock()
+        self._rod_slot_cache_path = THIS_DIR / "rf4_rod_slot_cache.json"
 
     def _load_item_catalog_index(self) -> None:
         candidates = [
@@ -3284,6 +3285,63 @@ class RF4ChatBridge:
         if broadcast.users_count is not None:
             session.latest_users_count = broadcast.users_count
 
+    # ── 装备槽位磁盘缓存 ──────────────────────────────────────────────
+    # 中途开启抓包时，登录后的快捷键快照已错过；磁盘缓存可恢复上次会话的映射。
+
+    ROD_SLOT_CACHE_SCHEMA_VERSION = 1
+    ROD_SLOT_CACHE_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 天
+
+    def _save_rod_slot_cache(self, session: FlowSession) -> None:
+        shortcut_numbers = session.profile.shortcut_slot_numbers
+        shortcut_items = {
+            str(slot_type): item_guid
+            for slot_type, item_guid in sorted(session.slot_items.items())
+            if slot_type in shortcut_numbers and item_guid
+        }
+        if not shortcut_items:
+            return
+        payload = {
+            "schema_version": self.ROD_SLOT_CACHE_SCHEMA_VERSION,
+            "saved_at": time.time(),
+            "shortcut_items": shortcut_items,
+        }
+        try:
+            self._rod_slot_cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _restore_rod_slot_cache(self, session: FlowSession) -> None:
+        try:
+            raw = json.loads(self._rod_slot_cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if raw.get("schema_version") != self.ROD_SLOT_CACHE_SCHEMA_VERSION:
+            return
+        saved_at = raw.get("saved_at")
+        if isinstance(saved_at, (int, float)):
+            if time.time() - saved_at > self.ROD_SLOT_CACHE_MAX_AGE_SECONDS:
+                return
+        shortcut_items = raw.get("shortcut_items")
+        if not isinstance(shortcut_items, dict):
+            return
+        shortcut_numbers = session.profile.shortcut_slot_numbers
+        for raw_slot, raw_guid in shortcut_items.items():
+            try:
+                slot_type = int(raw_slot)
+            except (TypeError, ValueError):
+                continue
+            if slot_type not in shortcut_numbers:
+                continue
+            if isinstance(raw_guid, str) and raw_guid.strip():
+                session.slot_items[slot_type] = raw_guid.strip()
+        if session.slot_items:
+            self._log(
+                f"从磁盘缓存恢复装备槽位映射：{len(session.slot_items)} 个槽位"
+            )
+
     def _remember_server_slot_items(self, session: FlowSession, plain_body: bytes, sub_cmd: Optional[int] = None) -> None:
         envelope = parse_envelope(plain_body)
         if envelope is None or envelope.marker != -2:
@@ -3308,11 +3366,13 @@ class RF4ChatBridge:
             for slot in slots:
                 if slot.slot_type in shortcut_numbers:
                     session.slot_items[slot.slot_type] = slot.item_guid
+            self._save_rod_slot_cache(session)
             return
         for slot in slots:
             if slot.item_guid == "00000000-0000-0000-0000-000000000000":
                 continue
             session.slot_items[slot.slot_type] = slot.item_guid
+        self._save_rod_slot_cache(session)
 
     def _gear_slot_text(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
         if not fishing_gear_id:
@@ -3464,6 +3524,23 @@ class RF4ChatBridge:
         session.rod_result_until_by_gear[gear] = (
             time.monotonic() + self.ROD_RESULT_HOLD_SECONDS
         )
+
+        def _clear_result_after_hold(g: str = gear, expected_phase: str = self.ROD_PHASE_RESULT) -> None:
+            # 重抛竿后 phase 已变成 waiting，旧回调不能再清新行。
+            if session.rod_phase_by_gear.get(g) != expected_phase:
+                return
+            current = self._gear_slot_text(session, g) or "手持竿"
+            session.rod_phase_by_gear.pop(g, None)
+            session.rod_result_until_by_gear.pop(g, None)
+            self._log_telemetry("fight_status", f"{current} 已收竿")
+
+        try:
+            session.overlay.schedule(
+                int(self.ROD_RESULT_HOLD_SECONDS * 1000),
+                _clear_result_after_hold,
+            )
+        except Exception:
+            pass
 
     def _emit_self_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
         self._set_rod_phase_for_event(session, synthetic)

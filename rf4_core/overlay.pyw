@@ -334,6 +334,10 @@ class Overlay:
         if clear_after > 0:
             self.root.after(clear_after, lambda: self._clear_row(gear_slot, text))
 
+    def schedule(self, delay_ms, callback):
+        """延迟执行 callback，返回 after ID（可传给 after_cancel 取消）。"""
+        return self.root.after(delay_ms, callback)
+
     def _clear_row(self, gear_slot, expected_text):
         # 只有在该行仍显示传入文本时才清除，避免误删更新的状态。
         current = self._rows.get(gear_slot) if gear_slot else self._rows.get("")

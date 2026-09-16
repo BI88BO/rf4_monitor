@@ -821,10 +821,15 @@ class PassiveSession:
         bridge: core.RF4ChatBridge,
         on_tcp_reconnect_requested: Optional[object] = None,
     ) -> "PassiveSession":
+        protocol = core.FlowSession(profile=bridge._profile)
+        try:
+            bridge._restore_rod_slot_cache(protocol)
+        except Exception:
+            pass
         return cls(
             session_id=session_id,
             bridge=bridge,
-            protocol=core.FlowSession(profile=bridge._profile),
+            protocol=protocol,
             on_tcp_reconnect_requested=on_tcp_reconnect_requested,
         )
 
