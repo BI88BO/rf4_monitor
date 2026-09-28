@@ -133,6 +133,17 @@ class SuspendLoopTests(unittest.TestCase):
         self.assertFalse(loop.suspended)
         self.assertEqual(process.resume_calls, 0)
 
+    def test_request_release_before_start_does_not_resume_fresh_suspension(
+        self,
+    ) -> None:
+        process = _FakeProcess()
+        loop = self._loop(process)
+        loop.request_release()
+        loop.start()
+        loop.tick()
+        self.assertTrue(loop.suspended)
+        self.assertEqual(process.resume_calls, 0)
+
     def test_detach_keeps_suspension_for_manual_resume(self) -> None:
         process = _FakeProcess()
         loop = self._loop(process)

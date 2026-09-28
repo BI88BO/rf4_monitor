@@ -238,6 +238,7 @@ class SuspendLoop:
             self._release_requested.set()
 
     def start(self) -> bool:
+        self._release_requested.clear()
         if not self.process.suspend():
             self.suspended = False
             self.error = "未找到 rf4_x64.exe 或挂起失败"
@@ -257,6 +258,7 @@ class SuspendLoop:
 
     def detach(self) -> None:
         """停止本控制器接管，但保留当前挂起状态，由用户手动恢复。"""
+        self._release_requested.clear()
         self.error = ""
 
     def toggle(self) -> bool:
