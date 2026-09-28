@@ -51,9 +51,7 @@ class SuspendConfigTests(unittest.TestCase):
                         "process_suspend": {
                             "enabled": False,
                             "process_names": ["Game.exe"],
-                            "loop_enabled": False,
-                            "countdown_seconds": 30,
-                            "rehang_delay_seconds": 0.5,
+                            "resume_on_fish": False,
                         }
                     }
                 ),
@@ -62,98 +60,102 @@ class SuspendConfigTests(unittest.TestCase):
             config = SuspendConfig.load(path)
         self.assertFalse(config.enabled)
         self.assertEqual(config.process_names, ("game.exe",))
-        self.assertFalse(config.loop_enabled)
-        self.assertEqual(config.countdown_seconds, 30.0)
-        self.assertEqual(config.rehang_delay_seconds, 0.5)
+        self.assertFalse(config.resume_on_fish)
+
+    def test_load_ignores_legacy_loop_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rf4_config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "process_suspend": {
+                            "loop_enabled": True,
+                            "countdown_seconds": 60,
+                            "rehang_delay_seconds": 0.05,
+                            "lock_cycle_on_fish": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = SuspendConfig.load(path)
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.resume_on_fish)
 
     def test_load_uses_defaults_for_missing_or_invalid_file(self) -> None:
         self.assertEqual(
             SuspendConfig.load(Path("missing.json")),
-            SuspendConfig(countdown_seconds=60.0, rehang_delay_seconds=0.05),
+            SuspendConfig(),
         )
 
 
 class SuspendLoopTests(unittest.TestCase):
-    def _loop(self, process, clock, countdown=10.0, delay=2.0, loop=True):
-        return SuspendLoop(
-            process,
-            SuspendConfig(
-                loop_enabled=loop,
-                countdown_seconds=countdown,
-                rehang_delay_seconds=delay,
-            ),
-            clock=clock,
-        )
+    def _loop(self, process, resume_on_fish=True):
+        return SuspendLoop(process, SuspendConfig(resume_on_fish=resume_on_fish))
 
-    def test_toggle_without_loop_stays_suspended(self) -> None:
-        now = [100.0]
+    def test_toggle_suspends_and_resumes(self) -> None:
         process = _FakeProcess()
-        loop = self._loop(process, lambda: now[0], loop=False)
+        loop = self._loop(process)
         self.assertTrue(loop.toggle())
         self.assertTrue(loop.suspended)
-        self.assertFalse(loop.active)
         self.assertEqual(loop.status_text(), "已挂起")
         loop.tick()
         self.assertTrue(loop.suspended)
+        self.assertEqual(process.resume_calls, 0)
         self.assertTrue(loop.toggle())
         self.assertEqual(process.resume_calls, 1)
 
-    def test_loop_counts_down_resumes_and_rehangs(self) -> None:
-        now = [200.0]
+    def test_request_release_defers_resume_until_tick(self) -> None:
         process = _FakeProcess()
-        loop = self._loop(process, lambda: now[0], countdown=10.0, delay=2.0)
-        self.assertTrue(loop.start())
-        self.assertEqual(loop.status_text(), "已挂起 10")
-        now[0] += 10.1
+        loop = self._loop(process)
+        loop.start()
+        loop.request_release()
+        self.assertTrue(loop.suspended)
+        self.assertEqual(process.resume_calls, 0)
         loop.tick()
         self.assertFalse(loop.suspended)
-        self.assertEqual(loop.status_text(), "待挂起 2")
-        now[0] += 2.1
+        self.assertEqual(process.resume_calls, 1)
+
+    def test_request_release_is_a_noop_when_disabled(self) -> None:
+        process = _FakeProcess()
+        loop = self._loop(process, resume_on_fish=False)
+        loop.start()
+        loop.request_release()
         loop.tick()
         self.assertTrue(loop.suspended)
-        self.assertEqual(loop.status_text(), "已挂起 10")
-        self.assertEqual(process.resume_calls, 1)
-        self.assertEqual(process.suspend_calls, 2)
+        self.assertEqual(process.resume_calls, 0)
 
-    def test_countdown_displays_whole_seconds_from_start(self) -> None:
-        now = [100.0]
+    def test_request_release_without_suspension_is_a_noop(self) -> None:
         process = _FakeProcess()
-        loop = self._loop(process, lambda: now[0], countdown=60.0, delay=0.05)
-        self.assertTrue(loop.start())
-        self.assertEqual(loop.status_text(), "已挂起 60")
-        now[0] += 0.4
-        self.assertEqual(loop.status_text(), "已挂起 60")
-        now[0] += 0.7
-        self.assertEqual(loop.status_text(), "已挂起 59")
+        loop = self._loop(process)
+        loop.request_release()
+        loop.tick()
+        self.assertFalse(loop.suspended)
+        self.assertEqual(process.resume_calls, 0)
 
     def test_detach_keeps_suspension_for_manual_resume(self) -> None:
         process = _FakeProcess()
-        loop = self._loop(process, lambda: 0.0)
+        loop = self._loop(process)
         loop.start()
         loop.detach()
         self.assertTrue(loop.suspended)
-        self.assertFalse(loop.active)
         self.assertEqual(process.resume_calls, 0)
 
     def test_failed_start_reports_error_until_next_success(self) -> None:
-        now = [0.0]
         process = _FakeProcess(suspend_ok=False)
-        loop = self._loop(process, lambda: now[0])
+        loop = self._loop(process)
         self.assertFalse(loop.toggle())
-        self.assertFalse(loop.active)
         self.assertEqual(loop.status_text(), "未找到 rf4_x64.exe 或挂起失败")
 
         process.suspend_ok = True
         self.assertTrue(loop.toggle())
-        self.assertEqual(loop.status_text(), "已挂起 10")
+        self.assertEqual(loop.status_text(), "已挂起")
 
     def test_failed_resume_reports_error(self) -> None:
-        now = [0.0]
         process = _FakeProcess(resume_ok=False)
-        loop = self._loop(process, lambda: now[0])
+        loop = self._loop(process)
         self.assertTrue(loop.toggle())
         self.assertFalse(loop.toggle())
-        self.assertFalse(loop.active)
         self.assertEqual(loop.status_text(), "游戏进程恢复失败")
 
     def test_process_name_is_normalized_for_toolhelp_lookup(self) -> None:

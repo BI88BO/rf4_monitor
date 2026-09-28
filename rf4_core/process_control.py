@@ -3,19 +3,15 @@ from __future__ import annotations
 
 import ctypes
 import json
-import math
 import os
 import threading
-import time
 from ctypes import wintypes as wt
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROCESS_NAMES = ("rf4_x64.exe",)
-DEFAULT_COUNTDOWN_SECONDS = 60.0
-DEFAULT_REHANG_DELAY_SECONDS = 0.05
 
 TH32CS_SNAPPROCESS = 0x00000002
 TH32CS_SNAPTHREAD = 0x00000004
@@ -94,9 +90,7 @@ def _configure_hotkey_api() -> None:
 class SuspendConfig:
     enabled: bool = True
     process_names: tuple[str, ...] = DEFAULT_PROCESS_NAMES
-    loop_enabled: bool = True
-    countdown_seconds: float = DEFAULT_COUNTDOWN_SECONDS
-    rehang_delay_seconds: float = DEFAULT_REHANG_DELAY_SECONDS
+    resume_on_fish: bool = True
 
     @classmethod
     def from_dict(cls, data: object) -> "SuspendConfig":
@@ -111,14 +105,7 @@ class SuspendConfig:
             process_names=tuple(
                 str(name).lower() for name in names if str(name).strip()
             ),
-            loop_enabled=bool(raw.get("loop_enabled", True)),
-            countdown_seconds=max(
-                0.0, float(raw.get("countdown_seconds", DEFAULT_COUNTDOWN_SECONDS))
-            ),
-            rehang_delay_seconds=max(
-                0.0,
-                float(raw.get("rehang_delay_seconds", DEFAULT_REHANG_DELAY_SECONDS)),
-            ),
+            resume_on_fish=bool(raw.get("resume_on_fish", True)),
         )
 
     @classmethod
@@ -231,48 +218,35 @@ class ProcessSuspender:
 
 
 class SuspendLoop:
-    """F8 状态机：挂起 → 倒计时 → 恢复 → 短暂延迟 → 再挂起。"""
+    """F8 挂起/恢复控制器：挂起后一直保持，直到再按 F8 或来鱼自动解除。
 
-    def __init__(
-        self,
-        process: ProcessSuspender,
-        config: SuspendConfig,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
+    没有倒计时自动恢复。事件线程要解除挂起时只投递一个 Event，
+    真正的 Win32 resume 仍在 tick 所在的挂起线程里执行，避免两个线程
+    并发操作同一批线程句柄。
+    """
+
+    def __init__(self, process: ProcessSuspender, config: SuspendConfig) -> None:
         self.process = process
         self.config = config
-        self.clock = clock
         self.suspended = False
-        self.active = False
-        self.phase = ""
-        self.deadline = 0.0
         self.error = ""
+        self._release_requested = threading.Event()
+
+    def request_release(self) -> None:
+        """来鱼/咬钩时由事件线程调用；实际恢复由下一个 tick 执行。"""
+        if self.config.resume_on_fish:
+            self._release_requested.set()
 
     def start(self) -> bool:
         if not self.process.suspend():
             self.suspended = False
-            self.active = False
-            self.phase = ""
-            self.deadline = 0.0
             self.error = "未找到 rf4_x64.exe 或挂起失败"
             return False
         self.error = ""
         self.suspended = True
-        if self.config.loop_enabled:
-            self.active = True
-            self.phase = "countdown"
-            self.deadline = self.clock() + self.config.countdown_seconds
-        else:
-            self.active = False
-            self.phase = ""
-            self.deadline = 0.0
         return True
 
     def stop(self) -> bool:
-        self.active = False
-        self.phase = ""
-        self.deadline = 0.0
         if not self.suspended:
             self.error = ""
             return False
@@ -283,9 +257,6 @@ class SuspendLoop:
 
     def detach(self) -> None:
         """停止本控制器接管，但保留当前挂起状态，由用户手动恢复。"""
-        self.active = False
-        self.phase = ""
-        self.deadline = 0.0
         self.error = ""
 
     def toggle(self) -> bool:
@@ -294,37 +265,14 @@ class SuspendLoop:
         return self.start()
 
     def tick(self) -> None:
-        if not self.active:
-            return
-        now = self.clock()
-        if now < self.deadline:
-            return
-        if self.phase == "countdown":
-            self.process.resume()
-            self.suspended = False
-            self.phase = "delay"
-            self.deadline = now + self.config.rehang_delay_seconds
-        elif self.phase == "delay":
-            if not self.process.suspend():
-                self.active = False
-                self.phase = ""
-                self.deadline = 0.0
-                self.error = "未找到 rf4_x64.exe 或挂起失败"
-                return
-            self.suspended = True
-            self.phase = "countdown"
-            self.deadline = now + self.config.countdown_seconds
+        if self._release_requested.is_set():
+            self._release_requested.clear()
+            self.stop()
 
     def status_text(self) -> str:
-        if self.error and not self.active:
+        if self.error:
             return self.error
-        if self.active:
-            remaining = max(0.0, self.deadline - self.clock())
-            text = str(math.ceil(remaining)) if remaining > 0.0 else "<1"
-            return f"{'已挂起' if self.suspended else '待挂起'} {text}"
-        if self.suspended:
-            return "已挂起"
-        return ""
+        return "已挂起" if self.suspended else ""
 
 
 class GlobalHotkey:
