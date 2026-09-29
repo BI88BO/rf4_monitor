@@ -192,6 +192,74 @@ class OverlayFightStatusTests(unittest.TestCase):
         self.assertEqual(keys, ["1号杆", "2号杆", "3号杆"])
 
 
+class OverlayRowRestoreTests(unittest.TestCase):
+    """结算闪现到期：恢复该竿上一条常驻行，而不是把整根竿删掉。"""
+
+    def _overlay(self) -> tuple[Overlay, list[tuple]]:
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._telemetry_seq = 0
+        ov._refresh_display = lambda: None
+        timers: list[tuple] = []
+        ov.root = SimpleNamespace(
+            after=lambda delay, fn: timers.append((delay, fn)) or 0
+        )
+        return ov, timers
+
+    def test_result_expiry_restores_previous_rod_row(self) -> None:
+        ov, timers = self._overlay()
+        ov._update_row("2号杆", "2号杆 已抛竿 深1.5米")
+        payload = json.dumps(
+            {"event": "fish_kept", "gear_slot": "2号杆", "text": "入护了"},
+            ensure_ascii=False,
+        )
+        ov._handle_event_payload(payload)
+        self.assertEqual(ov._rows["2号杆"], "入护了")
+        self.assertEqual([delay for delay, _ in timers], [3000])
+
+        timers[0][1]()
+
+        self.assertEqual(ov._rows.get("2号杆"), "2号杆 已抛竿 深1.5米")
+
+    def test_result_expiry_without_previous_row_removes_row(self) -> None:
+        ov, timers = self._overlay()
+        ov._update_row("1号杆", "入护了", 3000)
+
+        timers[0][1]()
+
+        self.assertNotIn("1号杆", ov._rows)
+
+    def test_persistent_line_arriving_within_hold_wins(self) -> None:
+        ov, timers = self._overlay()
+        ov._update_row("1号杆", "1号杆 已抛竿 深2米")
+        ov._update_row("1号杆", "入护了", 3000)
+        # 引擎在闪现到期前补发了"已收竿"：旧定时器不得再改这一行。
+        ov._handle_event_payload(
+            json.dumps(
+                {"event": "telemetry", "category": "fight_status", "text": "1号杆 已收竿"},
+                ensure_ascii=False,
+            )
+        )
+
+        timers[0][1]()
+
+        self.assertEqual(ov._rows.get("1号杆"), "1号杆 已收竿")
+        self.assertEqual(ov._row_restore_map(), {})
+
+    def test_reset_drops_pending_restore_entries(self) -> None:
+        ov, timers = self._overlay()
+        ov._update_row("1号杆", "1号杆 已抛竿 深2米")
+        ov._update_row("1号杆", "入护了", 3000)
+
+        ov._reset_to_idle(preserve_waiting=False)
+
+        self.assertEqual(ov._rows, {})
+        self.assertEqual(ov._row_restore_map(), {})
+        timers[0][1]()
+        self.assertEqual(ov._rows, {})
+
+
 class OverlayStartupHistoryTests(unittest.TestCase):
     def _poll_overlay(self) -> tuple[Overlay, list[tuple]]:
         import sqlite3
@@ -327,3 +395,126 @@ class OverlaySqliteCursorTests(unittest.TestCase):
             finally:
                 ov._close_sqlite()
             self.assertEqual(len(ov.calls), 1, "已读事件不应重复触发")
+
+    def test_poll_drains_backlog_larger_than_one_batch(self) -> None:
+        """回归：积压超过单批上限时必须一 tick 抽干，否则会分批慢慢吐出来。"""
+        import sqlite3
+        import tempfile
+
+        batch = Overlay.POLL_BATCH_LIMIT
+        total = batch * 2 + 5
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "events.sqlite3"
+            ov = self._overlay(db)
+            con = sqlite3.connect(db)
+            try:
+                con.executemany(
+                    "INSERT INTO overlay_events (ts, event_type, payload) VALUES (?, ?, ?)",
+                    [(float(i), "telemetry", '{"event":"telemetry","text":"x"}') for i in range(total)],
+                )
+                con.commit()
+            finally:
+                con.close()
+            try:
+                ov._poll()
+            finally:
+                ov._close_sqlite()
+            self.assertEqual(len(ov.calls), total)
+            self.assertLess(total, Overlay.POLL_BATCH_LIMIT * Overlay.POLL_MAX_BATCHES)
+
+
+class OverlayPollRecoveryTests(unittest.TestCase):
+    """事件库读不动/被重建时浮窗的自保行为。"""
+
+    def _overlay(self, db_path, delays: list) -> Overlay:
+        ov = object.__new__(Overlay)
+        ov.db_path = db_path
+        ov._last_seen_id = 0
+        ov._handle_event_payload = lambda payload: None
+        ov.root = SimpleNamespace(after=lambda delay, fn: delays.append(delay))
+        return ov
+
+    def test_unreadable_db_backs_off_instead_of_reconnecting_every_tick(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "events.sqlite3"
+            db.write_bytes(b"not a sqlite file at all")
+            delays: list[int] = []
+            ov = self._overlay(db, delays)
+            ov._poll()
+            ov._poll()
+            ov._poll()
+            self.assertEqual(delays[0], Overlay.POLL_INTERVAL_MS * 2)
+            self.assertLess(delays[0], delays[1])
+            self.assertLess(delays[1], delays[2])
+            self.assertLessEqual(delays[-1], Overlay.POLL_BACKOFF_MAX_MS)
+
+    def test_cursor_resets_when_event_db_is_rebuilt(self) -> None:
+        """监控侧重建事件库后自增 id 归零，游标必须跟上，否则浮窗永远收不到新事件。"""
+        import sqlite3
+        import tempfile
+
+        def seed(path, count: int) -> None:
+            con = sqlite3.connect(path)
+            try:
+                con.execute(
+                    "CREATE TABLE overlay_events ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "ts REAL NOT NULL,"
+                    "event_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL)"
+                )
+                con.executemany(
+                    "INSERT INTO overlay_events (ts, event_type, payload) VALUES (?, ?, ?)",
+                    [(float(i), "telemetry", '{"event":"telemetry","text":"x"}') for i in range(count)],
+                )
+                con.commit()
+            finally:
+                con.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "events.sqlite3"
+            seed(db, 3)
+            delays: list[int] = []
+            ov = self._overlay(db, delays)
+            ov._poll()
+            self.assertEqual(ov._last_seen_id, 3)
+            ov._close_sqlite()
+            db.unlink()
+            seed(db, 2)
+            try:
+                ov._poll()
+            finally:
+                ov._close_sqlite()
+            self.assertEqual(ov._last_seen_id, 2, "游标应回退到新库的最新 id")
+
+
+class OverlayBatchRedrawTests(unittest.TestCase):
+    def test_batch_defers_redraw_and_rows_save_until_flush(self) -> None:
+        original_save = overlay_mod.save_rows
+        saves: list[dict] = []
+        draws: list[dict] = []
+        overlay_mod.save_rows = lambda rows: saves.append(dict(rows))
+        ov = object.__new__(Overlay)
+        ov._rows = {}
+        ov._telemetry_rows = {}
+        ov._suspend_loop = None
+        ov.root = SimpleNamespace(after=lambda *args: None, geometry=lambda *args: None)
+        ov._content_width = lambda lines: 260
+        ov._content_height = lambda lines, width=None: 42
+        ov._draw = lambda **kwargs: draws.append(kwargs)
+        ov._show = lambda: None
+        try:
+            ov._defer_refresh = True
+            for index in range(5):
+                ov._update_row(f"{index + 1}号杆", f"row{index}")
+            self.assertEqual(saves, [], "一批事件不应逐条落盘")
+            self.assertEqual(draws, [], "一批事件不应逐条重绘")
+            ov._defer_refresh = False
+            ov._flush_deferred_refresh()
+        finally:
+            overlay_mod.save_rows = original_save
+        self.assertEqual(len(saves), 1)
+        self.assertEqual(len(draws), 1)
+        self.assertEqual(sorted(ov._rows), ["1号杆", "2号杆", "3号杆", "4号杆", "5号杆"])

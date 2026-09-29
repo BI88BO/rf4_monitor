@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -128,17 +129,54 @@ class Overlay:
     FONT_SIZE = 11
     PAD_X = 12
     PAD_Y = 10
+    # 事件轮询：一 tick 内分批抽干积压，整批只重绘一次；读库出错时退避重连，
+    # 避免每 30ms 重连并重建表把 Tk 主线程堵死（表现为浮窗卡一下才跳更新）。
+    POLL_INTERVAL_MS = 30
+    POLL_BATCH_LIMIT = 200
+    POLL_MAX_BATCHES = 10
+    POLL_BACKOFF_MAX_MS = 1000
+    # 空闲多久换一次连接：事件库被监控侧重建后，旧句柄再也读不到新事件。
+    POLL_IDLE_REOPEN_SECONDS = 5.0
+    # 挂起状态机节拍：跑在自己的线程上，与事件轮询无关，见 Overlay._suspend_worker。
+    SUSPEND_TICK_INTERVAL_MS = 20
+    SUSPEND_THREAD_JOIN_TIMEOUT_SECONDS = 1.0
+    # 来鱼/咬钩时自动解除挂起的事件名
+    # 挂起中的来鱼流程：来鱼解冻，咬钩自动冻回去，鱼结束/换会话就取消待命。
+    SUSPEND_FISH_FLOW = {
+        "fish_incoming": ("release", "来鱼"),
+        "fish_bitten": ("freeze", "咬钩"),
+        "fish_kept": ("disarm", ""),
+        "fish_escaped": ("disarm", ""),
+        "fish_released": ("disarm", ""),
+        "reset": ("disarm", ""),
+        "session_end": ("disarm", ""),
+    }
     # 反外挂警告红字状态：object.__new__ 构造(测试)时默认为 False
     _anticheat_red = False
     # 反外挂红字恢复定时器：同一时刻至多一个，新事件会先取消旧的
     _anticheat_timer_id = None
     # 抓包状态锁存：启动后未收到事件为灰色，收到事件后保持正常色
     _capture_active = False
+    # 画布：object.__new__ 构造(测试)时可能还没建，测量高度要能退回估算
+    canvas = None
+    # 一批事件只在抽干后重绘一次、落盘一次。默认值供 object.__new__ 构造(测试)使用。
+    _defer_refresh = False
+    _refresh_pending = False
+    _rows_dirty = False
+    _last_seen_id = 0
+    _poll_error_streak = 0
+    _sqlite_opened_ts = 0.0
+    # 临时结果行(入护/脱钩/放生)闪现结束后要恢复的常驻文本，key=竿号行键。
+    _row_restore = None
     # 挂起状态：object.__new__ 构造(测试)时默认关闭
     _suspend_loop = None
     _hotkey = None
     _suspend_error = None
     _last_suspend_status = ""
+    _suspend_thread = None
+    _suspend_stop = None
+    # 默认配置仅供 object.__new__ 构造(测试)读取开关用
+    _suspend_config = SuspendConfig()
 
     @staticmethod
     def font_family() -> str:
@@ -211,11 +249,18 @@ class Overlay:
         self._anticheat_timer_id = None
         self._last_seen_id = 0
         self._capture_active = False
+        self._defer_refresh = False
+        self._refresh_pending = False
+        self._rows_dirty = False
+        self._poll_error_streak = 0
+        self._sqlite_opened_ts = 0.0
         self._suspend_config = SuspendConfig.load()
         self._suspend_loop = None
         self._hotkey = None
         self._suspend_error = None
         self._last_suspend_status = ""
+        self._suspend_thread = None
+        self._suspend_stop = None
         if self._suspend_config.enabled and os.name == "nt":
             self._suspend_loop = SuspendLoop(
                 ProcessSuspender(self._suspend_config.process_names),
@@ -251,12 +296,15 @@ class Overlay:
         # 启动时只消费新事件；数据库里已有的都是上一轮运行的历史。
         self._last_seen_id = self._latest_event_id()
         self._refresh_display()
-        self.root.after(30, self._poll)
+        self.root.after(self.POLL_INTERVAL_MS, self._poll)
         self.root.after(800, self._poll_config)
         self._start_suspend_hotkey()
+        self._start_suspend_engine()
         self.root.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def destroy(self):
+        if self._rows_dirty:
+            save_rows(self._rows)
         self._close_suspend()
         self._close_sqlite()
         self.root.destroy()
@@ -324,12 +372,20 @@ class Overlay:
         self._drag_offset = None
         save_config({"position": {"x": self.root.winfo_x(), "y": self.root.winfo_y()}})
 
+    def _row_restore_map(self) -> dict:
+        if self._row_restore is None:
+            self._row_restore = {}
+        return self._row_restore
+
     def _update_row(self, gear_slot, text, clear_after=0):
-        if gear_slot:
-            self._rows[gear_slot] = text
+        key = gear_slot or ""
+        if clear_after > 0:
+            # 记下当前常驻文本(setdefault：连续两条临时行保留最早那条的原文)。
+            self._row_restore_map().setdefault(key, self._rows.get(key, ""))
         else:
-            self._rows[""] = text
-        save_rows(self._rows)
+            self._row_restore_map().pop(key, None)
+        self._rows[key] = text
+        self._rows_dirty = True
         self._refresh_display()
         if clear_after > 0:
             self.root.after(clear_after, lambda: self._clear_row(gear_slot, text))
@@ -340,14 +396,18 @@ class Overlay:
 
     def _clear_row(self, gear_slot, expected_text):
         # 只有在该行仍显示传入文本时才清除，避免误删更新的状态。
-        current = self._rows.get(gear_slot) if gear_slot else self._rows.get("")
-        if current == expected_text:
-            if gear_slot:
-                self._rows.pop(gear_slot, None)
-            else:
-                self._rows.pop("", None)
-            save_rows(self._rows)
-            self._refresh_display()
+        key = gear_slot or ""
+        if self._rows.get(key) != expected_text:
+            return
+        previous = self._row_restore_map().pop(key, "")
+        if previous:
+            # 闪现结束回到上一条常驻行；直接删行会让这根竿从浮窗消失，
+            # 直到下次抛竿才有行（用户看到的"某根杆子信息偶尔不见了"）。
+            self._rows[key] = previous
+        else:
+            self._rows.pop(key, None)
+        self._rows_dirty = True
+        self._refresh_display()
 
     @staticmethod
     def _rod_sort_key(slot: str) -> tuple:
@@ -482,15 +542,47 @@ class Overlay:
             self._refresh_display()
 
     def _refresh_display(self):
+        if self._defer_refresh:
+            # 一批事件里逐条重绘会把 Tk 主线程占满，抽干后统一画一次。
+            self._refresh_pending = True
+            return
+        if self._rows_dirty:
+            self._rows_dirty = False
+            save_rows(self._rows)
         lines = self._lines_for_display()
         width = self._content_width(lines)
-        need_h = self._content_height(lines, width)
+        height = self._content_height(lines, width)
         # 只设置尺寸、不带位置：Tk 会保留当前/已请求的位置。若在这里读
         # winfo_x/y 重新拼 geometry，窗口首次映射前它们还是 (0,0)，会把
         # 配置里记住的位置覆盖成屏幕左上角。
-        self.root.geometry(f"{width}x{need_h}")
-        self._draw(width=width, height=need_h)
+        self.root.geometry(f"{width}x{height}")
+        self._draw(width=width, height=height)
+        measured = self._measured_height(height)
+        if measured > height:
+            # 估算按"字符宽度/可用宽度"折算，Tk 实际按词边界换行，长搏鱼行会
+            # 多折一行；高度不够时下面一行就被窗口下沿裁掉半行，所以改用实测值。
+            self.root.geometry(f"{width}x{measured}")
+            self._draw(width=width, height=measured)
         self._show()
+
+    def _text_bottom(self, canvas, tags, fallback: int) -> int:
+        """读文字块实测底部；画布还不可用(测试/未建画布)时退回估算值。"""
+        measure = getattr(canvas, "bbox", None)
+        if measure is None:
+            return fallback
+        try:
+            box = measure(tags)
+        except tk.TclError:
+            return fallback
+        if not box:
+            return fallback
+        return int(math.ceil(box[3]))
+
+    def _measured_height(self, fallback: int) -> int:
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return fallback
+        return max(fallback, self._text_bottom(canvas, "body", fallback - self.PAD_Y) + self.PAD_Y)
 
     def _content_width(self, lines):
         """按最长行计算窗口宽度：待机保持紧凑，长搏鱼行最多加宽到上限，
@@ -512,10 +604,9 @@ class Overlay:
             lines.append(text)
         if not lines:
             lines = ["来鱼提示 · 待机中"]
-        if self._suspend_loop is not None:
-            status = self._suspend_error or self._suspend_loop.status_text()
-            if status:
-                lines.append(status)
+        status = self._suspend_status_line()
+        if status:
+            lines.append(status)
         return lines
 
     def _any_exhausted(self, lines) -> bool:
@@ -550,14 +641,13 @@ class Overlay:
         # 第一块：竿号/搏鱼行(按竿号排序，主色)；第二块：遥测/待机行(降暗色)。
         rod_lines = [self._rows[key] for key in sorted(self._rows, key=self._rod_sort_key)]
         dim_lines = list(self._telemetry_rows.values())
-        if self._suspend_loop is not None:
-            status = self._suspend_error or self._suspend_loop.status_text()
-            if status:
-                rod_lines.append(status)
+        suspend_line = self._suspend_status_line()
+        if suspend_line:
+            rod_lines.append(suspend_line)
         if not rod_lines and not dim_lines:
             dim_lines = ["来鱼提示 · 待机中"]
         # 反外挂红字优先：直接整块红字，跳过力竭判断(避免无效计算)
-        if rod_lines and rod_lines[-1].startswith(("已挂起", "待挂起")):
+        if suspend_line:
             rod_color = self.CANVAS_RED
         elif not self._capture_active:
             rod_color = self.CANVAS_GRAY
@@ -574,16 +664,25 @@ class Overlay:
                 fill=rod_color,
                 width=width - self.PAD_X * 2,
                 justify="left",
+                tags=("rod", "body"),
             )
         if dim_lines:
+            # 第二块从第一块的实测底部起算：折过行的长竿行按行数估算会偏小，
+            # 两块文字会叠在一起。
+            if rod_lines:
+                estimated = self.PAD_Y + len(rod_lines) * self._row_height() - 3
+                dim_y = self._text_bottom(canvas, "rod", estimated) + 3
+            else:
+                dim_y = self.PAD_Y
             canvas.create_text(
-                self.PAD_X, self.PAD_Y + len(rod_lines) * self._row_height(),
+                self.PAD_X, dim_y,
                 text="\n".join(dim_lines),
                 anchor="nw",
                 font=(Overlay.font_family(), self.FONT_SIZE),
                 fill=self.CANVAS_GRAY if not self._capture_active else self.CANVAS_DIM,
                 width=width - self.PAD_X * 2,
                 justify="left",
+                tags=("body",),
             )
 
     def _content_height(self, lines, width=None):
@@ -652,8 +751,9 @@ class Overlay:
         )
         self._rows.clear()
         self._rows.update(waiting)
+        self._row_restore_map().clear()
         self._telemetry_rows.clear()
-        save_rows(self._rows)
+        self._rows_dirty = True
         self._refresh_display()
 
     def _hide(self):
@@ -666,6 +766,63 @@ class Overlay:
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.visible = True
+
+    def _poll(self):
+        delay = self.POLL_INTERVAL_MS
+        try:
+            self._drain_events()
+        except (OSError, sqlite3.Error):
+            self._close_sqlite()
+            # 读不到就退避重连：每条事件都重连一次的话，建表/WAL 切换的开销全压在
+            # Tk 主线程上，浮窗看起来就是"卡一下才跳一批"。
+            self._poll_error_streak += 1
+            delay = min(
+                self.POLL_BACKOFF_MAX_MS,
+                self.POLL_INTERVAL_MS * (2 ** self._poll_error_streak),
+            )
+        else:
+            self._poll_error_streak = 0
+        finally:
+            self._flush_deferred_refresh()
+            self._sync_suspend_status()
+            self.root.after(delay, self._poll)
+
+    def _drain_events(self) -> None:
+        """分批抽干积压事件（最多 POLL_MAX_BATCHES 批），不再按 30ms 一条线地啃。"""
+        for _ in range(self.POLL_MAX_BATCHES):
+            con = self._sqlite_connection()
+            rows = con.execute(
+                "SELECT id, payload FROM overlay_events WHERE id > ? ORDER BY id LIMIT ?",
+                (self._last_seen_id, self.POLL_BATCH_LIMIT),
+            ).fetchall()
+            if not rows:
+                self._release_stale_connection()
+                return
+            self._defer_refresh = True
+            try:
+                for row_id, payload in rows:
+                    try:
+                        self._handle_event_payload(payload)
+                    except Exception:
+                        pass
+            finally:
+                self._defer_refresh = False
+            # 游标推进到本批最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
+            self._last_seen_id = rows[-1][0]
+            self._on_capture_alive()
+            self._flush_deferred_refresh()
+
+    def _flush_deferred_refresh(self):
+        if not (self._refresh_pending or self._rows_dirty):
+            return
+        self._refresh_pending = False
+        self._refresh_display()
+
+    def _release_stale_connection(self) -> None:
+        """空闲够久就丢一次长连接：事件库被监控侧重建后，旧句柄再也读不到新事件。"""
+        if time.time() - self._sqlite_opened_ts < self.POLL_IDLE_REOPEN_SECONDS:
+            return
+        self._close_sqlite()
 
     def _sqlite_connection(self):
         con = getattr(self, "_sqlite_con", None)
@@ -689,6 +846,8 @@ class Overlay:
             con.execute("PRAGMA journal_mode = WAL")
             con.commit()
             self._sqlite_con = con
+            self._sqlite_opened_ts = time.time()
+            self._realign_cursor(con)
         except Exception:
             try:
                 con.close()
@@ -696,6 +855,15 @@ class Overlay:
                 pass
             raise
         return con
+
+    def _realign_cursor(self, con) -> None:
+        """库被重建后自增 id 从 1 重新开始；游标若还停在旧库的高位就永远读不到新事件。"""
+        try:
+            row = con.execute("SELECT MAX(id) FROM overlay_events").fetchone()
+        except sqlite3.Error:
+            return
+        if int(row[0] or 0) < self._last_seen_id:
+            self._last_seen_id = 0
 
     def _close_sqlite(self):
         con, self._sqlite_con = getattr(self, "_sqlite_con", None), None
@@ -720,69 +888,89 @@ class Overlay:
             self._close_sqlite()
             return 0
 
-    def _poll(self):
-        try:
-            con = self._sqlite_connection()
-            rows = con.execute(
-                "SELECT id, payload FROM overlay_events WHERE id > ? ORDER BY id",
-                (self._last_seen_id,),
-            ).fetchall()
-            for row_id, payload in rows:
-                try:
-                    self._handle_event_payload(payload)
-                except Exception:
-                    pass
-            if rows:
-                # 游标推进到最新事件的自增 id（id 全局单调，不受 bridge 重启影响）。
-                self._last_seen_id = rows[-1][0]
-                self._on_capture_alive()
-        except (OSError, sqlite3.Error):
-            self._close_sqlite()
-        finally:
-            self._consume_suspend_hotkey()
-            self._update_suspend_loop()
-            self.root.after(30, self._poll)
-
-    def _consume_suspend_hotkey(self):
-        if self._hotkey is None:
-            return
-        if self._hotkey.poll():
-            self._toggle_suspend()
+    def _suspend_status_line(self) -> str:
+        """挂起状态行文本；测量高度、绘制、轮询比对三处必须一致。"""
+        if self._suspend_loop is None:
+            return ""
+        return self._suspend_error or self._suspend_loop.status_text()
 
     def _start_suspend_hotkey(self):
         if self._suspend_loop is None:
             return
-        self._hotkey = GlobalHotkey("F8")
+        wanted = self._suspend_config.hotkey
+        self._hotkey = GlobalHotkey(wanted)
         if not self._hotkey.start():
             self._hotkey = None
-            self._suspend_error = "F8 热键注册失败，可能已被占用"
+            self._suspend_error = f"{wanted} 等热键都被占用，挂起不可用"
             self._refresh_display()
-        else:
-            self._suspend_error = None
-
-    def _toggle_suspend(self):
-        if self._suspend_loop is None:
             return
         self._suspend_error = None
-        self._suspend_loop.toggle()
-        self._last_suspend_status = self._suspend_loop.status_text()
-        self._refresh_display()
+        # 状态文本要报真正绑上的键：首选键被占用时会自动顺延。
+        self._suspend_loop.hotkey_label = self._hotkey.bound_key or wanted
 
-    def _update_suspend_loop(self):
+    def _start_suspend_engine(self):
+        """把挂起控制器放到独立线程：节拍只由 SUSPEND_TICK_INTERVAL_MS 决定。
+
+        线程只做 Win32 挂起/恢复、轮询热键和执行事件线程投递的来鱼动作，
+        绝不碰 Tk；浮窗在 _poll 里读 status_text() 决定是否重绘。
+        """
         if self._suspend_loop is None:
             return
-        self._suspend_loop.tick()
-        status = self._suspend_loop.status_text()
+        self._suspend_stop = threading.Event()
+        self._suspend_thread = threading.Thread(
+            target=self._suspend_worker, name="rf4-suspend", daemon=True
+        )
+        self._suspend_thread.start()
+
+    def _suspend_worker(self):
+        loop = self._suspend_loop
+        hotkey = self._hotkey
+        stop = self._suspend_stop
+        interval = self.SUSPEND_TICK_INTERVAL_MS / 1000.0
+        while stop is not None and not stop.wait(interval):
+            try:
+                if hotkey is not None and hotkey.poll():
+                    loop.toggle()
+                loop.tick()
+            except Exception:
+                # 一次 Win32 调用出错不能停摆，否则游戏就永久冻在这里了。
+                continue
+
+    def _sync_suspend_status(self):
+        """把线程里的挂起状态搬到浮窗上：文本变了才重绘一次。"""
+        if self._suspend_loop is None:
+            return
+        status = self._suspend_status_line()
         if status != self._last_suspend_status:
             self._last_suspend_status = status
             self._refresh_display()
 
+    def _update_suspend_on_fish(self, name, gear_slot):
+        """来鱼解冻、咬钩冻回：动作只投递给挂起线程，Tk 线程不碰 Win32。
+
+        鱼被冻在咬钩那一帧，玩家有不限时看浮窗，要拉杆再按热键恢复进程。
+        """
+        step = self.SUSPEND_FISH_FLOW.get(name)
+        loop = self._suspend_loop
+        if step is None or loop is None:
+            return
+        action, verb = step
+        loop.request(action, f"{gear_slot}{verb}" if verb else "")
+
     def _close_suspend(self):
+        thread = self._suspend_thread
+        stop = self._suspend_stop
+        self._suspend_thread = None
+        self._suspend_stop = None
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=self.SUSPEND_THREAD_JOIN_TIMEOUT_SECONDS)
         if self._hotkey is not None:
             self._hotkey.stop()
             self._hotkey = None
         if self._suspend_loop is not None:
-            # 用户要求手动恢复：退出只解除接管，不替他恢复目标进程。
+            # 退出只解除接管，不替他恢复目标进程：需要手动恢复时先按热键再退出。
             self._suspend_loop.detach()
             self._suspend_loop = None
 
@@ -802,6 +990,7 @@ class Overlay:
         name = event.get("event")
         gear_slot = event.get("gear_slot") or ""
         text = event.get("text") or ""
+        self._update_suspend_on_fish(name, gear_slot)
         # 来鱼/咬钩保持到下一条事件(咬钩/搏鱼/结算/脱钩)覆盖，不再定时消失；
         # 入护/脱钩/放生维持 3 秒后消失。
         if name in ("fish_kept", "fish_escaped", "fish_released"):

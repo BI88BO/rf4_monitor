@@ -1,9 +1,10 @@
-"""进程挂起控制：从旧 RF4 工具移植的 F8 挂起/恢复功能。"""
+"""进程挂起控制：SuspendThread 挂起/恢复游戏进程，行为对齐参考版「F4雷达」。"""
 from __future__ import annotations
 
 import ctypes
 import json
 import os
+import queue
 import threading
 from ctypes import wintypes as wt
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ HOTKEY_ID = 0x4D4F  # "MO"，仅作为当前进程消息队列里的本地 id
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
+# 首选键被别的程序占用时按这个顺序顺延，绑上哪个键就显示哪个。
+# 参考版首选 F7，本机 F7 常被别的程序占着，所以首选仍是 F8，F7 放最后兜底。
+HOTKEY_FALLBACK_KEYS = ("F8", "F9", "F6", "F5", "F7")
 
 
 class _ProcessEntry(ctypes.Structure):
@@ -90,7 +94,7 @@ def _configure_hotkey_api() -> None:
 class SuspendConfig:
     enabled: bool = True
     process_names: tuple[str, ...] = DEFAULT_PROCESS_NAMES
-    resume_on_fish: bool = True
+    hotkey: str = "F8"
 
     @classmethod
     def from_dict(cls, data: object) -> "SuspendConfig":
@@ -100,12 +104,13 @@ class SuspendConfig:
             names = [names]
         if not isinstance(names, list) or not names:
             names = list(DEFAULT_PROCESS_NAMES)
+        hotkey = str(raw.get("hotkey", "")).strip().upper() or "F8"
         return cls(
             enabled=bool(raw.get("enabled", True)),
             process_names=tuple(
                 str(name).lower() for name in names if str(name).strip()
             ),
-            resume_on_fish=bool(raw.get("resume_on_fish", True)),
+            hotkey=hotkey,
         )
 
     @classmethod
@@ -218,36 +223,55 @@ class ProcessSuspender:
 
 
 class SuspendLoop:
-    """F8 挂起/恢复控制器：挂起后一直保持，直到再按 F8 或来鱼自动解除。
+    """F8 挂起控制器 + 来鱼流程：来鱼解冻，咬钩自动冻回去。
 
-    没有倒计时自动恢复。事件线程要解除挂起时只投递一个 Event，
-    真正的 Win32 resume 仍在 tick 所在的挂起线程里执行，避免两个线程
-    并发操作同一批线程句柄。
+    挂起后按 F8 是唯一的手动开关；来鱼流程是自动的：
+      挂起 →(fish_incoming) 解冻并待命 →(fish_bitten) 再挂起，鱼冻在咬钩那一帧，
+      玩家有不限时看浮窗，要拉杆再按 F8。待命期间按 F8 视为玩家接管，自动解除待命。
+    除热键外，只有挂起线程自己会调 Win32：Tk 事件线程只往 _actions 投递动作，
+    由 tick() 取出执行，两个线程不会并发操作同一批线程句柄。
     """
 
     def __init__(self, process: ProcessSuspender, config: SuspendConfig) -> None:
         self.process = process
         self.config = config
         self.suspended = False
+        self.armed = False
         self.error = ""
-        self._release_requested = threading.Event()
+        # 热键注册成功后由浮窗改成真正绑上的键（首选键被占用时会顺延）。
+        self.hotkey_label = config.hotkey
+        self.fish_notes: list[str] = []
+        self._actions: queue.Queue[tuple[str, str]] = queue.Queue()
 
-    def request_release(self) -> None:
-        """来鱼/咬钩时由事件线程调用；实际恢复由下一个 tick 执行。"""
-        if self.config.resume_on_fish:
-            self._release_requested.set()
+    def request(self, action: str, label: str = "") -> None:
+        """Tk 线程投递动作（release/freeze/disarm），真正的挂起在 tick 里做。"""
+        self._actions.put((action, label))
+
+    def note_fish(self, label: str) -> None:
+        """咬钩冻住的竿号只给状态行显示，不参与挂起判断。
+
+        整表替换而不是原地 append：写的人是挂起线程，读的人是 Tk 线程，
+        重新赋值在 GIL 下原子，读到的必是完整的前一版或后一版。
+        """
+        if not label or label in self.fish_notes:
+            return
+        self.fish_notes = [*self.fish_notes, label]
 
     def start(self) -> bool:
-        self._release_requested.clear()
+        self.armed = False
+        self.fish_notes = []
         if not self.process.suspend():
             self.suspended = False
-            self.error = "未找到 rf4_x64.exe 或挂起失败"
+            names = "/".join(self.config.process_names) or "游戏进程"
+            self.error = f"未找到 {names} 或挂起失败，游戏启动后再按 {self.hotkey_label}"
             return False
         self.error = ""
         self.suspended = True
         return True
 
     def stop(self) -> bool:
+        self.armed = False
+        self.fish_notes = []
         if not self.suspended:
             self.error = ""
             return False
@@ -258,34 +282,76 @@ class SuspendLoop:
 
     def detach(self) -> None:
         """停止本控制器接管，但保留当前挂起状态，由用户手动恢复。"""
-        self._release_requested.clear()
+        self.armed = False
+        self.fish_notes = []
         self.error = ""
 
     def toggle(self) -> bool:
+        # 待命时按热键算玩家自己接管：不再自动冻回去。
+        self.armed = False
         if self.suspended:
             return self.stop()
         return self.start()
 
     def tick(self) -> None:
-        if self._release_requested.is_set():
-            self._release_requested.clear()
-            self.stop()
+        while True:
+            try:
+                action, label = self._actions.get_nowait()
+            except queue.Empty:
+                return
+            if action == "release":
+                # 只在真的冻着、而且不是为拉杆冻着的时候解冻。
+                if self.suspended and not self.fish_notes:
+                    self.stop()
+                    self.armed = True
+            elif action == "freeze":
+                if self.armed:
+                    self.armed = False
+                    if not self.suspended:
+                        self.start()
+                    self.note_fish(label)
+                elif self.suspended and self.fish_notes:
+                    # 已经为拉杆冻住了：别的竿再咬钩只多标一笔，不动冻结状态。
+                    self.note_fish(label)
+            elif action == "disarm":
+                self.armed = False
 
     def status_text(self) -> str:
         if self.error:
             return self.error
-        return "已挂起" if self.suspended else ""
+        notes = self.fish_notes
+        if self.suspended:
+            if notes:
+                return f"游戏已挂起 · {'、'.join(notes)}，按 {self.hotkey_label} 拉杆"
+            return f"游戏已挂起（{self.hotkey_label} 恢复）"
+        if self.armed:
+            return "等待咬钩，咬钩自动挂起"
+        return ""
 
 
 class GlobalHotkey:
-    """注册进程级全局热键；F8 按下后由浮窗轮询消费。"""
+    """注册系统级热键；按下后由浮窗轮询消费。
 
-    def __init__(self, hotkey: str = "F8") -> None:
+    首选键被别的程序占用时按 HOTKEY_FALLBACK_KEYS 顺延，绑上哪个键就写在
+    bound_key 里，浮窗的状态文本跟着显示。
+    """
+
+    def __init__(
+        self,
+        hotkey: str = "F8",
+        fallbacks: Sequence[str] = HOTKEY_FALLBACK_KEYS,
+    ) -> None:
         self.hotkey = hotkey.upper()
+        self.fallbacks = tuple(str(key).upper() for key in fallbacks)
+        self.bound_key = ""
         self.triggered = threading.Event()
         self._stop = threading.Event()
         self._registered = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _candidates(self) -> tuple[str, ...]:
+        keys = [self.hotkey, *self.fallbacks]
+        return tuple(dict.fromkeys(key for key in keys if key))
 
     @staticmethod
     def _key_parts(hotkey: str) -> tuple[int, int]:
@@ -318,20 +384,27 @@ class GlobalHotkey:
         if os.name != "nt":
             return
         _configure_hotkey_api()
-        try:
-            modifiers, vk = self._key_parts(self.hotkey)
-        except ValueError:
-            return
         user32 = ctypes.windll.user32
-        if not user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+        for key in self._candidates():
+            try:
+                modifiers, vk = self._key_parts(key)
+            except ValueError:
+                continue
+            if not user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+                continue
+            self.bound_key = key
+            self._registered.set()
+            try:
+                self._message_loop(user32)
+            finally:
+                user32.UnregisterHotKey(None, HOTKEY_ID)
             return
-        self._registered.set()
+
+    def _message_loop(self, user32) -> None:
         message = wt.MSG()
         while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
             if message.message == WM_HOTKEY and message.wParam == HOTKEY_ID:
                 self.triggered.set()
-
-        user32.UnregisterHotKey(None, HOTKEY_ID)
 
     def start(self) -> bool:
         if os.name != "nt":

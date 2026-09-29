@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,6 +292,77 @@ class OverlayGeometryTests(unittest.TestCase):
         self.assertEqual(long, overlay_mod.WINDOW_MAX_WIDTH)
 
 
+class OverlayMeasuredLayoutTests(unittest.TestCase):
+    """窗口高度以画布实测为准：估算少折一行会把下面一行裁掉半截。"""
+
+    def _overlay(self, bbox_result, estimate: int) -> tuple[Overlay, list, list]:
+        ov = object.__new__(Overlay)
+        specs: list[str] = []
+        drawn: list[dict] = []
+        canvas = type("C", (), {
+            "delete": lambda self, tag: None,
+            "bbox": lambda self, tags: bbox_result,
+        })()
+        ov.canvas = canvas
+        ov.root = SimpleNamespace(geometry=lambda spec: specs.append(spec))
+        ov._lines_for_display = lambda: ["1号杆 | 体力 78% 出线 12.3米 已抛竿 深3.9米"]
+        ov._content_width = lambda lines: 320
+        ov._content_height = lambda lines, width: estimate
+        ov._draw = lambda **kwargs: drawn.append(kwargs)
+        ov._show = lambda: None
+        return ov, specs, drawn
+
+    def test_window_grows_to_measured_height(self) -> None:
+        # 估算给 60px，画布实测文字画到 88px：窗口必须跟着长到 88+PAD_Y。
+        ov, specs, drawn = self._overlay((12, 10, 300, 88), 60)
+        ov._refresh_display()
+        self.assertEqual(specs, ["320x60", f"320x{88 + Overlay.PAD_Y}"])
+        self.assertEqual([d["height"] for d in drawn], [60, 88 + Overlay.PAD_Y])
+
+    def test_window_keeps_estimate_when_measured_fits(self) -> None:
+        ov, specs, drawn = self._overlay((12, 10, 300, 45), 60)
+        ov._refresh_display()
+        self.assertEqual(specs, ["320x60"])
+        self.assertEqual(len(drawn), 1)
+
+    def test_missing_bbox_falls_back_to_estimate(self) -> None:
+        # 测试/未建画布时没有 bbox 可调，退回估算值，不能抛异常。
+        ov, specs, drawn = self._overlay(None, 60)
+        ov._refresh_display()
+        self.assertEqual(specs, ["320x60"])
+        self.assertEqual(len(drawn), 1)
+
+    def test_canvas_without_bbox_is_tolerated(self) -> None:
+        ov, specs, drawn = self._overlay((12, 10, 300, 88), 60)
+        del ov.canvas
+        ov.canvas = type("C", (), {"delete": lambda self, tag: None})()
+        ov._refresh_display()
+        self.assertEqual(specs, ["320x60"])
+
+    def test_dim_block_starts_at_measured_rod_bottom(self) -> None:
+        # 竿行折成两行时，遥测块要按实测底部起算，否则两块文字叠在一起。
+        ov = object.__new__(Overlay)
+        created: list[tuple] = []
+        canvas = type("C", (), {
+            "delete": lambda self, tag: None,
+            "create_text": lambda self, *a, **k: (
+                created.append((a, k)) or 3
+            ),
+            "bbox": lambda self, tags: (12, 10, 316, 50) if tags == "rod" else None,
+        })()
+        ov.style = Overlay.STYLE_TRANSPARENT
+        ov.canvas = canvas
+        ov._ensure_canvas = lambda: canvas
+        ov._capture_active = True
+        ov._anticheat_red = False
+        ov._rows = {"1号杆": "1号杆 | 体力 78% 出线 12.3米"}
+        ov._telemetry_rows = {1: "商店折扣"}
+        ov._suspend_loop = None
+        ov._draw(width=320, height=90)
+        dim = [item for item in created if item[1].get("tags") == ("body",)][0]
+        self.assertEqual(dim[0][1], 50 + 3)
+
+
 class OverlayCompactTests(unittest.TestCase):
     """浮窗紧凑化：搏鱼行单行化 + 事件短句化，三竿同开不再满屏折行。"""
 
@@ -454,15 +527,15 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         ov = object.__new__(Overlay)
         ov._rows = {}
         ov._telemetry_rows = {}
-        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 119")
-        self.assertEqual(ov._lines_for_display(), ["来鱼提示 · 待机中", "已挂起 119"])
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起")
+        self.assertEqual(ov._lines_for_display(), ["来鱼提示 · 待机中", "已挂起"])
 
     def test_suspend_status_uses_red_even_without_capture(self) -> None:
         ov = object.__new__(Overlay)
         ov.style = Overlay.STYLE_TRANSPARENT
         ov._rows = {}
         ov._telemetry_rows = {}
-        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 119")
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起")
         ov._capture_active = False
         created: list[tuple] = []
         canvas = type("C", (), {
@@ -473,48 +546,38 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         ov._ensure_canvas = lambda: canvas
         ov._draw(width=320, height=60)
         self.assertEqual(created[0]["fill"], Overlay.CANVAS_RED)
-        self.assertEqual(created[0]["text"], "已挂起 119")
+        self.assertEqual(created[0]["text"], "已挂起")
 
-    def test_suspend_countdown_change_refreshes_display(self) -> None:
-        texts = ["已挂起 60", "已挂起 59"]
+    def test_suspend_status_unchanged_does_not_repaint(self) -> None:
         ov = object.__new__(Overlay)
-        ov._suspend_loop = SimpleNamespace(
-            tick=lambda: texts.pop(0),
-            status_text=lambda: texts[0],
-        )
+        ov._last_suspend_status = "已挂起"
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起")
         refresh_calls: list[bool] = []
         ov._refresh_display = lambda: refresh_calls.append(True)
-        ov._update_suspend_loop()
-        self.assertEqual(ov._suspend_loop.status_text(), "已挂起 59")
-        self.assertEqual(refresh_calls, [True])
+        ov._sync_suspend_status()
+        self.assertEqual(refresh_calls, [])
 
-    def test_suspend_countdown_change_between_polls_refreshes_display(self) -> None:
-        # F8 后立刻画 60；下一次轮询读取到的可能已经是 59。
-        # 必须和上次画出的状态比较，否则 60 会一直挂到状态机切换。
+    def test_suspend_status_change_between_polls_refreshes_display(self) -> None:
+        # 状态机改了状态，浮窗只能在轮询里追：和上次画出的文本比。
         ov = object.__new__(Overlay)
-        ov._last_suspend_status = "已挂起 60"
-        ov._suspend_loop = SimpleNamespace(
-            tick=lambda: None,
-            status_text=lambda: "已挂起 59",
-        )
+        ov._last_suspend_status = ""
+        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起")
         refresh_calls: list[bool] = []
         ov._refresh_display = lambda: refresh_calls.append(True)
-        ov._update_suspend_loop()
-        self.assertEqual(ov._last_suspend_status, "已挂起 59")
+        ov._sync_suspend_status()
+        self.assertEqual(ov._last_suspend_status, "已挂起")
         self.assertEqual(refresh_calls, [True])
 
-    def test_failed_toggle_shows_persistent_error(self) -> None:
+    def test_failed_suspend_shows_persistent_error(self) -> None:
         ov = object.__new__(Overlay)
         ov._rows = {}
         ov._telemetry_rows = {}
         ov._suspend_loop = SimpleNamespace(
-            suspended=False,
-            toggle=lambda: False,
-            status_text=lambda: "未找到 rf4_x64.exe 或挂起失败",
+            status_text=lambda: "未找到 rf4_x64.exe 或挂起失败"
         )
         refresh_calls: list[bool] = []
         ov._refresh_display = lambda: refresh_calls.append(True)
-        ov._toggle_suspend()
+        ov._sync_suspend_status()
         self.assertEqual(
             ov._lines_for_display(),
             ["来鱼提示 · 待机中", "未找到 rf4_x64.exe 或挂起失败"],
@@ -537,15 +600,35 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         self.assertIsNone(ov._hotkey)
         self.assertEqual(
             ov._lines_for_display(),
-            ["来鱼提示 · 待机中", "F8 热键注册失败，可能已被占用"],
+            ["来鱼提示 · 待机中", "F8 等热键都被占用，挂起不可用"],
         )
         self.assertEqual(refresh_calls, [True])
 
-    def test_fish_row_and_suspend_countdown_are_shown_together(self) -> None:
+    def test_bound_key_is_used_in_status_text(self) -> None:
+        # F8 被占用时热键会顺延，状态文本必须报真正绑上的那个键。
+        ov = object.__new__(Overlay)
+        ov._suspend_loop = SimpleNamespace(hotkey_label="F8")
+        real_hotkey = overlay_mod.GlobalHotkey
+        overlay_mod.GlobalHotkey = lambda hotkey: SimpleNamespace(
+            start=lambda: True, bound_key="F9"
+        )
+        try:
+            ov._start_suspend_hotkey()
+        finally:
+            overlay_mod.GlobalHotkey = real_hotkey
+        self.assertEqual(ov._suspend_loop.hotkey_label, "F9")
+        self.assertIsNone(ov._suspend_error)
+        self.assertEqual(ov._hotkey.bound_key, "F9")
+        ov._hotkey.stop = lambda: None
+
+    def test_fish_row_and_suspend_status_are_shown_together(self) -> None:
         ov = object.__new__(Overlay)
         ov._rows = {"1号杆": "黑线鳕444g 咬钩"}
         ov._telemetry_rows = {}
-        ov._suspend_loop = SimpleNamespace(status_text=lambda: "已挂起 60")
+        ov._suspend_loop = SimpleNamespace(
+            request=lambda action, label: None,
+            status_text=lambda: "已挂起 · 1号杆咬钩，按 F8 拉杆",
+        )
         refresh_calls: list[bool] = []
         ov._refresh_display = lambda: refresh_calls.append(True)
         ov.root = SimpleNamespace(after=lambda delay, fn: None)
@@ -557,9 +640,167 @@ class OverlaySuspendDisplayTests(unittest.TestCase):
         ov._handle_event_payload(payload)
         self.assertEqual(
             ov._lines_for_display(),
-            ["黑线鳕444g 咬钩", "已挂起 60"],
+            ["黑线鳕444g 咬钩", "已挂起 · 1号杆咬钩，按 F8 拉杆"],
         )
         self.assertEqual(len(refresh_calls), 1)
+
+    def test_poll_syncs_suspend_display_only(self) -> None:
+        # 回归：状态机曾挂在 _poll 的 finally 里，读库退避(最高 1s)会拖慢轮询。
+        # 轮询现在只负责把文本搬到浮窗上。
+        driven: list[str] = []
+        ov = object.__new__(Overlay)
+        ov._drain_events = lambda: None
+        ov._flush_deferred_refresh = lambda: None
+        ov._sync_suspend_status = lambda: driven.append("sync")
+        delays: list[int] = []
+        ov.root = SimpleNamespace(after=lambda delay, fn: delays.append(delay))
+        ov._poll()
+        self.assertEqual(driven, ["sync"])
+        self.assertEqual(delays, [Overlay.POLL_INTERVAL_MS])
+
+
+class _FakeStop:
+    """挂起线程的假停止信号：放行 beats 拍后要求退出。"""
+
+    def __init__(self, beats: int) -> None:
+        self.left = beats
+        self.slept: list[float] = []
+
+    def wait(self, timeout: float) -> bool:
+        if self.left <= 0:
+            return True
+        self.left -= 1
+        self.slept.append(timeout)
+        return False
+
+
+class OverlaySuspendThreadTests(unittest.TestCase):
+    """状态机跑在独立线程上：节拍恒定、不碰 Tk、退出时能被停住。"""
+
+    INTERVAL_SECONDS = Overlay.SUSPEND_TICK_INTERVAL_MS / 1000.0
+
+    def _overlay(self, beats: int, loop, hotkey=None) -> tuple[Overlay, _FakeStop]:
+        ov = object.__new__(Overlay)
+        stop = _FakeStop(beats)
+        ov._suspend_loop = loop
+        ov._hotkey = hotkey
+        ov._suspend_stop = stop
+        return ov, stop
+
+    def test_worker_beats_on_a_constant_interval(self) -> None:
+        beats: list[str] = []
+        loop = SimpleNamespace(tick=lambda: beats.append("tick"))
+        hotkey = SimpleNamespace(poll=lambda: beats.append("poll") or False)
+        ov, stop = self._overlay(3, loop, hotkey)
+        ov._suspend_worker()
+        self.assertEqual(beats, ["poll", "tick"] * 3)
+        self.assertEqual(stop.slept, [self.INTERVAL_SECONDS] * 3)
+
+    def test_worker_toggles_when_hotkey_fires(self) -> None:
+        toggles: list[int] = []
+        loop = SimpleNamespace(tick=lambda: None, toggle=lambda: toggles.append(1))
+        ov, _ = self._overlay(2, loop, SimpleNamespace(poll=lambda: True))
+        ov._suspend_worker()
+        self.assertEqual(toggles, [1, 1])
+
+    def test_worker_keeps_beating_after_a_failed_toggle(self) -> None:
+        # 一次 Win32 调用出错不能停摆，否则游戏就永久冻住了。
+        polls: list[int] = []
+
+        def toggle() -> bool:
+            raise OSError("OpenThread failed")
+
+        ov, _ = self._overlay(
+            2,
+            SimpleNamespace(tick=lambda: None, toggle=toggle),
+            SimpleNamespace(poll=lambda: polls.append(1) or True),
+        )
+        ov._suspend_worker()
+        self.assertEqual(polls, [1, 1])
+
+    def test_engine_stays_off_without_suspend_loop(self) -> None:
+        ov = object.__new__(Overlay)
+        ov._suspend_loop = None
+        ov._start_suspend_engine()
+        self.assertIsNone(ov._suspend_thread)
+
+    def test_close_joins_the_worker_before_detaching(self) -> None:
+        order: list[str] = []
+        ov = object.__new__(Overlay)
+        ov._suspend_loop = SimpleNamespace(
+            tick=lambda: None,
+            toggle=lambda: order.append("toggle"),
+            detach=lambda: order.append("detach"),
+        )
+        ov._hotkey = SimpleNamespace(
+            poll=lambda: order.append("beat") or True, stop=lambda: None
+        )
+        ov._start_suspend_engine()
+        thread = ov._suspend_thread
+        self.assertIsInstance(thread, threading.Thread)
+        deadline = time.time() + 1.0
+        while "beat" not in order and time.time() < deadline:
+            time.sleep(0.005)
+        ov._close_suspend()
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(ov._suspend_thread)
+        self.assertIn("beat", order)
+        self.assertEqual(order[-1], "detach")
+        # 线程已停：节拍计数不再增长。
+        beats = order.count("beat")
+        time.sleep(self.INTERVAL_SECONDS * 4)
+        self.assertEqual(order.count("beat"), beats)
+
+
+class OverlaySuspendFishFlowTests(unittest.TestCase):
+    """浮窗只把来鱼事件翻译成动作：Tk 线程不直接挂起/恢复游戏进程。"""
+
+    def _overlay(self) -> tuple[Overlay, list[tuple[str, str]]]:
+        actions: list[tuple[str, str]] = []
+        ov = object.__new__(Overlay)
+        ov._suspend_loop = SimpleNamespace(
+            request=lambda action, label: actions.append((action, label))
+        )
+        return ov, actions
+
+    def test_incoming_requests_thaw_and_bite_requests_freeze(self) -> None:
+        ov, actions = self._overlay()
+        ov._update_suspend_on_fish("fish_incoming", "2号杆")
+        ov._update_suspend_on_fish("fish_bitten", "2号杆")
+        self.assertEqual(
+            actions, [("release", "2号杆来鱼"), ("freeze", "2号杆咬钩")]
+        )
+
+    def test_slot_less_fish_keeps_the_verb(self) -> None:
+        ov, actions = self._overlay()
+        ov._update_suspend_on_fish("fish_incoming", "")
+        self.assertEqual(actions, [("release", "来鱼")])
+
+    def test_fish_end_and_session_events_disarm(self) -> None:
+        for name in (
+            "fish_kept",
+            "fish_escaped",
+            "fish_released",
+            "reset",
+            "session_end",
+        ):
+            ov, actions = self._overlay()
+            ov._update_suspend_on_fish(name, "2号杆")
+            self.assertEqual(actions, [("disarm", "")], name)
+
+    def test_telemetry_does_not_touch_suspend(self) -> None:
+        # 待命期间遥测一行行地刷，绝不能把待命状态打掉。
+        ov, actions = self._overlay()
+        ov._update_suspend_on_fish("telemetry", "2号杆")
+        ov._update_suspend_on_fish("fish_catch", "2号杆")
+        ov._update_suspend_on_fish("chat", "2号杆")
+        self.assertEqual(actions, [])
+
+    def test_disabled_suspend_feature_never_reaches_handler(self) -> None:
+        ov, _ = self._overlay()
+        ov._suspend_loop = None
+        ov._update_suspend_on_fish("fish_bitten", "2号杆")
+        self.assertIsNone(ov._suspend_loop)
 
 
 class OverlayCaptureStateTests(unittest.TestCase):
