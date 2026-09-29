@@ -631,6 +631,9 @@ class RodPhaseTests(unittest.TestCase):
         self.bridge = RF4ChatBridge()
         self.session = FlowSession(profile=get_profile("4.0.24799"))
         self.gear = "5a43c383-1111-1111-1111-111111111111"
+        # 定时器换成登记表：断言"何时补发什么"，而不是真等 3 秒。
+        self.scheduled: list[tuple[float, object]] = []
+        self.bridge._schedule_after = lambda delay, callback: self.scheduled.append((delay, callback))
 
     def tearDown(self) -> None:
         import rf4_core.bridge as bridge_mod
@@ -670,6 +673,64 @@ class RodPhaseTests(unittest.TestCase):
         )
         self.assertEqual(self.session.rod_phase_by_gear[self.gear], "result")
         self.assertGreater(self.session.rod_result_until_by_gear[self.gear], 0.0)
+
+    def test_result_phase_schedules_row_restore(self) -> None:
+        """回归：脱钩后线还在水里，展示结束必须回到"已抛竿"而不是"已收竿"。
+
+        实测日志：脱钩广播后同钓组的 14/7 位置上报继续每秒上报，
+        而 3 秒后浮窗被写成"已收竿"——那是这里凭空补出来的一行。
+        """
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.session.slot_items[3] = self.gear
+        self.session.fight_depth_by_gear[self.gear] = 1.64
+        emitted: list[tuple[str, str]] = []
+        self.bridge._log_telemetry = lambda cat, text: emitted.append((cat, text))
+
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_ESCAPED)
+        )
+
+        self.assertEqual(len(self.scheduled), 1)
+        delay, callback = self.scheduled[0]
+        self.assertEqual(delay, self.bridge.ROD_RESULT_HOLD_SECONDS)
+        self.assertEqual(emitted, [])
+        callback()
+        self.assertEqual(emitted, [("fight_status", "3号杆 已抛竿 深1.6米")])
+        self.assertEqual(self.session.rod_phase_by_gear[self.gear], "waiting")
+        self.assertNotIn(self.gear, self.session.rod_result_until_by_gear)
+
+    def test_retrieved_rod_gets_no_invented_row(self) -> None:
+        """入护时客户端已发 14/4（深度被清）：定时器不得再补任何一行。"""
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.session.slot_items[3] = self.gear
+        emitted: list[tuple[str, str]] = []
+        self.bridge._log_telemetry = lambda cat, text: emitted.append((cat, text))
+
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_KEPT)
+        )
+        self.scheduled[0][1]()
+
+        self.assertEqual(emitted, [])
+        self.assertNotIn(self.gear, self.session.rod_phase_by_gear)
+
+    def test_recast_within_hold_skips_retrieved_row(self) -> None:
+        from rf4_core.bridge import RF4ChatBridge
+
+        self.session.slot_items[3] = self.gear
+        emitted: list[tuple[str, str]] = []
+        self.bridge._log_telemetry = lambda cat, text: emitted.append((cat, text))
+        self.bridge._set_rod_phase_for_event(
+            self.session, self._event(RF4ChatBridge.SELF_EVENT_PHASE_KEPT)
+        )
+        self.session.rod_phase_by_gear[self.gear] = "waiting"
+
+        self.scheduled[0][1]()
+
+        self.assertEqual(emitted, [])
+        self.assertEqual(self.session.rod_phase_by_gear[self.gear], "waiting")
 
     def test_event_without_gear_is_ignored(self) -> None:
         from rf4_core.bridge import RF4ChatBridge

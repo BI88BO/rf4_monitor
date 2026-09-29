@@ -16,8 +16,13 @@ rf4_overlay_config.json
 rf4_show_config.json
 rf4_core/rf4_token_cache.json
 rf4_core/rf4_overlay_events.sqlite3
+# WAL 边文件与损坏库的隔离副本（事件库自愈重建时改名留下）
+rf4_core/rf4_overlay_events.sqlite3*
 rf4_core/rf4_overlay_config.json
 rf4_core/rf4_show_config.json
+# 浮窗竿行落盘（重启恢复）与装备槽位缓存：都是运行时状态
+rf4_core/rf4_overlay_rows.json
+rf4_core/rf4_rod_slot_cache.json
 
 # Deprecated deployment directories
 packaging/

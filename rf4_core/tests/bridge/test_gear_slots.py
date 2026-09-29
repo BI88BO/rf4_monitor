@@ -10,8 +10,10 @@ from types import SimpleNamespace
 from rf4_core import bridge as bridge_mod
 from rf4_core.bridge import FlowSession, RF4ChatBridge
 from rf4_core.protocol import (
+    build_request_envelope,
     build_response_envelope,
     get_profile,
+    pack_arg_header,
     pack_u16,
     pack_u32,
 )
@@ -227,3 +229,92 @@ class RodSlotCacheTests(unittest.TestCase):
         shortcut_items = raw.get("shortcut_items", {})
         self.assertIn("1", shortcut_items)
         self.assertNotIn("4", shortcut_items)
+
+
+class SlotRequestEvidenceTests(unittest.TestCase):
+    """11/x(装备槽位)请求：登记 call_id 并把请求内容记入日志供取证。
+
+    竿号目前只能从登录时的 11/1 全量映射学到；实测 11/2 换杆响应只带
+    slot_type=4(当前活动位)，学不到快捷键编号。请求内容是否带目标槽位号
+    决定了"晚启动抓包"能否实时恢复竿号，所以必须先留痕再改行为。
+    """
+
+    def setUp(self) -> None:
+        self._prev_ctx = getattr(bridge_mod, "ctx", None)
+        bridge_mod.ctx = SimpleNamespace(
+            options=SimpleNamespace(
+                rf4_verbose_logging=False,
+                rf4_log_telemetry=True,
+                rf4_telemetry_categories="all",
+            )
+        )
+        self.bridge = RF4ChatBridge()
+        self.logs: list[str] = []
+        self.bridge._log = lambda text: self.logs.append(text)
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+
+    def tearDown(self) -> None:
+        bridge_mod.ctx = self._prev_ctx
+
+    def _switch_request(self, call_id: int) -> bytes:
+        payload = pack_arg_header(b"507", 1) + pack_u32(2)
+        return build_request_envelope(
+            call_id=call_id, main_cmd=11, sub_cmd=2, payload=payload
+        )
+
+    def test_switch_request_registers_call_id_and_logs_payload(self) -> None:
+        self.bridge._handle_client_frame(self.session, self._switch_request(21))
+        self.assertEqual(self.session.slot_request_calls.get(21), 2)
+        line = next((text for text in self.logs if "客户端切换装备槽位" in text), "")
+        self.assertIn("hex=", line)
+        self.assertIn(pack_u32(2).hex(), line)
+
+
+class RodLabelTests(unittest.TestCase):
+    """竿号标签：没学到任何快捷键映射时要说清楚，不能静默冒充手持竿。"""
+
+    def setUp(self) -> None:
+        self._prev_ctx = getattr(bridge_mod, "ctx", None)
+        bridge_mod.ctx = SimpleNamespace(
+            options=SimpleNamespace(
+                rf4_verbose_logging=False,
+                rf4_log_telemetry=True,
+                rf4_telemetry_categories="all",
+            )
+        )
+        self.bridge = RF4ChatBridge()
+        self.logs: list[str] = []
+        self.bridge._log = lambda text: self.logs.append(text)
+        self.session = FlowSession(profile=get_profile("4.0.24799"))
+        self.gear = "11111111-1111-1111-1111-111111111111"
+
+    def tearDown(self) -> None:
+        bridge_mod.ctx = self._prev_ctx
+
+    @property
+    def _hints(self) -> list[str]:
+        return [text for text in self.logs if "未捕获装备槽位映射" in text]
+
+    def test_mapped_gear_label(self) -> None:
+        self.session.slot_items[3] = self.gear
+        self.assertEqual(self.bridge._rod_label(self.session, self.gear), "3号杆")
+        self.assertEqual(self._hints, [])
+
+    def test_hand_rod_with_known_mapping_does_not_hint(self) -> None:
+        # 映射在手，查不到这根竿 = 真的没上快捷键，显示手持竿且不该报警。
+        self.session.slot_items[1] = self.gear
+        other = "22222222-2222-2222-2222-222222222222"
+        self.assertEqual(self.bridge._rod_label(self.session, other), "手持竿")
+        self.assertEqual(self._hints, [])
+
+    def test_missing_mapping_hints_once(self) -> None:
+        other = "22222222-2222-2222-2222-222222222222"
+        self.assertEqual(self.bridge._rod_label(self.session, other), "手持竿")
+        self.assertEqual(self.bridge._rod_label(self.session, other), "手持竿")
+        self.assertEqual(len(self._hints), 1)
+
+    def test_active_slot_only_counts_as_missing_mapping(self) -> None:
+        # 只回到过 slot_type=4(当前活动位)：没有竿号，属于"没学到映射"。
+        self.session.slot_items[4] = self.gear
+        self.assertEqual(self.bridge._rod_label(self.session, self.gear), "手持竿")
+        self.assertEqual(len(self._hints), 1)

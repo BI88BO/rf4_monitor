@@ -2477,7 +2477,7 @@ class PacketObserver:
             )
         ]
         for flow_key, session in stale:
-            self._remove_auto_session(flow_key, session)
+            self._remove_auto_session(flow_key, session, notify_session_end=False)
 
     def _promote_candidate(
         self,
@@ -2616,6 +2616,7 @@ class PacketObserver:
         session: PassiveSession,
         flags: Optional[int] = None,
         from_client: Optional[bool] = None,
+        notify_session_end: bool = True,
     ) -> None:
         active = self._auto_sessions.pop(key, None)
         self._remember_rc4_handoff(session)
@@ -2643,10 +2644,12 @@ class PacketObserver:
         _print_line("session", f"realtime 连接已关闭{close_detail} | 会话={session.session_id}")
         # 会话结束（小退/断连）：通知浮窗清空（含等待咬钩的竿行），避免残留旧状态；
         # 若是切服/重连，新会话开始时会用承接状态把等待中的竿行补发回来。
-        try:
-            self.bridge.broadcast_session_end()
-        except Exception:
-            pass
+        # 退役镜像流（加速器双抓）不算会话结束：真会话还在跑，通知会把浮窗清空。
+        if notify_session_end:
+            try:
+                self.bridge.broadcast_session_end()
+            except Exception:
+                pass
 
     def _expire_candidates(self) -> None:
         now = time.monotonic()

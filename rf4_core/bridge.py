@@ -186,6 +186,8 @@ class FlowSession:
     latest_location_id: Optional[str] = None
     latest_users_count: Optional[int] = None
     slot_items: Dict[int, str] = field(default_factory=dict)
+    # 无快捷键映射时的一次性"竿号未识别"提示标记（每个会话最多提示一次）。
+    slot_mapping_hint_shown: bool = False
     next_synthetic_event_id: int = 0x71000000
     next_synthetic_call_id: int = 0x61000000
     next_synthetic_wire_id: int = 0x100000
@@ -255,6 +257,10 @@ class RF4ChatBridge:
     ROD_PHASE_ENDED = "ended"
     # 结算结果（入护/脱钩/放生）在竿行的展示时长，期间不被深度行覆盖。
     ROD_RESULT_HOLD_SECONDS = 3.0
+    # 浮窗事件库：保留最近多少条事件、每多少次写入清理一次、连续写失败几次判定库损坏。
+    OVERLAY_ROWS_TO_KEEP = 2000
+    OVERLAY_CLEANUP_EVERY_WRITES = 100
+    OVERLAY_CORRUPT_WRITE_FAILURES = 3
     TELEMETRY_CATEGORY_LABELS = {
         "fish": "钓鱼",
         "player": "人物",
@@ -511,6 +517,8 @@ class RF4ChatBridge:
         self._overlay_con: Optional[sqlite3.Connection] = None
         self._overlay_con_path: Optional[Path] = None
         self._overlay_write_lock = threading.Lock()
+        self._overlay_write_failures = 0
+        self._overlay_writes_since_cleanup = 0
         self._rod_slot_cache_path = THIS_DIR / "rf4_rod_slot_cache.json"
 
     def _load_item_catalog_index(self) -> None:
@@ -942,19 +950,59 @@ class RF4ChatBridge:
                     (time.time(), event_type, payload),
                 )
                 con.commit()
-                # 每 100 次写入清理一次旧事件。id 单调递增，按阈值删除即可。
-                row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-                keep_from_id = int(row_id) - 2000
-                if keep_from_id > 0:
-                    con.execute(
-                        "DELETE FROM overlay_events WHERE id <= ?",
-                        (keep_from_id,),
-                    )
-                    con.commit()
             except (OSError, sqlite3.Error):
-                self._close_overlay_db()
-                if ctx.options.rf4_verbose_logging:
-                    self._log(f"failed to write overlay event to {db_path}")
+                self._on_overlay_db_broken(db_path)
+                return
+            self._overlay_write_failures = 0
+            # 清理按次数节流：旧事件多留一会儿没有影响，但每条事件都跑一次
+            # DELETE + commit 会把写入延迟翻倍地摊到广播路径上。
+            self._overlay_writes_since_cleanup += 1
+            if self._overlay_writes_since_cleanup >= self.OVERLAY_CLEANUP_EVERY_WRITES:
+                self._overlay_writes_since_cleanup = 0
+                if not self._cleanup_overlay_events(con):
+                    # 清理失败是库损坏的典型信号(坏页多落在旧的已删除区间)。
+                    # 不升级处理的话事件库会无上限增长：实测损坏后 13MB/12.9 万条。
+                    self._on_overlay_db_broken(db_path)
+
+    def _cleanup_overlay_events(self, con: sqlite3.Connection) -> bool:
+        """按 id 阈值丢弃旧事件（id 单调递增，删除最旧区间即可）。返回是否清理成功。"""
+        try:
+            row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+            keep_from_id = int(row_id) - self.OVERLAY_ROWS_TO_KEEP
+            if keep_from_id > 0:
+                con.execute("DELETE FROM overlay_events WHERE id <= ?", (keep_from_id,))
+                con.commit()
+            return True
+        except sqlite3.Error:
+            # 坏页往往只在旧区间，连接本身还能继续写入，交给下一次重连。
+            self._close_overlay_db()
+            return False
+
+    def _on_overlay_db_broken(self, db_path: Path) -> None:
+        self._close_overlay_db()
+        self._overlay_write_failures += 1
+        if self._overlay_write_failures >= self.OVERLAY_CORRUPT_WRITE_FAILURES:
+            self._overlay_write_failures = 0
+            self._replace_corrupt_overlay_db(db_path)
+        if ctx.options.rf4_verbose_logging:
+            self._log(f"failed to write overlay event to {db_path}")
+
+    def _replace_corrupt_overlay_db(self, db_path: Path) -> None:
+        """事件库反复写失败(通常是库损坏)：改名隔离后重建空库。
+
+        重建后自增 id 从 1 重新开始，浮窗侧靠 id 回退检测重置游标(见
+        overlay.Overlay._realign_cursor)。改名失败说明还有别的进程持有该文件
+        (比如另一个监控实例)，此时保持原样，不做破坏性处理。
+        """
+        archived = db_path.with_name(
+            f"{db_path.name}.corrupt-{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        try:
+            db_path.rename(archived)
+        except OSError:
+            return
+        if ctx.options.rf4_verbose_logging:
+            self._log(f"overlay event db rebuilt, old file kept as {archived.name}")
 
     def _overlay_connection(self, db_path: Path) -> sqlite3.Connection:
         if self._overlay_con is not None and self._overlay_con_path == db_path:
@@ -966,6 +1014,7 @@ class RF4ChatBridge:
             self._ensure_overlay_db(con)
             con.execute("PRAGMA journal_mode = WAL")
             con.execute("PRAGMA synchronous = NORMAL")
+            con.commit()
             self._overlay_con = con
             self._overlay_con_path = db_path
         except Exception:
@@ -2930,6 +2979,15 @@ class RF4ChatBridge:
             and envelope.sub_cmd is not None
         ):
             session.slot_request_calls[envelope.call_id] = envelope.sub_cmd
+            # 请求内容常驻日志：11/2(换杆)响应实测只回 slot_type=4(当前活动位)，
+            # 学不到快捷键编号，所以竿号只能靠登录时的 11/1 全量映射。若请求里带了
+            # 目标槽位号，晚启动抓包就能凭一次换杆实时恢复竿号而不依赖磁盘缓存
+            # ——先取证，取证前不猜编码。
+            label = self.SLOT_COMMAND_LABELS.get(envelope.sub_cmd, "装备槽位操作")
+            self._log(
+                f"{self._format_business_line(f'客户端{label}', self._format_generic_business_payload(envelope.payload))} "
+                f"hex={self._hex_preview(envelope.payload, limit=96)}"
+            )
             if ctx.options.rf4_verbose_logging:
                 self._log(
                     f"slot_request sub={envelope.sub_cmd} payload={self._hex_preview(envelope.payload, limit=96)}"
@@ -2966,7 +3024,7 @@ class RF4ChatBridge:
                 session.fight_depth_by_gear.pop(cast_gear.fishing_gear_id, None)
                 # 抛竿阶段回显：搏鱼状态行显示该竿进入"准备抛竿/已抛竿"，
                 # 否则浮窗在抛竿后静默期一直停在"待机中"，看不出竿已抛出。
-                gear_slot = self._gear_slot_text(session, cast_gear.fishing_gear_id) or "手持竿"
+                gear_slot = self._rod_label(session, cast_gear.fishing_gear_id)
                 preparing = envelope.sub_cmd == session.profile.cast_prepare_sub_cmd
                 stage = "准备抛竿" if preparing else "已抛竿"
                 session.rod_phase_by_gear[cast_gear.fishing_gear_id] = (
@@ -3000,7 +3058,7 @@ class RF4ChatBridge:
                 if phase in (None, "", self.ROD_PHASE_WAITING) and (
                     previous is None or f"{previous:.1f}" != f"{depth:.1f}"
                 ):
-                    gear_slot = self._gear_slot_text(session, gear_id) or "手持竿"
+                    gear_slot = self._rod_label(session, gear_id)
                     self._log_telemetry(
                         "fight_status", f"{gear_slot} 已抛竿 深{depth:.1f}米"
                     )
@@ -3409,6 +3467,29 @@ class RF4ChatBridge:
             return f"{rod_number}号杆"
         return ""
 
+    def _rod_label(self, session: FlowSession, fishing_gear_id: Optional[str]) -> str:
+        """竿号显示标签：反查不到映射就回"手持竿"。
+
+        一根快捷键竿都没学到时（抓包晚于登录且没有磁盘缓存）同样会回落成“手持竿”，
+        用户看不出是"真手持"还是"没学到竿号"，所以这种场景提示一次原因。
+        """
+        label = self._gear_slot_text(session, fishing_gear_id)
+        if label:
+            return label
+        if not session.slot_mapping_hint_shown and not self._has_shortcut_slot_items(session):
+            session.slot_mapping_hint_shown = True
+            self._log(
+                "未捕获装备槽位映射：竿号统一显示为“手持竿”。"
+                "抓包晚于登录且无历史缓存，重新登录游戏一次即可恢复竿号"
+            )
+        return "手持竿"
+
+    @staticmethod
+    def _has_shortcut_slot_items(session: FlowSession) -> bool:
+        """是否至少学到一根快捷键竿（只有 slot_type=4 活动位算没学到）。"""
+        shortcut_numbers = session.profile.shortcut_slot_numbers
+        return any(slot_type in shortcut_numbers for slot_type in session.slot_items)
+
     def _build_synthetic_broadcast(
         self,
         session: FlowSession,
@@ -3487,7 +3568,7 @@ class RF4ChatBridge:
             sender_name=self._self_sender_name(phase),
             line_type=session.profile.room_message_line_type_catch,
             fishing_gear_id=fishing_gear_id or "",
-            gear_slot_text=self._gear_slot_text(session, fishing_gear_id) or "手持竿",
+            gear_slot_text=self._rod_label(session, fishing_gear_id),
             grade_enum=grade_enum,
         )
 
@@ -3538,22 +3619,30 @@ class RF4ChatBridge:
             time.monotonic() + self.ROD_RESULT_HOLD_SECONDS
         )
 
-        def _clear_result_after_hold(g: str = gear, expected_phase: str = self.ROD_PHASE_RESULT) -> None:
-            # 重抛竿后 phase 已变成 waiting，旧回调不能再清新行。
+        def _release_result_hold(g: str = gear, expected_phase: str = self.ROD_PHASE_RESULT) -> None:
+            # 重抛竿/收竿后 phase 已变成 waiting/ended，旧回调不能再清新行。
             if session.rod_phase_by_gear.get(g) != expected_phase:
                 return
-            current = self._gear_slot_text(session, g) or "手持竿"
-            session.rod_phase_by_gear.pop(g, None)
             session.rod_result_until_by_gear.pop(g, None)
-            self._log_telemetry("fight_status", f"{current} 已收竿")
+            depth = session.fight_depth_by_gear.get(g)
+            if depth is None:
+                # 线已离水：入护/收回时客户端的 14/4 早就回显过"已收竿"，
+                # 这里绝不凭空再补一行（脱钩后 3 秒显示"已收竿"就是这么来的）。
+                session.rod_phase_by_gear.pop(g, None)
+                return
+            # 脱钩/放生后 14/7 位置上报还在继续 = 线还在水里：回到等待咬钩。
+            session.rod_phase_by_gear[g] = self.ROD_PHASE_WAITING
+            slot = self._rod_label(session, g)
+            self._log_telemetry("fight_status", f"{slot} 已抛竿 深{depth:.1f}米")
 
-        try:
-            session.overlay.schedule(
-                int(self.ROD_RESULT_HOLD_SECONDS * 1000),
-                _clear_result_after_hold,
-            )
-        except Exception:
-            pass
+        # 抓包侧没有事件循环（浮窗是独立进程），用一次性定时器在展示结束后放行。
+        self._schedule_after(self.ROD_RESULT_HOLD_SECONDS, _release_result_hold)
+
+    def _schedule_after(self, delay_seconds: float, callback) -> None:
+        """延迟执行 callback：桥接浮窗的 schedule()，供结算展示结束后补发竿行。"""
+        timer = threading.Timer(delay_seconds, callback)
+        timer.daemon = True
+        timer.start()
 
     def _emit_self_event(self, session: FlowSession, synthetic: SyntheticChatEvent) -> bytes:
         self._set_rod_phase_for_event(session, synthetic)
@@ -3638,7 +3727,7 @@ class RF4ChatBridge:
         session.fight_depth_by_gear.pop(gear_id, None)
         session.fight_distance_by_gear.pop(gear_id, None)
         session.rod_result_until_by_gear.pop(gear_id, None)
-        gear_slot = self._gear_slot_text(session, gear_id) or "手持竿"
+        gear_slot = self._rod_label(session, gear_id)
         self._log_telemetry("fight_status", f"{gear_slot} 已收竿")
 
     def _emit_waiting_rod_rows(self, session: FlowSession) -> None:
